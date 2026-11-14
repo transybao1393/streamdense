@@ -6,6 +6,8 @@ over the Anthropic Messages API so coding agents (for example Claude Code) and t
 
 <p align="center"><img src="docs/dataflow.svg" alt="System overview (animated): coding agents such as Claude Code, or the SwiftUI app, send requests to streamdense gateway (Anthropic Messages API on 127.0.0.1:8898, KV prefix reuse and snapshots); the engine runs Qwen3.8-27B 4-bit on the Metal GPU with MTP speculative decoding; weights come from the SSD into RAM under the sd-watchdog hard cap of 16 GB, either the full model or the 12 GB mode (compact FFN chosen per prompt); tokens stream back to the client" width="100%"></p>
 
+<p align="center"><img src="docs/assets/demo.gif" alt="Terminal-style recording of Qwen3.8-27B (MLX 4-bit + MTP) on a Mac mini M4 Pro 48 GB streaming a Rust palindrome function through the streamdense gateway, with a live tokens-per-second counter; final stats 23.7 tok/s decode, 164 tokens, first token 0.66 s" width="100%"></p>
+
 ## Headline numbers
 
 Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model process, under `sd-watchdog`.
