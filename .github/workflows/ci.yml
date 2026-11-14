@@ -32,10 +32,24 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: engine -> target
+          workspaces: |
+            engine -> target
+            engine/qwen-dense -> target
+            engine/model_layer -> target
       - name: build
         run: cargo build --workspace --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: fast tests (no models/, no GPU)
         run: cargo fast -- --show-output
+      # engine/qwen-dense and engine/model_layer are their own Cargo workspaces (see their Cargo.toml)
+      - name: qwen-dense clippy + unit tests (no GPU, no models/)
+        working-directory: engine/qwen-dense
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --lib --locked -- --show-output
+      - name: model_layer clippy + unit tests (no GPU, no models/)
+        working-directory: engine/model_layer
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked -- --show-output

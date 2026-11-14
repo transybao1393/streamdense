@@ -16,6 +16,8 @@ for this engine (different buffers, fused ops, multi-token dispatch), but the nu
 | [engine/shaders/attn_gated.metal](engine/shaders/attn_gated.metal) | MLX `mlx/backend/metal/kernels`: `rms_norm`, `rope`, `sdpa_vector.h` (`sdpa_vector`, `sdpa_vector_2pass`), unary `Sigmoid`; steel `BaseMMAFrag` fragment layout (`attn_flash_b16`) |
 | [engine/shaders/gemv_q4.metal](engine/shaders/gemv_q4.metal) | MLX `quantized.h` `load_vector` / `qdot` method (pre-scaled x, unshifted nibble masks) |
 | [engine/shaders/sparse_up.metal](engine/shaders/sparse_up.metal) | MLX `quantized.h` `load_vector` / `qdot` method, on gathered rows |
+| [engine/qwen-dense/shaders/attn_hd128_sdpa.metal](engine/qwen-dense/shaders/attn_hd128_sdpa.metal) | MLX `sdpa_vector.h` (`sdpa_vector`, `sdpa_vector_2pass`) at head dim 128, and the host block-count rule of `scaled_dot_product_attention.cpp` |
+| [engine/qwen-dense/shaders/attn_hd128.metal](engine/qwen-dense/shaders/attn_hd128.metal), [attn_hd128_flash.metal](engine/qwen-dense/shaders/attn_hd128_flash.metal) | Via `attn_gated.metal`: MLX `rms_norm`, `rope`, sdpa partition and rounding, steel `BaseMMAFrag` layout |
 | [engine/shaders/deltanet.metal](engine/shaders/deltanet.metal) | mlx-lm `models/gated_delta.py` (packed Dk=128 gated-delta kernel), `models/qwen3_5.py` `GatedDeltaNet`; MLX `rms_norm`, `Sigmoid`, `log1p` |
 | [engine/shaders/gemv_bf16.metal](engine/shaders/gemv_bf16.metal) | MLX `gemv.h` `GEMVKernel` |
 | [engine/shaders/gemv_q4_bf16.metal](engine/shaders/gemv_q4_bf16.metal) | MLX `quantized.h` `qmv_fast` / `qmv`, `load_vector`, `qdot` |
@@ -78,11 +80,13 @@ so no license notice is required. They are listed for transparency.
 Crates are fetched from crates.io at build time; this repository does not include their source. If you ship a
 compiled binary, include the license texts of these crates with it (for example with `cargo about`).
 
-One Cargo workspace (from `cargo metadata`, 2026-11-02, every target platform):
+Three separate Cargo workspaces (from `cargo metadata`, every target platform; `engine/` counted 2026-11-02, the other two 2026-11-14):
 
 | Workspace | Direct dependencies | Crates in the lock graph |
 |---|---|---|
 | [engine/](engine/Cargo.toml) | libc, objc2, objc2-foundation, objc2-metal, regex, serde, serde_json, toml, unicode-normalization, ureq | 70 |
+| [engine/qwen-dense/](engine/qwen-dense/Cargo.toml) | libc, objc2, objc2-foundation, objc2-metal, serde_json, streamdense-core / streamdense-tokenizer (local) | 36 |
+| [engine/model_layer/](engine/model_layer/Cargo.toml) | serde_json, qwen-dense / streamdense-core / streamdense-model / streamdense-tokenizer (local) | 36 |
 
 Almost every crate is `MIT OR Apache-2.0`, `MIT`, `Apache-2.0 OR MIT`, or `Unlicense OR MIT`. No GPL, LGPL, MPL
 or other copyleft license appears. Crates under a license other than plain MIT / Apache-2.0 (all permissive):
@@ -98,7 +102,7 @@ or other copyleft license appears. Crates under a license other than plain MIT /
 | ryu 1.0 | Apache-2.0 OR BSL-1.0 | |
 | adler2 2.0 | 0BSD OR MIT OR Apache-2.0 | |
 
-Regenerate with, in `engine/`:
+Regenerate with, in each workspace:
 `cargo metadata --format-version 1 | jq -r '.packages[] | select(.source != null) | "\(.name) \(.version) \(.license)"'`
 
 ## 3. Swift packages
@@ -115,6 +119,9 @@ of each model card, checked 2026-11-02.
 |---|---|---|
 | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | Main target (base model) | Apache-2.0 |
 | [p4ik/Qwen3.8-27B-MLX-4bit](https://huggingface.co/p4ik/Qwen3.8-27B-MLX-4bit) | 4-bit MLX package the engine loads (`models/qwen38_27b_mlx4`) | Apache-2.0 (base_model Qwen/Qwen3.8-27B) |
+| [Qwen/Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B), [Qwen/Qwen3-14B](https://huggingface.co/Qwen/Qwen3-14B), [Qwen/Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B) | Config shapes in `engine/qwen-dense` | Apache-2.0 |
+| [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B), [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Real-model tests of `engine/qwen-dense` vs MLX (MLX 4-bit conversions; weights not included) | Apache-2.0 |
+| [Qwen/Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct), [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct), [Qwen/Qwen2.5-14B-Instruct](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct) | Config shapes in `engine/qwen-dense` | Apache-2.0 (note: some other Qwen2.5 sizes, e.g. 3B and 72B, use different Qwen licenses) |
 
 Test data: [engine/testdata/vectors/](engine/testdata/vectors) holds random inputs at real shapes run through MLX
 ops (no model weights); [engine/refs/](engine/refs) holds token ids, logits and activation dumps produced with MLX / mlx-lm from a
