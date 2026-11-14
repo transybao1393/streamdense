@@ -1,30 +1,29 @@
 //! Family detection from a model folder's config.json. `FAMILIES` is the only family list: another family is one more
 //! entry there, plus its `Family` arm in engine.rs / report.rs (the routing: each arm calls that family's folder).
 //!
-//! model_type comes from `text_config` when present, else the root, as `DenseConfig::from_json` reads it. The MLX
-//! Qwen3.8 config has root "qwen3_5" and text_config "qwen3_5_text". `QwenConfig` itself never reads model_type, so the
-//! hybrid strings are this table's, taken from those config files.
-use qwen_dense::config::is_hybrid;
+//! model_type comes from `text_config` when present, else the root, as `DenseConfig::from_json` reads it. The
+//! model_type strings of each entry are the family folder's (`qwen::config` for the Qwen ones).
+use dense_engine::config::is_hybrid;
 use serde_json::Value;
 
 /// The existing engine a family goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineKind {
-    /// engine/qwen-dense: `DenseConfig`, `Engine` (standalone crate; greedy; all-attention, head dim 128)
-    QwenDense,
+    /// engine/dense-engine: `DenseConfig`, `Engine` (standalone crate; greedy; all-attention, head dim 128)
+    DenseEngine,
     /// engine/crates/streamdense-model: `QwenConfig`, `QwenEngine` (hybrid DeltaNet + attention, head dim 256)
     Main,
 }
 
 impl EngineKind {
-    pub fn name(self) -> &'static str { match self { EngineKind::QwenDense => "qwen-dense", EngineKind::Main => "main engine (streamdense-model)" } }
+    pub fn name(self) -> &'static str { match self { EngineKind::DenseEngine => "dense-engine", EngineKind::Main => "main engine (streamdense-model)" } }
 }
 
 /// Whose code a folder goes to, in `Model::load` and `report::inspect_text`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Family { Qwen }
+pub enum Family { Qwen, Llama, Granite, Gemma }
 
-/// What the layer types of a config must look like for this family (`qwen_dense::config::is_hybrid`).
+/// What the layer types of a config must look like for this family (`dense_engine::config::is_hybrid`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape { Dense, Hybrid }
 
@@ -39,9 +38,12 @@ pub struct FamilyEntry {
 
 /// Every supported family.
 pub const FAMILIES: &[FamilyEntry] = &[
-    FamilyEntry { name: "qwen2", family: Family::Qwen, model_types: &["qwen2"], shape: Shape::Dense, engine: EngineKind::QwenDense },
-    FamilyEntry { name: "qwen3", family: Family::Qwen, model_types: &["qwen3"], shape: Shape::Dense, engine: EngineKind::QwenDense },
-    FamilyEntry { name: "qwen3.8-hybrid", family: Family::Qwen, model_types: &["qwen3_5", "qwen3_5_text"], shape: Shape::Hybrid, engine: EngineKind::Main },
+    FamilyEntry { name: "qwen2", family: Family::Qwen, model_types: crate::qwen::QWEN2_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "qwen3", family: Family::Qwen, model_types: crate::qwen::QWEN3_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "qwen3.8-hybrid", family: Family::Qwen, model_types: crate::qwen::HYBRID_TYPES, shape: Shape::Hybrid, engine: EngineKind::Main },
+    FamilyEntry { name: "llama", family: Family::Llama, model_types: crate::llama::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "granite", family: Family::Granite, model_types: crate::granite::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "gemma", family: Family::Gemma, model_types: crate::gemma::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
 ];
 
 /// Keys that mark a mixture-of-experts config (same list as `DenseConfig::from_json`).
@@ -66,6 +68,11 @@ pub fn detect_json(root: &Value) -> Result<Detected, String> {
     let c = if root["text_config"].is_object() { &root["text_config"] } else { root };
     let model_type = c["model_type"].as_str().or(root["model_type"].as_str()).ok_or("config.json has no model_type")?;
     let root_type = root["model_type"].as_str().unwrap_or("");
+    // the other Granite members (MoE, hybrid, shared-MLP) get the granite folder's own reason, not the generic ones
+    if model_type.starts_with("granite") && !crate::granite::MODEL_TYPES.contains(&model_type) {
+        let b = crate::granite::blockers(root);
+        return Err(if b.is_empty() { format!("model_type {:?} is not supported yet", model_type) } else { b.join("; ") });
+    }
     let moe = MOE_KEYS.iter().any(|k| !c[*k].is_null() || !root[*k].is_null());
     if moe || model_type.contains("moe") || root_type.contains("moe") {
         return Err(format!("model_type {:?}: mixture-of-experts model rejected: dense models only", model_type));
@@ -89,11 +96,11 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn dense_families_go_to_qwen_dense() {
+    fn dense_families_go_to_dense_engine() {
         for t in ["qwen2", "qwen3"] {
             let d = detect_json(&json!({"model_type": t, "hidden_size": 512})).unwrap();
             assert_eq!(d.entry.name, t);
-            assert_eq!(d.entry.engine, EngineKind::QwenDense);
+            assert_eq!(d.entry.engine, EngineKind::DenseEngine);
         }
     }
 
@@ -130,6 +137,28 @@ mod tests {
     fn shape_must_fit_the_family() {
         assert!(detect_json(&json!({"model_type": "qwen3", "linear_num_key_heads": 4})).unwrap_err().contains("does not take"));
         assert!(detect_json(&json!({"model_type": "qwen3_5"})).unwrap_err().contains("needs"));
+    }
+
+    #[test]
+    fn other_families_go_to_dense_engine() {
+        for (t, name) in [("llama", "llama"), ("granite", "granite"), ("gemma", "gemma"), ("gemma2", "gemma"), ("gemma3_text", "gemma")] {
+            let d = detect_json(&json!({"model_type": t, "hidden_size": 512})).unwrap();
+            assert_eq!((d.entry.name, d.entry.engine), (name, EngineKind::DenseEngine));
+        }
+        // multimodal gemma3 root: model_type from text_config
+        let d = detect_json(&json!({"model_type": "gemma3", "text_config": {"model_type": "gemma3_text"}, "vision_config": {}})).unwrap();
+        assert_eq!(d.entry.name, "gemma");
+    }
+
+    #[test]
+    fn granite_members_get_the_granite_reason() {
+        let e = detect_json(&json!({"model_type": "granitemoehybrid", "num_local_experts": 0,
+                                    "layer_types": ["mamba", "attention"]})).unwrap_err();
+        assert!(e.contains("mamba") && e.contains("not supported yet"), "{}", e);
+        let e = detect_json(&json!({"model_type": "granitemoehybrid", "num_local_experts": 62})).unwrap_err();
+        assert!(e.contains("dense models only") && e.contains("62 experts"), "{}", e);
+        let e = detect_json(&json!({"model_type": "granitemoe"})).unwrap_err();
+        assert!(e.contains("dense models only"), "{}", e);
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub const FILE_NAME: &str = "streamdense.toml";
 pub struct Ram {
     /// hard cap on the model process footprint (sd-watchdog --cap-gb, engine --abort-gb)
     pub cap_gb: f64,
-    /// system swap limit (sd-watchdog + engine --swap-gb)
+    /// system swap GROWTH limit since the process started (sd-watchdog + engine --swap-gb); not absolute swap
     pub swap_gb: f64,
     /// sd-watchdog --margin-gb
     pub margin_gb: f64,

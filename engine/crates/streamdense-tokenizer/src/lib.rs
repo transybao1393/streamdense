@@ -1,12 +1,20 @@
-//! streamdense-tokenizer: Qwen3.x byte-level BPE tokenizer, chat template (incl. tools) and chat KV bookkeeping,
-//! in Rust (replaces HF transformers' AutoTokenizer / apply_chat_template that the Python UI and gateway used).
+//! streamdense-tokenizer: BPE tokenizer for HF `tokenizer.json` files (Qwen, GPT-2 style byte-level such as
+//! Granite / SmolLM2, Llama 3 style, SentencePiece-style BPE such as Llama 2 / Gemma / Mistral), the Qwen chat
+//! template (incl. tools) and chat KV bookkeeping, in Rust (replaces HF transformers' AutoTokenizer /
+//! apply_chat_template that the Python UI and gateway used). Chat templates of other families live with those
+//! families, not here.
 //!
 //! # Public API (stable; the gateway codes against this)
 //!
 //! ## Tokenizer
 //! * [`Tokenizer::from_path`]`(dir) -> Result<Tokenizer, String>`; `encode(&str) -> Vec<u32>`, `decode(&[u32]) -> String`,
 //!   `token_id(&str) -> Option<u32>`; [`StreamDecoder`] (`push(&tk, id) -> String` emits only complete UTF-8 chars,
-//!   `finish() -> String`). Stop ids: [`IM_END`], [`ENDOFTEXT`].
+//!   `finish() -> String`). Stop ids: [`IM_END`], [`ENDOFTEXT`] (Qwen).
+//! * Any family: `encode` adds no BOS/EOS (HF `add_special_tokens=False`); `encode_with_special(&str)` adds the
+//!   post-processor template ids (`special_prefix()` / `special_suffix()`, `add_bos()`, `bos_id()`), e.g. Llama /
+//!   Gemma BOS. `decode_skip_special(&[u32])` = HF `skip_special_tokens=True`. An unsupported tokenizer.json
+//!   component (Unigram/WordPiece model, Precompiled normalizer, other look-around regexes, ...) fails at load
+//!   with an error naming it; supported components are listed in [`pipeline`].
 //!
 //! ## Chat template (exact to transformers `apply_chat_template` with models/qwen38_27b_mlx4/chat_template.jinja)
 //! ```ignore
@@ -90,6 +98,7 @@
 //!   `commit_chat(mode, fed, generated, &[ChatMessage], &[ToolDef], opt, ok)`. Followup mode also covers
 //!   tool-result turns after an assistant tool call (tools must be identical to the previous request's).
 pub mod chat;
+pub mod pipeline;
 pub mod session;
 pub mod tokenizer;
 pub mod tools;

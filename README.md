@@ -77,15 +77,20 @@ Options, snapshots, the 12 GB mode and the request log are described in [docs/GA
 
 ## Supported models
 
-The gateway above (MTP speculative decoding, 12 GB mode) is built for Qwen3.8-27B. Other Qwen dense models run through
-`sd-model-layer`, plain greedy decoding, raw prompt (no chat template). Full guide, limits and example output:
-[engine/model_layer/README.md](engine/model_layer/README.md).
+The gateway above (MTP speculative decoding, 12 GB mode) is built for Qwen3.8-27B. Other dense models run through
+`sd-model-layer`, plain greedy decoding, raw prompt (`--prompt`) or the model's chat template (`--chat`, every family below).
+Full guide, limits and example output: [engine/model_layer/README.md](engine/model_layer/README.md).
 
 | Family | `model_type` | Engine | Notes |
 |---|---|---|---|
-| Qwen2 / Qwen2.5 dense | `qwen2` | [engine/qwen-dense](engine/qwen-dense/README.md) | head dim 128 (1.5B and up); checked against MLX on Qwen2.5-1.5B-Instruct |
-| Qwen3 dense | `qwen3` | [engine/qwen-dense](engine/qwen-dense/README.md) | head dim 128; checked against MLX on Qwen3-1.7B |
-| Qwen3.5 / Qwen3.8 hybrid | `qwen3_5`, `qwen3_5_text` | main engine (`engine/crates/streamdense-model`) | Qwen3.8-27B; full features through the gateway |
+| Qwen2 / Qwen2.5 dense | `qwen2` | [engine/dense-engine](engine/dense-engine/README.md) | head dim 64 / 128 (0.5B and up); checked against MLX on Qwen2.5-1.5B-Instruct and Qwen2.5-0.5B-Instruct |
+| Qwen3 dense | `qwen3` | [engine/dense-engine](engine/dense-engine/README.md) | head dim 128; checked against MLX on Qwen3-1.7B and Qwen3-0.6B |
+| Qwen3.5 / Qwen3.8 hybrid | `qwen3_5`, `qwen3_5_text` | main engine (`engine/crates/streamdense-model`) | Qwen3.8-27B; full features through the gateway; small models run through `sd-model-layer` (tied embeddings, no MTP): checked against MLX on Qwen3.5-0.8B |
+| Llama (Llama 3.x, SmolLM) | `llama` | [engine/dense-engine](engine/dense-engine/README.md) | head dim 64 / 128 / 256, llama3 RoPE; checked against MLX on Llama-3.2-1B-Instruct and SmolLM-135M-Instruct ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
+| Granite (dense) | `granite` | [engine/dense-engine](engine/dense-engine/README.md) | Granite multipliers; checked against MLX on granite-4.2-3b ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)); MoE / Mamba-hybrid Granite refused |
+| Gemma 1 | `gemma` | [engine/dense-engine](engine/dense-engine/README.md) | tanh GELU (per config); checked against MLX on gemma-1.1-2b-it ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
+| Gemma 2 | `gemma2` | [engine/dense-engine](engine/dense-engine/README.md) | soft caps, sliding window; checked against MLX on gemma-2-2b-it; past the 4096-token window not verified ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
+| Gemma 3 (text) | `gemma3_text` | [engine/dense-engine](engine/dense-engine/README.md) | head dim 256, sliding window; checked against MLX on gemma-3-270m-it; beyond 512 tokens near-match, open issue ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
 
 MLX 4-bit (group 64) weights only. MoE models and other families are refused by name.
 
@@ -94,6 +99,7 @@ cd engine/model_layer && cargo build --release
 B=engine/model_layer/target/release
 $B/sd-model-layer inspect models/<model_dir>                                  # family, engine, what applies; reads no weights
 $B/sd-model-layer run models/<model_dir> --prompt "def fibonacci(n):" --max-tokens 48
+$B/sd-model-layer run models/<model_dir> --chat "Name three primary colors." --max-tokens 32   # all families
 ```
 
 ## Configuration
@@ -133,7 +139,7 @@ Quitting the app stops the engine and frees its RAM.
 | Path | What |
 |---|---|
 | `engine/` | Rust workspace: `crates/streamdense-{core,metal,model,tokenizer,gateway,cli,fetch}`, Metal shaders (`shaders/`), kernel test vectors and request fixtures (`testdata/`) |
-| `engine/qwen-dense/` | Standalone Metal engine for Qwen2 / 2.5 / 3 dense models (own Cargo workspace) |
+| `engine/dense-engine/` | Standalone Metal engine for dense models: Qwen2 / 2.5 / 3, Llama, Granite, Gemma (own Cargo workspace) |
 | `engine/model_layer/` | `sd-model-layer`: picks family + engine from `config.json`; `inspect` / `run` (own Cargo workspace) |
 | `engine/refs/` | Reference outputs (greedy tokens, teacher logits, dumps) read by the engine tests and checks |
 | `app/` | SwiftUI chat app for `qwen serve` (`Sources/StreamdenseChat`, `run.sh`) |

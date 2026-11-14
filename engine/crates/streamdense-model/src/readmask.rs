@@ -525,7 +525,7 @@ mod tests {
     fn test_cfg() -> QwenConfig {
         QwenConfig { hidden: 512, inter: 1024 + 64 * 70, layers: 4, kinds: vec![LayerKind::DeltaNet, LayerKind::DeltaNet, LayerKind::DeltaNet, LayerKind::Attention],
                      heads: 4, kv_heads: 2, head_dim: 256, rope_dims: 64, rope_theta: 1e7, dn_kh: 2, dn_vh: 70, dn_dk: 128, dn_dv: 128, conv_k: 4,
-                     vocab: 2048, eps: 1e-6, eos: vec![1], mtp_layers: 0 }
+                     vocab: 2048, eps: 1e-6, eos: vec![1], mtp_layers: 0, tie_word_embeddings: false }
     }
 
     #[test]

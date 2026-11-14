@@ -34,7 +34,7 @@ jobs:
         with:
           workspaces: |
             engine -> target
-            engine/qwen-dense -> target
+            engine/dense-engine -> target
             engine/model_layer -> target
       - name: build
         run: cargo build --workspace --locked
@@ -42,9 +42,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: fast tests (no models/, no GPU)
         run: cargo fast -- --show-output
-      # engine/qwen-dense and engine/model_layer are their own Cargo workspaces (see their Cargo.toml)
-      - name: qwen-dense clippy + unit tests (no GPU, no models/)
-        working-directory: engine/qwen-dense
+      # engine/dense-engine and engine/model_layer are their own Cargo workspaces (see their Cargo.toml)
+      - name: dense-engine clippy + unit tests (no GPU, no models/)
+        working-directory: engine/dense-engine
         run: |
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --lib --locked -- --show-output

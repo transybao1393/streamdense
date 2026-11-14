@@ -26,6 +26,9 @@ pub struct QwenConfig {
     pub eps: f32,
     pub eos: Vec<u32>,
     pub mtp_layers: usize,
+    /// `tie_word_embeddings` (text_config first, then root; absent = false): the output head is the embedding matrix
+    /// (`embed_tokens`), as mlx_lm's `embed_tokens.as_linear`; no `lm_head` tensor is read.
+    pub tie_word_embeddings: bool,
 }
 
 /// Token ids from a scalar or an array field.
@@ -110,6 +113,7 @@ impl QwenConfig {
             eps: c["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
             eos,
             mtp_layers: c["mtp_num_hidden_layers"].as_u64().unwrap_or(0) as usize,
+            tie_word_embeddings: c["tie_word_embeddings"].as_bool().or(root["tie_word_embeddings"].as_bool()).unwrap_or(false),
         })
     }
 

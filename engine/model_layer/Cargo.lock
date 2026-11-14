@@ -27,6 +27,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dense-engine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "serde_json",
+ "streamdense-core",
+ "streamdense-tokenizer",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -154,19 +167,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qwen-dense"
-version = "0.1.0"
-dependencies = [
- "libc",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "serde_json",
- "streamdense-core",
- "streamdense-tokenizer",
-]
-
-[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -283,7 +283,7 @@ dependencies = [
 name = "streamdense-model-layer"
 version = "0.1.0"
 dependencies = [
- "qwen-dense",
+ "dense-engine",
  "serde_json",
  "streamdense-core",
  "streamdense-model",

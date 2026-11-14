@@ -20,7 +20,10 @@ $B/sd-watchdog --cap-gb 16 --margin-gb 0 --swap-gb 7 -- nice -n 10 \
 ```
 
 Check RAM and disk first (`df -h /`, `sysctl vm.swapusage`): the engine holds about 15.6 GB. The process also
-aborts itself above 16 GB phys_footprint (`--abort-gb`) or 7 GB system swap (`--swap-gb`), like `qwen serve`.
+aborts itself above 16 GB phys_footprint (`--abort-gb`) or when system swap has grown by more than 7 GB since it
+started (`--swap-gb`; the baseline is printed on the `FOOTPRINT MONITOR: start` line), like `qwen serve`. Since
+2026-11-14 `--swap-gb` / `swap_gb` is a growth limit for the engine and `sd-watchdog` alike, not absolute system swap:
+swap other programs already held does not stop a model.
 stdout gets one `{"ready":true,"port":..}` line when the port is open.
 
 Options: `--port N` (0 = any free port), `--host`, `--max-ctx N` (default 8192; 8K ≈ 15.9 GB, 12K ≈ 16.2 GB peak), `--mtp` (load the MTP head; MTP
@@ -42,7 +45,7 @@ The RAM cap for every run lives in `streamdense.toml` at the repo root (read by 
 ```toml
 [ram]
 cap_gb    = 16.0   # sd-watchdog kill + engine self-abort (--abort-gb)
-swap_gb   = 7      # stop above this much system swap
+swap_gb   = 7      # stop when system swap grows by more than this since start (not absolute swap)
 margin_gb = 0      # sd-watchdog margin
 nice      = 10
 [gateway]

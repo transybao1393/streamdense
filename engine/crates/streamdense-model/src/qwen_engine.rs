@@ -710,7 +710,7 @@ impl QwenEngine {
             }
             let host = if opt.ffn_stream_host {
                 let src = |s: &str| -> Result<(usize, u64), String> {
-                    let n = format!("language_model.lm_head.{}", s);
+                    let n = format!("{}.{}", crate::weights::head_prefix(&cfg), s);
                     idx.get(&n).map(|t| (t.file, t.off)).ok_or_else(|| format!("ffn_stream_host: {} not found", n))
                 };
                 Some(crate::ffn_stream::HostPool { regions: [w.lm_head.w, w.lm_head.s, w.lm_head.b], src: [src("weight")?, src("scales")?, src("biases")?] })

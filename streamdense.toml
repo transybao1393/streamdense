@@ -5,7 +5,7 @@
 
 [ram]
 cap_gb    = 16.0   # hard cap on the model process footprint: sd-watchdog kills it, and the engine aborts itself (--abort-gb)
-swap_gb   = 7      # stop if system swap goes above this
+swap_gb   = 7      # stop if system swap grows by more than this since the process started (not absolute swap)
 margin_gb = 0      # sd-watchdog margin under the cap
 nice      = 10     # CPU priority of the model process
 

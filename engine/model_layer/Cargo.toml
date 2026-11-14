@@ -1,6 +1,6 @@
-# Model support layer: one entry point in front of the existing engines (qwen-dense, streamdense-model). No inference
-# code of its own. Own (empty) workspace, as engine/qwen-dense: it cannot be a member of
-# engine/Cargo.toml while it depends on qwen-dense, which is inside that root with its own [workspace] table (cargo:
+# Model support layer: one entry point in front of the existing engines (dense-engine, streamdense-model). No inference
+# code of its own. Own (empty) workspace, as engine/dense-engine: it cannot be a member of
+# engine/Cargo.toml while it depends on dense-engine, which is inside that root with its own [workspace] table (cargo:
 # "multiple workspace roots found in the same workspace").
 [package]
 name = "streamdense-model-layer"
@@ -18,7 +18,7 @@ name = "sd-model-layer"
 path = "src/main.rs"
 
 [dependencies]
-qwen-dense = { path = "../qwen-dense" }
+dense-engine = { path = "../dense-engine" }
 streamdense-core = { path = "../crates/streamdense-core" }
 streamdense-model = { path = "../crates/streamdense-model" }
 streamdense-tokenizer = { path = "../crates/streamdense-tokenizer" }
