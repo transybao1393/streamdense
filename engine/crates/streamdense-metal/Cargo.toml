@@ -2,6 +2,7 @@
 name = "streamdense-metal"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 [dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true

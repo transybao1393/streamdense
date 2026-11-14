@@ -2,6 +2,7 @@
 name = "streamdense-model"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 [dependencies]
 streamdense-core = { path = "../streamdense-core" }
 streamdense-metal = { path = "../streamdense-metal" }

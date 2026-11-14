@@ -2,6 +2,7 @@
 name = "streamdense-fetch"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 
 [dependencies]
 # rustls only; no gzip (Accept-Encoding would break byte ranges).

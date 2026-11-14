@@ -2,6 +2,10 @@
 //! chat UI and the gateway use: system / user / assistant / tool messages with string content, tool definitions,
 //! assistant tool calls, `add_generation_prompt`, `enable_thinking` (+ `reasoning_effort`). No images / videos.
 //!
+//! Origin: the template's fixed strings are reproduced word for word from `chat_template.jinja` of Qwen/Qwen3.8-27B,
+//! licensed under the Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0). Changes: rewritten from
+//! Jinja into Rust; images / videos left out. See THIRD_PARTY_NOTICES.md.
+//!
 //! What the template does (and this file reproduces):
 //! * leading system (or developer) messages are merged: each `|trim`med, the non-empty ones joined by "\n";
 //! * enable_thinking true -> a reasoning-effort instruction (xhigh default, "high" == xhigh, medium -> none, low)

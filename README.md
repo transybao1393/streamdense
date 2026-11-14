@@ -130,5 +130,7 @@ without weights they print `SKIP: ...` and return. Lints: `cargo clippy --worksp
 
 ## License
 
-Proprietary, all rights reserved: see [`LICENSE`](LICENSE). Third-party code, crates and models keep their own
+[PolyForm Strict License 1.0.0](https://polyformproject.org/licenses/strict/1.0.0): see [`LICENSE`](LICENSE). You may
+download, build and run streamdense for noncommercial purposes. Commercial use, modification and redistribution are not
+permitted without written permission from the copyright holder. Third-party code, crates and models keep their own
 licenses: see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Model weights are not part of this repo.
