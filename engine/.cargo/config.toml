@@ -1,0 +1,10 @@
+[alias]
+# Fast set: every test that needs neither models/ nor a Metal GPU (CPU only; also what CI runs).
+#   unit tests of all crates (--lib --bins) + the CPU-only integration targets below.
+# Tests in these targets that want models/ (27B tokenizer.json / config, tiny config) print "SKIP: needs models/..."
+# and return when it is missing. Add `-- --show-output` to see the SKIP lines.
+# Not in the fast set (need a Metal GPU and/or weights): streamdense-metal tests/*, streamdense-model tests
+# activity, dump, embed, mtp, qwen_prefill, snapshot, weights; streamdense-gateway snapshot_tiny, compact_tiny, compact_snapshot_tiny;
+# streamdense-cli gateway_http, gateway_12gb, serve_chat, watcher_http. Run those with plain `cargo test`.
+fast = ["test", "--workspace", "--locked", "--lib", "--bins",
+        "--test", "safetensors", "--test", "qwen_config", "--test", "fixture", "--test", "session", "--test", "http_fake"]

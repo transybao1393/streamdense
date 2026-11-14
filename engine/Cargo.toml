@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = ["crates/streamdense-core", "crates/streamdense-metal", "crates/streamdense-model", "crates/streamdense-cli", "crates/streamdense-fetch", "crates/streamdense-tokenizer", "crates/streamdense-gateway"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+libc = "0.2.189"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+serde_json = "1.0.151"
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+
+[profile.release]
+opt-level = 3
+debug = 1
+
+# Clippy policy (CI runs `cargo clippy --workspace --all-targets --locked -- -D warnings`). Every crate opts in with
+# `[lints] workspace = true`. Allowed below are style lints that conflict with the house style of dense one-line
+# numeric/kernel-host code (explicit `(a + b - 1) / b`, index loops mirroring the Metal kernels, many-arg launch
+# helpers, `!(x < y)` NaN-aware compares, `} if` chains of independent counters). They flag no bugs here; fixing them
+# would be a mass rewrite across files other work is editing. The two deny-by-default correctness lints
+# (mut_from_ref, not_unsafe_ptr_arg_deref) are NOT allowed here; they are allowed only at their one site each, with
+# the reason (streamdense-core arena.rs / io.rs).
+[workspace.lints.clippy]
+doc_lazy_continuation = "allow"        # `//!` lists wrapped without indentation (docs style)
+doc_overindented_list_items = "allow"
+manual_div_ceil = "allow"              # explicit `(n + d - 1) / d`, mirrors the shader-side math
+needless_range_loop = "allow"          # index loops over several parallel buffers, as in the kernels
+manual_is_multiple_of = "allow"        # `x % 64 != 0` alignment checks
+neg_cmp_op_on_partial_ord = "allow"    # `!(a < b)` is deliberate: NaN goes the safe way
+too_many_arguments = "allow"           # kernel launch / bench helpers take one arg per buffer
+type_complexity = "allow"
+unnecessary_map_or = "allow"
+field_reassign_with_default = "allow"
+possible_missing_else = "allow"        # `} if` chains of independent one-line counters (checked: none is a missing else)
+sliced_string_as_bytes = "allow"
+int_plus_one = "allow"                 # `x + 1 <= cap` written as the capacity rule reads
+unnecessary_cast = "allow"
+manual_repeat_n = "allow"
+manual_range_contains = "allow"
+unnecessary_sort_by = "allow"
+unnecessary_literal_unwrap = "allow"
+redundant_closure_call = "allow"
+needless_return = "allow"
+manual_contains = "allow"
+manual_clamp = "allow"                 # clamp() panics on NaN bounds; the manual form is kept on purpose
+large_enum_variant = "allow"           # worker message enum, one per request; boxing buys nothing
+if_same_then_else = "allow"            # placeholder branches in tests/benches kept for the variant they document
+double_comparisons = "allow"
+unnecessary_operation = "allow"
+excessive_precision = "allow"          # test literal is the exact f16 value printed in full
+bool_comparison = "allow"
+assertions_on_constants = "allow"      # compile-time layout facts asserted in tests

@@ -1,0 +1,12 @@
+[package]
+name = "streamdense-fetch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# rustls only; no gzip (Accept-Encoding would break byte ranges).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

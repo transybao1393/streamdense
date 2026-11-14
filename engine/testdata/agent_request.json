@@ -1,0 +1,140 @@
+{
+ "note": "Synthetic coding-agent /v1/messages request body (neutral text written for the tests). Input of the tool chats in tokenizer_fixture.json.",
+ "system": [
+  {
+   "type": "text",
+   "text": "x-anthropic-billing-header: cc_version=0.0.0; cc_entrypoint=test;"
+  },
+  {
+   "type": "text",
+   "text": "You are a test assistant for the streamdense gateway.",
+   "cache_control": {
+    "type": "ephemeral"
+   }
+  },
+  {
+   "type": "text",
+   "text": "You are a coding agent on the user's Mac. Use the tools to read, edit and run code. Be concise.",
+   "cache_control": {
+    "type": "ephemeral"
+   }
+  }
+ ],
+ "tools": [
+  {
+   "name": "Bash",
+   "description": "execute shell commands",
+   "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "command": {
+      "description": "Shell command line to run",
+      "type": "string"
+     },
+     "timeout": {
+      "description": "Time limit in milliseconds (at most 600000)",
+      "type": "number"
+     },
+     "description": {
+      "description": "One short line saying what the command is for, written for the person watching the session. Name the effect, not the syntax.\n\nKeep it plain: say what happens in everyday words; do not repeat the command line, its flags or paths - the reader may never see the command itself.\n\nShort examples (3-8 words):\n- pwd → \"Show the current folder\"\n- make test → \"Run the test suite\"\n- du -sh build → \"Show size of the build folder\"\n\nWhen the command is long or chained (pipes, redirects, unusual options), say a little more:\n- grep -rl TODO src | wc -l → \"Count source files that still contain TODO\"\n- sed -i 's/\\t/  /g' notes.txt → \"Replace tabs with two spaces in the notes\"\n- tar -czf out.tgz data/ && ls -l out.tgz → \"Pack the data folder and show the archive size\"",
+      "type": "string"
+     },
+     "sandbox_off": {
+      "description": "Run outside the sandbox when true.",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Edit",
+   "description": "modify file contents in place",
+   "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "file_path": {
+      "description": "Absolute path of the file to change",
+      "type": "string"
+     },
+     "old_string": {
+      "description": "Exact text to find",
+      "type": "string"
+     },
+     "new_string": {
+      "description": "Text that replaces it (must differ from old_string)",
+      "type": "string"
+     },
+     "replace_all": {
+      "description": "Replace every match instead of one (default false)",
+      "default": false,
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "file_path",
+     "old_string",
+     "new_string"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Read",
+   "description": "read files, images, PDFs, notebooks",
+   "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "file_path": {
+      "description": "Absolute path of the file to open",
+      "type": "string"
+     },
+     "offset": {
+      "description": "First line to return (for files too big to read in one go)",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+     },
+     "limit": {
+      "description": "How many lines to return (for files too big to read in one go).",
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+     },
+     "pages": {
+      "description": "PDF page range such as \"2\", \"1-4\" or \"8-12\"; PDFs only, at most 20 pages per call.",
+      "type": "string"
+     },
+     "whole_file": {
+      "description": "Return a large text file in full, up to what fits; otherwise read it in parts with offset and limit.",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "file_path"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "say hi",
+     "cache_control": {
+      "type": "ephemeral"
+     }
+    }
+   ]
+  }
+ ]
+}

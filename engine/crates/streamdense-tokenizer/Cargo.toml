@@ -1,0 +1,12 @@
+[package]
+name = "streamdense-tokenizer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = { workspace = true, features = ["preserve_order"] }
+regex = "1"
+unicode-normalization = "0.1"
+
+[lints]
+workspace = true

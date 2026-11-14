@@ -1,0 +1,12 @@
+[package]
+name = "streamdense-core"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+toml.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

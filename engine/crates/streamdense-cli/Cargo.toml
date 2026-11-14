@@ -1,0 +1,20 @@
+[package]
+name = "streamdense-cli"
+version.workspace = true
+edition.workspace = true
+[[bin]]
+name = "streamdense"
+path = "src/main.rs"
+[[bin]]
+name = "sd-watchdog"
+path = "src/watchdog.rs"
+[dependencies]
+streamdense-core = { path = "../streamdense-core" }
+streamdense-model = { path = "../streamdense-model" }
+streamdense-tokenizer = { path = "../streamdense-tokenizer" }
+streamdense-gateway = { path = "../streamdense-gateway" }
+serde_json.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

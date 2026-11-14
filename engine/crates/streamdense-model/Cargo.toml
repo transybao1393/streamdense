@@ -1,0 +1,17 @@
+[package]
+name = "streamdense-model"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+streamdense-core = { path = "../streamdense-core" }
+streamdense-metal = { path = "../streamdense-metal" }
+objc2.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+objc2-metal.workspace = true
+objc2-foundation.workspace = true

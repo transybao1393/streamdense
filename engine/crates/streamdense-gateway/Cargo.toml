@@ -1,0 +1,14 @@
+[package]
+name = "streamdense-gateway"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+streamdense-core = { path = "../streamdense-core" }
+streamdense-model = { path = "../streamdense-model" }
+streamdense-tokenizer = { path = "../streamdense-tokenizer" }
+serde_json.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

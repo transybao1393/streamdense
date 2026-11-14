@@ -1,0 +1,2136 @@
+{
+ "files": {
+  "gemv": {
+   "path": "gemv.safetensors",
+   "bytes": 2491091,
+   "cases": {
+    "q4_k5120": {
+     "op": "q4b_gemv",
+     "mlx": "mx.quantized_matmul(x, w, s, b, transpose=True, group_size=64, bits=4)",
+     "params": {
+      "rows": 256,
+      "cols": 5120,
+      "K": 8,
+      "group_size": 64,
+      "bits": 4,
+      "mlx_y_equals_y_k1": false,
+      "mlx_y_vs_y_k1_max_ulp": 1
+     },
+     "inputs": {
+      "q4_k5120.w": {
+       "shape": [
+        256,
+        640
+       ],
+       "dtype": "uint32"
+      },
+      "q4_k5120.s": {
+       "shape": [
+        256,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k5120.b": {
+       "shape": [
+        256,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k5120.x": {
+       "shape": [
+        8,
+        5120
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "q4_k5120.y": {
+       "shape": [
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k5120.y_k1": {
+       "shape": [
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "y = x[K,C] @ dequant(w)^T in one call (MLX qmm path for K>1); y_k1 = the same rows one at a time (MLX qmv path, = plain decode). The engine mirrors stepwise decode, so y_k1 is the primary target."
+    },
+    "q4_k6144": {
+     "op": "q4b_gemv",
+     "mlx": "mx.quantized_matmul(x, w, s, b, transpose=True, group_size=64, bits=4)",
+     "params": {
+      "rows": 128,
+      "cols": 6144,
+      "K": 8,
+      "group_size": 64,
+      "bits": 4,
+      "mlx_y_equals_y_k1": true,
+      "mlx_y_vs_y_k1_max_ulp": 0
+     },
+     "inputs": {
+      "q4_k6144.w": {
+       "shape": [
+        128,
+        768
+       ],
+       "dtype": "uint32"
+      },
+      "q4_k6144.s": {
+       "shape": [
+        128,
+        96
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k6144.b": {
+       "shape": [
+        128,
+        96
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k6144.x": {
+       "shape": [
+        8,
+        6144
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "q4_k6144.y": {
+       "shape": [
+        8,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k6144.y_k1": {
+       "shape": [
+        8,
+        128
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "y = x[K,C] @ dequant(w)^T in one call (MLX qmm path for K>1); y_k1 = the same rows one at a time (MLX qmv path, = plain decode). The engine mirrors stepwise decode, so y_k1 is the primary target."
+    },
+    "q4_k17408": {
+     "op": "q4b_gemv",
+     "mlx": "mx.quantized_matmul(x, w, s, b, transpose=True, group_size=64, bits=4)",
+     "params": {
+      "rows": 64,
+      "cols": 17408,
+      "K": 8,
+      "group_size": 64,
+      "bits": 4,
+      "mlx_y_equals_y_k1": true,
+      "mlx_y_vs_y_k1_max_ulp": 0
+     },
+     "inputs": {
+      "q4_k17408.w": {
+       "shape": [
+        64,
+        2176
+       ],
+       "dtype": "uint32"
+      },
+      "q4_k17408.s": {
+       "shape": [
+        64,
+        272
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k17408.b": {
+       "shape": [
+        64,
+        272
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k17408.x": {
+       "shape": [
+        8,
+        17408
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "q4_k17408.y": {
+       "shape": [
+        8,
+        64
+       ],
+       "dtype": "bfloat16"
+      },
+      "q4_k17408.y_k1": {
+       "shape": [
+        8,
+        64
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "y = x[K,C] @ dequant(w)^T in one call (MLX qmm path for K>1); y_k1 = the same rows one at a time (MLX qmv path, = plain decode). The engine mirrors stepwise decode, so y_k1 is the primary target."
+    },
+    "deq": {
+     "op": "dequantize",
+     "mlx": "mx.dequantize(w, s, b, group_size=64, bits=4)",
+     "params": {
+      "rows": 16,
+      "cols": 5120
+     },
+     "inputs": {
+      "deq.w": {
+       "shape": [
+        16,
+        640
+       ],
+       "dtype": "uint32"
+      },
+      "deq.s": {
+       "shape": [
+        16,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "deq.b": {
+       "shape": [
+        16,
+        80
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "deq.y": {
+       "shape": [
+        16,
+        5120
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "w = scale*q + bias per group of 64, q = nibble j of u32 word j/8 (low nibble first); result bf16."
+    }
+   }
+  },
+  "swiglu": {
+   "path": "swiglu.safetensors",
+   "bytes": 1027445,
+   "cases": {
+    "ffn": {
+     "op": "swiglu",
+     "mlx": "mlx_lm.models.activations.swiglu(gate, up)  # silu(gate) * up, bf16, mx.compile",
+     "params": {
+      "K": 4,
+      "inter": 17408
+     },
+     "inputs": {
+      "ffn.gate": {
+       "shape": [
+        4,
+        17408
+       ],
+       "dtype": "bfloat16"
+      },
+      "ffn.up": {
+       "shape": [
+        4,
+        17408
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "ffn.y": {
+       "shape": [
+        4,
+        17408
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "FFN activation of Qwen3NextMLP: down_proj(swiglu(gate_proj(x), up_proj(x)))."
+    },
+    "precise": {
+     "op": "precise_swiglu",
+     "mlx": "mlx_lm.models.activations.precise_swiglu(h, gate=z, x)",
+     "params": {
+      "K": 4
+     },
+     "inputs": {
+      "precise.h": {
+       "shape": [
+        4,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "precise.z": {
+       "shape": [
+        4,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "precise.x": {
+       "shape": [
+        4,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "precise.y": {
+       "shape": [
+        4,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "silu(z.f32) * x.f32, cast to h.dtype (bf16). h only sets the dtype. Inside RMSNormGated x is the bf16 rms_norm output, so the bf16 rounding of x happens before this op."
+    },
+    "fused": {
+     "op": "q4b_swiglu",
+     "mlx": "swiglu(quantized_matmul(x, g_w..), quantized_matmul(x, u_w..))",
+     "params": {
+      "K": 4,
+      "rows": 64,
+      "cols": 5120,
+      "mlx_y_equals_y_k1": true
+     },
+     "inputs": {
+      "fused.x": {
+       "shape": [
+        4,
+        5120
+       ],
+       "dtype": "bfloat16"
+      },
+      "fused.g_w": {
+       "shape": [
+        64,
+        640
+       ],
+       "dtype": "uint32"
+      },
+      "fused.g_s": {
+       "shape": [
+        64,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "fused.g_b": {
+       "shape": [
+        64,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "fused.u_w": {
+       "shape": [
+        64,
+        640
+       ],
+       "dtype": "uint32"
+      },
+      "fused.u_s": {
+       "shape": [
+        64,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "fused.u_b": {
+       "shape": [
+        64,
+        80
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "fused.gp": {
+       "shape": [
+        4,
+        64
+       ],
+       "dtype": "bfloat16"
+      },
+      "fused.up": {
+       "shape": [
+        4,
+        64
+       ],
+       "dtype": "bfloat16"
+      },
+      "fused.y": {
+       "shape": [
+        4,
+        64
+       ],
+       "dtype": "bfloat16"
+      },
+      "fused.y_k1": {
+       "shape": [
+        4,
+        64
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "gp/up are the bf16 GEMV outputs MLX rounds to before swiglu; y_k1 = per-row (decode) path."
+    }
+   }
+  },
+  "norm": {
+   "path": "norm.safetensors",
+   "bytes": 847531,
+   "cases": {
+    "hidden": {
+     "op": "rmsnorm_b",
+     "mlx": "mx.fast.rms_norm(x, w, 1e-6)",
+     "params": {
+      "K": 8,
+      "dim": 5120,
+      "eps": 1e-06
+     },
+     "inputs": {
+      "hidden.x": {
+       "shape": [
+        8,
+        5120
+       ],
+       "dtype": "bfloat16"
+      },
+      "hidden.w": {
+       "shape": [
+        5120
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "hidden.y": {
+       "shape": [
+        8,
+        5120
+       ],
+       "dtype": "bfloat16"
+      },
+      "hidden.y_k1": {
+       "shape": [
+        8,
+        5120
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "input/post_attention_layernorm, model.norm, MTP norms (weights stored with +1 already, used as-is). Rows 0, 3, 5 carry large outliers."
+    },
+    "qk": {
+     "op": "rmsnorm_b (per head)",
+     "mlx": "mx.fast.rms_norm(x, w, 1e-6)  # over the last axis (256)",
+     "params": {
+      "K": 8,
+      "heads": 24,
+      "dim": 256,
+      "eps": 1e-06
+     },
+     "inputs": {
+      "qk.x": {
+       "shape": [
+        8,
+        24,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "qk.w": {
+       "shape": [
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "qk.y": {
+       "shape": [
+        8,
+        24,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "q_norm / k_norm of the gated attention (applied before RoPE)."
+    },
+    "gated": {
+     "op": "rmsnorm_gated",
+     "mlx": "Qwen3NextRMSNormGated(128, eps=1e-6)(y, z)  = precise_swiglu(y, z, mx.fast.rms_norm(y, w, eps))",
+     "params": {
+      "K": 8,
+      "vh": 48,
+      "dv": 128,
+      "eps": 1e-06
+     },
+     "inputs": {
+      "gated.y": {
+       "shape": [
+        8,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "gated.z": {
+       "shape": [
+        8,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "gated.w": {
+       "shape": [
+        128
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "gated.xn": {
+       "shape": [
+        8,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "gated.out": {
+       "shape": [
+        8,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "linear_attn.norm (weight NOT +1). xn is the intermediate bf16 rms_norm output; out = bf16(silu(f32 z) * f32 xn)."
+    }
+   }
+  },
+  "dn": {
+   "path": "dn.safetensors",
+   "bytes": 1648301,
+   "cases": {
+    "small.conv": {
+     "op": "dn_conv",
+     "mlx": "nn.silu(nn.Conv1d(C, C, 4, groups=C, bias=False)(concat([conv_state, qkv], 1))); state_out = last 3 rows",
+     "params": {
+      "T": 8,
+      "conv_dim": 1280,
+      "kh": 2,
+      "vh": 6
+     },
+     "inputs": {
+      "small.conv_w": {
+       "shape": [
+        1280,
+        4,
+        1
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.conv_state": {
+       "shape": [
+        1,
+        3,
+        1280
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.qkv": {
+       "shape": [
+        1,
+        8,
+        1280
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "small.conv_out": {
+       "shape": [
+        1,
+        8,
+        1280
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.conv_state_out": {
+       "shape": [
+        1,
+        3,
+        1280
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "conv weight layout [C, 4, 1] as stored (already sanitized); tap j multiplies input row t+j of [state; qkv]. kh=2/vh=6 (same 1:3 grouping as the real 16/48), T=8."
+    },
+    "small.prep": {
+     "op": "dn_prep",
+     "mlx": "q, k = normalize_qk(q, k, inv_scale=128**-0.5, eps=1e-6); g = compute_g(A_log, a, dt_bias); beta = sigmoid(b)",
+     "params": {
+      "T": 8,
+      "kh": 2,
+      "vh": 6,
+      "dk": 128,
+      "dv": 128
+     },
+     "inputs": {
+      "small.conv_out": {
+       "shape": [
+        1,
+        8,
+        1280
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.a": {
+       "shape": [
+        1,
+        8,
+        6
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.b": {
+       "shape": [
+        1,
+        8,
+        6
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.A_log": {
+       "shape": [
+        6
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.dt_bias": {
+       "shape": [
+        6
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "small.q": {
+       "shape": [
+        1,
+        8,
+        2,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.k": {
+       "shape": [
+        1,
+        8,
+        2,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.v": {
+       "shape": [
+        1,
+        8,
+        6,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.g": {
+       "shape": [
+        1,
+        8,
+        6
+       ],
+       "dtype": "float32"
+      },
+      "small.beta": {
+       "shape": [
+        1,
+        8,
+        6
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "q,k,v = split(conv_out, [kd, 2kd]) reshaped per head. normalize_qk (mlx-lm): q = (1/128) * rms_norm(q, None, 1e-6/128), k = 128**-0.5 * rms_norm(k, None, 1e-6/128) (bf16 each step). g = exp(-exp(f32 A_log) * softplus(a + dt_bias)) is f32 (a + dt_bias and softplus in bf16 inside compile); beta bf16."
+    },
+    "small.recur": {
+     "op": "dn_recur",
+     "mlx": "y, S = gated_delta_update(q, k, v, a, b, A_log, dt_bias, S_in, None, use_kernel=True)",
+     "params": {
+      "T": 8,
+      "kh": 2,
+      "vh": 6,
+      "dk": 128,
+      "dv": 128,
+      "state_layout": "[B, hv, dv, dk] f32",
+      "kernel": "mlx-lm gated_delta_step_packed_btree (scalar f32 g, Dk=128)",
+      "mlx_y_equals_y_step": true,
+      "mlx_S_equals_stepwise": true
+     },
+     "inputs": {
+      "small.q": {
+       "shape": [
+        1,
+        8,
+        2,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.k": {
+       "shape": [
+        1,
+        8,
+        2,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.v": {
+       "shape": [
+        1,
+        8,
+        6,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.a": {
+       "shape": [
+        1,
+        8,
+        6
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.b": {
+       "shape": [
+        1,
+        8,
+        6
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.A_log": {
+       "shape": [
+        6
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.dt_bias": {
+       "shape": [
+        6
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.S_in": {
+       "shape": [
+        1,
+        6,
+        128,
+        128
+       ],
+       "dtype": "float32"
+      }
+     },
+     "outputs": {
+      "small.y": {
+       "shape": [
+        1,
+        8,
+        6,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.S": {
+       "shape": [
+        1,
+        6,
+        128,
+        128
+       ],
+       "dtype": "float32"
+      },
+      "small.y_step": {
+       "shape": [
+        1,
+        8,
+        6,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.S1": {
+       "shape": [
+        1,
+        6,
+        128,
+        128
+       ],
+       "dtype": "float32"
+      }
+     },
+     "note": "Per token: S *= g; kv = S.k; delta = (v - kv) * beta; S += k (x) delta; y = S.q (q already carries 1/sqrt(128)). v head h uses k head h // (vh/kh). y is bf16, S f32. y_step / S1 = T=1 calls (decode path); S1 = state after token 0."
+    },
+    "small.gnorm": {
+     "op": "rmsnorm_gated",
+     "mlx": "Qwen3NextRMSNormGated(128)(y, z).reshape(1, T, vh*128)",
+     "params": {
+      "T": 8,
+      "vh": 6
+     },
+     "inputs": {
+      "small.y": {
+       "shape": [
+        1,
+        8,
+        6,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.z": {
+       "shape": [
+        1,
+        8,
+        6,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "small.norm_w": {
+       "shape": [
+        128
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "small.yn": {
+       "shape": [
+        1,
+        8,
+        768
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "The out_proj input of the DeltaNet block."
+    },
+    "real.conv": {
+     "op": "dn_conv",
+     "mlx": "nn.silu(nn.Conv1d(C, C, 4, groups=C, bias=False)(concat([conv_state, qkv], 1))); state_out = last 3 rows",
+     "params": {
+      "T": 2,
+      "conv_dim": 10240,
+      "kh": 16,
+      "vh": 48
+     },
+     "inputs": {
+      "real.conv_w": {
+       "shape": [
+        10240,
+        4,
+        1
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.conv_state": {
+       "shape": [
+        1,
+        3,
+        10240
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.qkv": {
+       "shape": [
+        1,
+        2,
+        10240
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "real.conv_out": {
+       "shape": [
+        1,
+        2,
+        10240
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.conv_state_out": {
+       "shape": [
+        1,
+        3,
+        10240
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "conv weight layout [C, 4, 1] as stored (already sanitized); tap j multiplies input row t+j of [state; qkv]. Real head counts kh=16/vh=48 (conv_dim 10240), T=2; recurrence only with --big (3 MB states)."
+    },
+    "real.prep": {
+     "op": "dn_prep",
+     "mlx": "q, k = normalize_qk(q, k, inv_scale=128**-0.5, eps=1e-6); g = compute_g(A_log, a, dt_bias); beta = sigmoid(b)",
+     "params": {
+      "T": 2,
+      "kh": 16,
+      "vh": 48,
+      "dk": 128,
+      "dv": 128
+     },
+     "inputs": {
+      "real.conv_out": {
+       "shape": [
+        1,
+        2,
+        10240
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.a": {
+       "shape": [
+        1,
+        2,
+        48
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.b": {
+       "shape": [
+        1,
+        2,
+        48
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.A_log": {
+       "shape": [
+        48
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.dt_bias": {
+       "shape": [
+        48
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "real.q": {
+       "shape": [
+        1,
+        2,
+        16,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.k": {
+       "shape": [
+        1,
+        2,
+        16,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.v": {
+       "shape": [
+        1,
+        2,
+        48,
+        128
+       ],
+       "dtype": "bfloat16"
+      },
+      "real.g": {
+       "shape": [
+        1,
+        2,
+        48
+       ],
+       "dtype": "float32"
+      },
+      "real.beta": {
+       "shape": [
+        1,
+        2,
+        48
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "q,k,v = split(conv_out, [kd, 2kd]) reshaped per head. normalize_qk (mlx-lm): q = (1/128) * rms_norm(q, None, 1e-6/128), k = 128**-0.5 * rms_norm(k, None, 1e-6/128) (bf16 each step). g = exp(-exp(f32 A_log) * softplus(a + dt_bias)) is f32 (a + dt_bias and softplus in bf16 inside compile); beta bf16."
+    }
+   }
+  },
+  "attn": {
+   "path": "attn.safetensors",
+   "bytes": 1838531,
+   "cases": {
+    "prep": {
+     "op": "attn_prep",
+     "mlx": "q, gate = split(qp.reshape(1,K,24,512), 2, -1); q = rope(rms_norm(q, q_norm)); k = rope(rms_norm(k, k_norm))",
+     "params": {
+      "K": 2,
+      "offset": 37,
+      "heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "rope_dims": 64,
+      "rope_theta": 10000000.0,
+      "eps": 1e-06
+     },
+     "inputs": {
+      "prep.qp": {
+       "shape": [
+        1,
+        2,
+        12288
+       ],
+       "dtype": "bfloat16"
+      },
+      "prep.kp": {
+       "shape": [
+        1,
+        2,
+        1024
+       ],
+       "dtype": "bfloat16"
+      },
+      "prep.vp": {
+       "shape": [
+        1,
+        2,
+        1024
+       ],
+       "dtype": "bfloat16"
+      },
+      "prep.q_norm": {
+       "shape": [
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "prep.k_norm": {
+       "shape": [
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "prep.q": {
+       "shape": [
+        1,
+        24,
+        2,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "prep.k": {
+       "shape": [
+        1,
+        4,
+        2,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "prep.v": {
+       "shape": [
+        1,
+        4,
+        2,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "prep.gate": {
+       "shape": [
+        1,
+        2,
+        6144
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "q/k/v outputs are [1, heads, K, 256] (transposed), gate [1, K, 24*256]. Row t has RoPE position offset + t."
+    },
+    "sdpa_n1_k1": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :1], kv.v[:, :, :1], scale=1/16, mask=None)",
+     "params": {
+      "n_keys": 1,
+      "K": 1,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": null
+     },
+     "inputs": {
+      "sdpa_n1_k1.q": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n1_k1.o": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "sdpa_n17_k1": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :17], kv.v[:, :, :17], scale=1/16, mask=None)",
+     "params": {
+      "n_keys": 17,
+      "K": 1,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": null
+     },
+     "inputs": {
+      "sdpa_n17_k1.q": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n17_k1.o": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "sdpa_n256_k1": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :256], kv.v[:, :, :256], scale=1/16, mask=None)",
+     "params": {
+      "n_keys": 256,
+      "K": 1,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": null
+     },
+     "inputs": {
+      "sdpa_n256_k1.q": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n256_k1.o": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "sdpa_n257_k1": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :257], kv.v[:, :, :257], scale=1/16, mask=None)",
+     "params": {
+      "n_keys": 257,
+      "K": 1,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": null
+     },
+     "inputs": {
+      "sdpa_n257_k1.q": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n257_k1.o": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "sdpa_n300_k1": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :300], kv.v[:, :, :300], scale=1/16, mask=None)",
+     "params": {
+      "n_keys": 300,
+      "K": 1,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": null
+     },
+     "inputs": {
+      "sdpa_n300_k1.q": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n300_k1.o": {
+       "shape": [
+        1,
+        24,
+        1,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "sdpa_n17_k2": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :17], kv.v[:, :, :17], scale=1/16, mask='causal')",
+     "params": {
+      "n_keys": 17,
+      "K": 2,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": "causal"
+     },
+     "inputs": {
+      "sdpa_n17_k2.q": {
+       "shape": [
+        1,
+        24,
+        2,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n17_k2.o": {
+       "shape": [
+        1,
+        24,
+        2,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "sdpa_n300_k2": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :300], kv.v[:, :, :300], scale=1/16, mask='causal')",
+     "params": {
+      "n_keys": 300,
+      "K": 2,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": "causal"
+     },
+     "inputs": {
+      "sdpa_n300_k2.q": {
+       "shape": [
+        1,
+        24,
+        2,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n300_k2.o": {
+       "shape": [
+        1,
+        24,
+        2,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "sdpa_n300_k8": {
+     "op": "attn_partial+attn_reduce",
+     "mlx": "mx.fast.scaled_dot_product_attention(q, kv.k[:, :, :300], kv.v[:, :, :300], scale=1/16, mask='causal')",
+     "params": {
+      "n_keys": 300,
+      "K": 8,
+      "heads": 24,
+      "kv_heads": 4,
+      "gqa": 6,
+      "scale": 0.0625,
+      "mask": "causal"
+     },
+     "inputs": {
+      "sdpa_n300_k8.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.k": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "kv.v": {
+       "shape": [
+        1,
+        4,
+        300,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "sdpa_n300_k8.o": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Use only the first n_keys of kv.k / kv.v. mask='causal' is what mlx-lm passes for L>1 with a cache: query row t (of K) sees keys [0, n - K + t]."
+    },
+    "gate": {
+     "op": "attn_reduce_gate (gate part)",
+     "mlx": "o * mx.sigmoid(gate)  # both bf16",
+     "params": {
+      "K": 2
+     },
+     "inputs": {
+      "gate.o": {
+       "shape": [
+        1,
+        2,
+        6144
+       ],
+       "dtype": "bfloat16"
+      },
+      "gate.gate": {
+       "shape": [
+        1,
+        2,
+        6144
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "gate.y": {
+       "shape": [
+        1,
+        2,
+        6144
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Qwen3NextAttention: o_proj(output * sigmoid(gate)); sigmoid in bf16, product bf16."
+    }
+   }
+  },
+  "rope": {
+   "path": "rope.safetensors",
+   "bytes": 1394281,
+   "cases": {
+    "off0": {
+     "op": "rope (attn_prep)",
+     "mlx": "nn.RoPE(64, traditional=False, base=1e7)(x, offset=0)",
+     "params": {
+      "offset": 0,
+      "K": 8,
+      "rope_dims": 64,
+      "head_dim": 256,
+      "base": 10000000.0,
+      "mlx_q_equals_q_k1": true
+     },
+     "inputs": {
+      "x.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "x.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "off0.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off0.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off0.q_k1": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Row t gets position offset + t. Rotate-half within the first 64 dims (pairs i, i+32); dims 64..255 pass through. q_k1 = one row per call at offset + t (decode path)."
+    },
+    "off1": {
+     "op": "rope (attn_prep)",
+     "mlx": "nn.RoPE(64, traditional=False, base=1e7)(x, offset=1)",
+     "params": {
+      "offset": 1,
+      "K": 8,
+      "rope_dims": 64,
+      "head_dim": 256,
+      "base": 10000000.0,
+      "mlx_q_equals_q_k1": true
+     },
+     "inputs": {
+      "x.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "x.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "off1.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off1.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off1.q_k1": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Row t gets position offset + t. Rotate-half within the first 64 dims (pairs i, i+32); dims 64..255 pass through. q_k1 = one row per call at offset + t (decode path)."
+    },
+    "off7": {
+     "op": "rope (attn_prep)",
+     "mlx": "nn.RoPE(64, traditional=False, base=1e7)(x, offset=7)",
+     "params": {
+      "offset": 7,
+      "K": 8,
+      "rope_dims": 64,
+      "head_dim": 256,
+      "base": 10000000.0,
+      "mlx_q_equals_q_k1": true
+     },
+     "inputs": {
+      "x.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "x.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "off7.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off7.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off7.q_k1": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Row t gets position offset + t. Rotate-half within the first 64 dims (pairs i, i+32); dims 64..255 pass through. q_k1 = one row per call at offset + t (decode path)."
+    },
+    "off1000": {
+     "op": "rope (attn_prep)",
+     "mlx": "nn.RoPE(64, traditional=False, base=1e7)(x, offset=1000)",
+     "params": {
+      "offset": 1000,
+      "K": 8,
+      "rope_dims": 64,
+      "head_dim": 256,
+      "base": 10000000.0,
+      "mlx_q_equals_q_k1": true
+     },
+     "inputs": {
+      "x.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "x.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "off1000.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off1000.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off1000.q_k1": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Row t gets position offset + t. Rotate-half within the first 64 dims (pairs i, i+32); dims 64..255 pass through. q_k1 = one row per call at offset + t (decode path)."
+    },
+    "off4095": {
+     "op": "rope (attn_prep)",
+     "mlx": "nn.RoPE(64, traditional=False, base=1e7)(x, offset=4095)",
+     "params": {
+      "offset": 4095,
+      "K": 8,
+      "rope_dims": 64,
+      "head_dim": 256,
+      "base": 10000000.0,
+      "mlx_q_equals_q_k1": true
+     },
+     "inputs": {
+      "x.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "x.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "off4095.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off4095.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off4095.q_k1": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Row t gets position offset + t. Rotate-half within the first 64 dims (pairs i, i+32); dims 64..255 pass through. q_k1 = one row per call at offset + t (decode path)."
+    },
+    "off131071": {
+     "op": "rope (attn_prep)",
+     "mlx": "nn.RoPE(64, traditional=False, base=1e7)(x, offset=131071)",
+     "params": {
+      "offset": 131071,
+      "K": 8,
+      "rope_dims": 64,
+      "head_dim": 256,
+      "base": 10000000.0,
+      "mlx_q_equals_q_k1": true
+     },
+     "inputs": {
+      "x.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "x.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "off131071.q": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off131071.k": {
+       "shape": [
+        1,
+        4,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      },
+      "off131071.q_k1": {
+       "shape": [
+        1,
+        24,
+        8,
+        256
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Row t gets position offset + t. Rotate-half within the first 64 dims (pairs i, i+32); dims 64..255 pass through. q_k1 = one row per call at offset + t (decode path)."
+    }
+   }
+  },
+  "embed": {
+   "path": "embed.safetensors",
+   "bytes": 819627,
+   "cases": {
+    "rows": {
+     "op": "embed_q4",
+     "mlx": "nn.QuantizedEmbedding(V, 5120, 64, 4)(ids)  # = dequantize(w[ids], s[ids], b[ids])",
+     "params": {
+      "rows_in_table": 256,
+      "dim": 5120,
+      "row_bytes": 2880
+     },
+     "inputs": {
+      "tab.w": {
+       "shape": [
+        256,
+        640
+       ],
+       "dtype": "uint32"
+      },
+      "tab.s": {
+       "shape": [
+        256,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "tab.b": {
+       "shape": [
+        256,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "rows.ids": {
+       "shape": [
+        8
+       ],
+       "dtype": "uint32"
+      }
+     },
+     "outputs": {
+      "rows.y": {
+       "shape": [
+        8,
+        5120
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Table is a random 256-row stand-in for embed_tokens (real 248320 rows; same per-row layout, 2880 B/row)."
+    }
+   }
+  },
+  "head": {
+   "path": "head.safetensors",
+   "bytes": 1531332,
+   "cases": {
+    "lm": {
+     "op": "q4b_gemv (lm_head) + argmax_b + topk32",
+     "mlx": "logits = quantized_matmul(x, w, s, b); mx.argmax(logits, -1)",
+     "params": {
+      "rows": 512,
+      "K": 4,
+      "cols": 5120
+     },
+     "inputs": {
+      "lm.w": {
+       "shape": [
+        512,
+        640
+       ],
+       "dtype": "uint32"
+      },
+      "lm.s": {
+       "shape": [
+        512,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "lm.b": {
+       "shape": [
+        512,
+        80
+       ],
+       "dtype": "bfloat16"
+      },
+      "lm.x": {
+       "shape": [
+        4,
+        5120
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "lm.logits": {
+       "shape": [
+        4,
+        512
+       ],
+       "dtype": "bfloat16"
+      },
+      "lm.logits_k1": {
+       "shape": [
+        4,
+        512
+       ],
+       "dtype": "bfloat16"
+      },
+      "lm.argmax": {
+       "shape": [
+        4
+       ],
+       "dtype": "uint32"
+      },
+      "lm.top32_idx": {
+       "shape": [
+        4,
+        32
+       ],
+       "dtype": "uint32"
+      },
+      "lm.top32_val": {
+       "shape": [
+        4,
+        32
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "note": "Logits are bf16 as MLX returns them. top32 by descending value (argsort of -logits); among equal values the index order is MLX argsort's, so compare top32 by value, and as a set where values tie."
+    },
+    "tie": {
+     "op": "argmax_b",
+     "mlx": "mx.argmax(logits_bf16, axis=-1)",
+     "params": {
+      "expected_lowest_index": [
+       3,
+       500,
+       10
+      ]
+     },
+     "inputs": {
+      "tie.logits": {
+       "shape": [
+        3,
+        1000
+       ],
+       "dtype": "bfloat16"
+      }
+     },
+     "outputs": {
+      "tie.argmax": {
+       "shape": [
+        3
+       ],
+       "dtype": "uint32"
+      }
+     },
+     "note": "Records MLX tie behaviour on bf16 logits (plan 4.3: lowest index on ties). Row 2 ties only after bf16 rounding."
+    }
+   }
+  }
+ },
+ "generator": "qwen38/make_kernel_vectors.py",
+ "seed": 0,
+ "big": false,
+ "mlx": "0.32.4",
+ "mlx_lm": "0.32.2",
+ "device": "Device(gpu, 0)",
+ "created": "2026-10-29 21:05:18",
+ "quant": {
+  "mode": "affine",
+  "group_size": 64,
+  "bits": 4,
+  "layout": "weight u32 [R, C/8], nibble j of word j//8 (low nibble first); scales/biases bf16 [R, C/64]"
+ },
+ "naming": "<case>.<role>; each case lists its input and output tensor names"
+}

@@ -1,0 +1,898 @@
+{
+ "generator": "qwen38/make_tiny_model.py --dumps",
+ "model": "models/tiny_qwen35",
+ "tokens": [
+  1275,
+  777,
+  125,
+  1457,
+  291,
+  1660
+ ],
+ "mtp_next_tokens": [
+  777,
+  125,
+  1457,
+  291,
+  1660,
+  880
+ ],
+ "mode": "stepwise (L=1 per token)",
+ "check_logits_equal_model_forward": true,
+ "check_mtp_equal_mtphead_forward": true,
+ "dtypes": "F32 (MLX bf16 values widened exactly; dn.g / dn.S are f32 in MLX); tokens, logits_top32.idx, mtp.draft are U32",
+ "notes": {
+  "L{l}.dn.proj": "[qkv | z | b | a] along the last axis (in_proj outputs, bf16)",
+  "L{l}.dn.q/k": "after normalize_qk (q carries the extra 1/sqrt(dk))",
+  "L{l}.dn.yn": "gated RMSNorm output, out_proj input",
+  "L{l}.attn.q/k": "[T, heads, 256] after q/k norm + RoPE; attn.v raw",
+  "L{l}.attn.gate": "raw gate half of q_proj (pre-sigmoid)",
+  "L{l}.attn.o": "attention output * sigmoid(gate), o_proj input",
+  "L{l}.ffn.act": "swiglu(gate_proj, up_proj), down_proj input",
+  "logits_top32": "bf16 logits sorted descending; .idx = their token ids",
+  "mtp.h_out": "MTP decoder layer output before mtp.norm; mtp.hn after it",
+  "mtp.draft": "argmax lm_head(mtp.hn): the draft for position p+2"
+ },
+ "tensors": {
+  "L0.dn.S": {
+   "shape": [
+    6,
+    128,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.beta": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.conv": {
+   "shape": [
+    6,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.conv_state": {
+   "shape": [
+    3,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.g": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.k": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.proj": {
+   "shape": [
+    6,
+    2060
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.q": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.v": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.y": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L0.dn.yn": {
+   "shape": [
+    6,
+    768
+   ],
+   "dtype": "float32"
+  },
+  "L0.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L0.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L0.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L0.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.S": {
+   "shape": [
+    6,
+    128,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.beta": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.conv": {
+   "shape": [
+    6,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.conv_state": {
+   "shape": [
+    3,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.g": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.k": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.proj": {
+   "shape": [
+    6,
+    2060
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.q": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.v": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.y": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L1.dn.yn": {
+   "shape": [
+    6,
+    768
+   ],
+   "dtype": "float32"
+  },
+  "L1.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L1.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L1.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L1.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.S": {
+   "shape": [
+    6,
+    128,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.beta": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.conv": {
+   "shape": [
+    6,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.conv_state": {
+   "shape": [
+    3,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.g": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.k": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.proj": {
+   "shape": [
+    6,
+    2060
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.q": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.v": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.y": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L2.dn.yn": {
+   "shape": [
+    6,
+    768
+   ],
+   "dtype": "float32"
+  },
+  "L2.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L2.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L2.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L2.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L3.attn.gate": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L3.attn.k": {
+   "shape": [
+    6,
+    2,
+    256
+   ],
+   "dtype": "float32"
+  },
+  "L3.attn.o": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L3.attn.q": {
+   "shape": [
+    6,
+    4,
+    256
+   ],
+   "dtype": "float32"
+  },
+  "L3.attn.v": {
+   "shape": [
+    6,
+    2,
+    256
+   ],
+   "dtype": "float32"
+  },
+  "L3.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L3.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L3.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L3.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.S": {
+   "shape": [
+    6,
+    128,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.beta": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.conv": {
+   "shape": [
+    6,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.conv_state": {
+   "shape": [
+    3,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.g": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.k": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.proj": {
+   "shape": [
+    6,
+    2060
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.q": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.v": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.y": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L4.dn.yn": {
+   "shape": [
+    6,
+    768
+   ],
+   "dtype": "float32"
+  },
+  "L4.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L4.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L4.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L4.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.S": {
+   "shape": [
+    6,
+    128,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.beta": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.conv": {
+   "shape": [
+    6,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.conv_state": {
+   "shape": [
+    3,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.g": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.k": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.proj": {
+   "shape": [
+    6,
+    2060
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.q": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.v": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.y": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L5.dn.yn": {
+   "shape": [
+    6,
+    768
+   ],
+   "dtype": "float32"
+  },
+  "L5.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L5.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L5.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L5.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.S": {
+   "shape": [
+    6,
+    128,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.beta": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.conv": {
+   "shape": [
+    6,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.conv_state": {
+   "shape": [
+    3,
+    1280
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.g": {
+   "shape": [
+    6,
+    6
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.k": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.proj": {
+   "shape": [
+    6,
+    2060
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.q": {
+   "shape": [
+    6,
+    2,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.v": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.y": {
+   "shape": [
+    6,
+    6,
+    128
+   ],
+   "dtype": "float32"
+  },
+  "L6.dn.yn": {
+   "shape": [
+    6,
+    768
+   ],
+   "dtype": "float32"
+  },
+  "L6.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L6.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L6.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L6.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L7.attn.gate": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L7.attn.k": {
+   "shape": [
+    6,
+    2,
+    256
+   ],
+   "dtype": "float32"
+  },
+  "L7.attn.o": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L7.attn.q": {
+   "shape": [
+    6,
+    4,
+    256
+   ],
+   "dtype": "float32"
+  },
+  "L7.attn.v": {
+   "shape": [
+    6,
+    2,
+    256
+   ],
+   "dtype": "float32"
+  },
+  "L7.ffn.act": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "L7.h_mid": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L7.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "L7.x_in": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "emb": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "hf": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "logits_top32": {
+   "shape": [
+    6,
+    32
+   ],
+   "dtype": "float32"
+  },
+  "logits_top32.idx": {
+   "shape": [
+    6,
+    32
+   ],
+   "dtype": "uint32"
+  },
+  "mtp.cat": {
+   "shape": [
+    6,
+    1024
+   ],
+   "dtype": "float32"
+  },
+  "mtp.draft": {
+   "shape": [
+    6
+   ],
+   "dtype": "uint32"
+  },
+  "mtp.fc": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "mtp.h_out": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "mtp.hn": {
+   "shape": [
+    6,
+    512
+   ],
+   "dtype": "float32"
+  },
+  "tokens": {
+   "shape": [
+    6
+   ],
+   "dtype": "uint32"
+  }
+ }
+}

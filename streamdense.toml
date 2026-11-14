@@ -1,0 +1,87 @@
+# streamdense.toml: RAM limits for every model run: gateway, qwen serve, the Swift app. Command-line flags still override.
+# Search order: $SD_CONFIG, ./streamdense.toml, the repo root (walking up from the binary), ~/.config/streamdense/config.toml.
+# Missing file -> the same built-in defaults. Unknown keys are an error. Check: engine/target/release/streamdense config
+# Start the gateway with these values: engine/target/release/streamdense up
+
+[ram]
+cap_gb    = 16.0   # hard cap on the model process footprint: sd-watchdog kills it, and the engine aborts itself (--abort-gb)
+swap_gb   = 7      # stop if system swap goes above this
+margin_gb = 0      # sd-watchdog margin under the cap
+nice      = 10     # CPU priority of the model process
+
+[gateway]
+model   = "models/qwen38_27b_mlx4"   # relative paths resolve against the repo root
+port    = 8898
+max_ctx = 8192
+mtp     = true
+spec_depth = "auto" # MTP drafts verified per pass: 1 = draft 1 / verify 2; 2..7 = chained drafts, one exact pass of N + 1 rows;
+                    # "auto" = adaptive 0..7 per pass (MTP confidence + acceptance history + draft table)
+gemv    = "mma"    # matmul family of decode / verify: "mma" (gemv_mma_q4.metal, default) or "old" (gemv_q4_bf16.metal, bit-exact vs MLX)
+draft_vocab = "models/qwen38_27b_mlx4/draft_vocab.keep"   # pruned MTP draft head (streamdense vocab keep); "" / absent = off. Output unchanged
+draft_table = "~/.streamdense/draft_table"   # learning draft table for spec_depth = "auto" (on by default)
+# verify_fused = false   # fused verify matmuls (bit-identical, faster verify of 3..8 rows); default OFF; or --verify-fused
+# drafter = ""          # DFlash block drafter dir (kit export_engine.py output); "" = off. Replaces MTP, snapshots off; or --drafter DIR
+# dflash2 = ""          # DFlash2 drafter dir (models/dflash2_27b_q4); "" = off (experimental). Replaces MTP, snapshots off; or --dflash2 DIR / --no-dflash2. Budget must fit [ram] cap_gb; refused with drafter or the 12 GB mode
+
+[watcher]   # domain watcher: always on (no off switch); topic domains (not languages); learns every turn, decides over long windows; dry-run plans
+mode                    = "observe"   # "observe" = decide + log what would unload; "unload" reserved (observes until then)
+decide_window_folds     = 3           # decision window = 3 compactions (fold notes) ...
+decide_window_min_turns = 50          # ... and at least 50 turns (no folds from the client: closes at 2 x 50 turns)
+opp_similarity          = 0.25        # similarity gate: a job below this similarity to its label's slot (cosine; ~0.5 unrelated, 1 same) is held out of it until it persists over the decision window
+fold_every              = 8           # heat store: fold same-label jobs to disk in batches of this many (also on label change, 30 s idle, shutdown); 1 = every job
+margin                  = 0.15        # window's top domain must lead the runner-up by this (also per turn, to learn into its label)
+hysteresis              = 1           # switch after this many windows in a row agree (sub-margin windows keep the count)
+go_live_points          = 50          # go-live: clean-audit points in a row (every reply is audited in idle time; clean 1.0, mask-caused mismatch = reset + tighten)
+# sample_ms             = 100         # low-level watcher: recorder sample period (background-QoS thread); default 100
+keep_frac               = 0.995       # unload plan: keep the FFN blocks / heads covering this share of the domain's activity
+granularity             = 64          # FFN neurons per block (plans + block profiles; per-neuron sums are stored too)
+keep_languages          = "all-except-cut"   # languages are never domains; every kept language is always hot (never unloaded)
+cut_languages           = ["zh", "ja", "ko", "tl", "id", "ms"]   # always "opposite": their specialist weights unload first (reserved)
+mask                    = "dry"       # read mask: "off" (nothing built / written) | "dry" (profile + CPU prompt predictor score + exploration schedule, reported; no mask applied) | "on" (off by default; acts as dry until the engine hook exists)
+profile_window          = "all"       # read-mask profile ("all": a tiny session part marks different blocks and the union keeps 2-3x more): union of the keep sets of these pooled parts (now | session | all | now+all | session+all | now+session+all)
+explore_frac            = 0.02        # exploration: share of the masked blocks / heads re-read per idle round (CPU-ranked, rotating)
+dir                     = "~/.streamdense/watcher"   # state, profiles/, decisions.jsonl, notes.jsonl, audits.jsonl, heat/
+# library               = true        # answer library (OFF by default): one record per turn (prompt -> answer FFN activity, 2.37 MB on the 27B) in <dir>/library/, ring capped below
+# library_cap_gb        = 1.0         # ring file cap in GB (~420 turns per GB on the 27B; oldest dropped first)
+# library_text          = false       # also store the newest user message text (privacy: off by default)
+
+# [forheader]   # 12 GB mode (research; OFF by default). Needs the global score file: streamdense forheader export --data DIR
+# mode          = "12gb"   # "off" (default) | "12gb"; also `streamdense gateway --forheader 12gb`
+# cap_gb        = 12.0     # RAM the resident model part is sized for (by formula); [ram] cap_gb stays the hard kill limit
+# mtp           = false    # MTP decode in this mode (costs resident model memory); [gateway] mtp does not apply here
+# slots         = 2        # prompt-read slots (1..4)
+# host          = true     # keep the prompt-read slots inside idle model memory (no extra RAM)
+# stream_tokens = 8192     # max prompt tokens per streamed pass (capped at max_ctx)
+# fast          = true     # fast prompt read (default ON; ~1.8x faster TTFT on the 27B; not bit-exact with the exact read): false = exact read, or --no-fast
+# fused         = true     # fused decode (default ON; bit-identical, 27B ~10% faster per token): false = old decode loop, or --no-fused
+# ctx_draft     = false    # context drafts (default OFF): draft from text already in the context (+ [gateway] draft_table) and check each block in one pass; output identical; or --ctx-draft
+# ctx_draft_max = 7        # max drafts per check pass (1..7)
+# verify_fused  = false    # fused verify matmuls in this mode (bit-identical); default OFF; or --verify-fused
+# t1            = "~/.streamdense/forheader/t1.sdt1"
+# (in this mode: snapshots, the activity recorder and the answer library are off)
+
+[snapshots]   # snapshot tiers (gateway): hot = RAM copies, warm = files on SSD, cold = deleted by the disk policy (docs/GATEWAY.md)
+max_disk_gb          = 8.0    # total size of the snapshot files (--snapshot-max-gb wins); oldest / least used deleted first
+max_files            = 32     # number of snapshot files (--snapshot-max-files wins)
+min_free_disk_gb     = 20.0   # never save below this much free disk; files are evicted until it holds
+idle_s               = 5.0    # gateway idle this long (nothing running or queued) before idle work starts
+idle_save            = true   # idle work: save the live session (prompt + reply) so the next turn / a restart restores it
+idle_save_min_tokens = 256    # ... when it is at least this many tokens past that session's newest file
+preread              = true   # idle work: page in the snapshot files most likely needed next (OS file cache)
+preread_files        = 2      # ... at most this many files
+preread_gb           = 1.5    # ... and this many GB per idle period
+hot_gb               = 1.0    # hot tier: RAM copies of recent sessions, only while footprint + copy + headroom <= [ram] cap_gb (none in 12 GB mode)
+hot_headroom_gb      = 1.0    # (32 GB machine: [ram] cap_gb ~ 28 and hot_gb ~ 2 keep the shared prefix + a live turn in RAM)
+hot_stable           = true   # hot tier: also a RAM copy of the shared prefix (system prompt + tools) when it fits without dropping another copy
+switch_save          = true   # multi-user: save the live conversation before another conversation's request replaces it ...
+switch_save_min_tokens = 64   # ... when it is at least this many tokens past that conversation's newest file
+
+# [history]   # history index (OFF by default): drafts for the 12 GB mode's context drafts from text you already have (lossless)
+# enabled   = false
+# dir       = "~/.streamdense/history_index"   # build ahead: streamdense index build --project DIR
+# budget_mb = 32       # hard RAM bound (counted in the 12 GB keep formula)
+# project   = ""       # project dir re-scanned (only changed files) at gateway start; "" = none
+# sessions  = ""       # session logs (JSON / JSONL file or dir) scanned at gateway start; "" = none
+
+# [dflash2]              # read only when [gateway] dflash2 / --dflash2 is on
+# expected_sha256 = "ac61dedfd68c6524b71fd96cbe50a2e20749edfc0fbb25f964f61b93efcd022e"  # weights file check; a mismatch refuses the start

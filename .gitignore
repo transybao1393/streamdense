@@ -1,0 +1,57 @@
+# Build output
+engine/target/
+target/
+app/.build/
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Model weights and exports (large; fetched with sd-fetch)
+models/
+exports/
+
+
+# Scratch
+scratch/
+tmp/
+
+# Python leftovers
+__pycache__/
+*.pyc
+
+# OS / logs
+.DS_Store
+*.log
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Secrets / local env
+.env
+.env.*
+
+# Profiling / crash output
+*.profraw
+*.trace/
+*.dSYM/
+
+# Engine snapshots (KV/DeltaNet state, ~240 MB each) and gateway logs
+*.sdsnap
+gw*.jsonl
+*.msnap
+*.esnap
+
+# Extra build dirs (a dev build next to a running release build)
+target-dev/
+target-cli/
+engine/target-*/
+
+# History index and snapshot tier index (local state)
+*.sdh
+tiers.json
