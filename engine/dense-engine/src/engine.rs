@@ -7,7 +7,7 @@
 //! ctrl.pos set on the GPU) or `DecodeMode::Sync` (the `step` loop). No MTP / speculation.
 use crate::config::DenseConfig;
 use crate::gpu::{commit, run, wait, Arena, CmdBuf, Gpu, SdCtrl};
-use crate::config::{rope_inv_freq, RopeScaling};
+use crate::config::{rope_inv_freq, su_inv_freq, RopeScaling};
 use crate::model::{self, AttnImpl, Dims, Kv, PassIo, BF, CHUNK, F32, K_MAX};
 use crate::prefill::{Prefill, PrefillModel};
 use crate::weights::{self, SafeSource, TensorSource, Weights};
@@ -84,6 +84,8 @@ pub struct Engine {
     pub dims: Dims,
     /// per layer: sliding window (None = full attention)
     pub windows: Vec<Option<u32>>,
+    /// per layer: RoPE applied (false on `no_rope_layers`)
+    pub rope: Vec<bool>,
     pub attn: AttnImpl,
     pub max_ctx: usize,
     /// max rows of one pass (attn.max_pass())
@@ -152,6 +154,7 @@ impl Engine {
         let (h, nh, nkv, hd) = (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim);
         let dims = Dims::new(&cfg);
         let windows = model::layer_windows(&cfg);
+        let rope = model::layer_rope(&cfg);
         let prow = cfg.attn_in_rows();
         let kv_layer = nkv * max_ctx * hd * BF;
         let al = |n: usize| (n + 255) / 256 * 256;
@@ -171,7 +174,7 @@ impl Engine {
         if total > gpu.max_buffer() {
             return Err(format!("engine: arena {} B > max Metal buffer {} B (lower --max-ctx or split the arena)", total, gpu.max_buffer()));
         }
-        for p in model::pipelines(opts.attn, &dims, &windows) { gpu.pipeline(&p)?; }
+        for p in model::pipelines(opts.attn, &dims, &windows, &rope) { gpu.pipeline(&p)?; }
         let mut arena = Arena::new(&gpu, total)?;
         let base = arena.alloc(w.bytes);
         weights::load_into(src, &jobs, arena.bytes_mut(base, w.bytes))?;
@@ -189,7 +192,9 @@ impl Engine {
         let invf_local = nx();
         arena.put(io.ctrl, &[SdCtrl::default()]);
         // RoPE tables: plain ones from the kernel (Qwen: as before), scaled ones computed on the host
-        if cfg.rope_scale == RopeScaling::None {
+        if let Some(su) = &cfg.rope_su {
+            arena.put(io.invf, &su_inv_freq(cfg.rope_dims, cfg.rope_theta, su));
+        } else if cfg.rope_scale == RopeScaling::None {
             run(&gpu, &arena, |e| model::encode_rope_invf(e, cfg.rope_dims, cfg.rope_theta, io.invf))?;
         } else {
             arena.put(io.invf, &rope_inv_freq(cfg.rope_dims, cfg.rope_theta, cfg.rope_scale));
@@ -200,7 +205,7 @@ impl Engine {
             run(&gpu, &arena, |e| model::encode_rope_invf(e, cfg.rope_dims, t, invf_local))?;
         }
         Ok(Engine {
-            cfg, gpu, arena, w, kv, dims, windows, attn: opts.attn, max_ctx, pass_max: r, prefill_mode: opts.prefill, decode_mode: opts.decode, pf: None, io, pos: 0,
+            cfg, gpu, arena, w, kv, dims, windows, rope, attn: opts.attn, max_ctx, pass_max: r, prefill_mode: opts.prefill, decode_mode: opts.decode, pf: None, io, pos: 0,
             logits_alt, cur_logits: io.logits,
             load_s: t0.elapsed().as_secs_f64(), arena_bytes: total,
         })
@@ -223,10 +228,12 @@ impl Engine {
         let io = PassIo { k, pos: self.pos, ..self.io };
         self.arena.put(io.tok, tokens);
         self.arena.put(io.ctrl, &[SdCtrl { pos: self.pos as u32, ..Default::default() }]);
-        let (d, w, kv, attn, wins) = (&self.dims, &self.w, &self.kv, self.attn, &self.windows);
+        let (d, w, kv, attn, wins, rope) = (&self.dims, &self.w, &self.kv, self.attn, &self.windows, &self.rope);
         run(&self.gpu, &self.arena, |e| {
             model::encode_embed(e, d, w, &io);
-            for ((lw, kvl), win) in w.layers.iter().zip(kv).zip(wins) { model::encode_layer(e, d, lw, kvl, &io, attn, *win); }
+            for (((lw, kvl), win), r) in w.layers.iter().zip(kv).zip(wins).zip(rope) {
+                model::encode_layer(e, d, lw, kvl, &io, attn, *win, *r);
+            }
             if head { model::encode_head(e, d, w, &io); }
         })?;
         self.pos += k;
@@ -308,11 +315,13 @@ impl Engine {
     fn commit_step(&self, pos: usize, slot: usize) -> CmdBuf {
         let logits = if slot == 0 { self.io.logits } else { self.logits_alt };
         let io = PassIo { k: 1, pos, logits, ..self.io };
-        let (d, w, kv, attn, wins) = (&self.dims, &self.w, &self.kv, self.attn, &self.windows);
+        let (d, w, kv, attn, wins, rope) = (&self.dims, &self.w, &self.kv, self.attn, &self.windows, &self.rope);
         commit(&self.gpu, &self.arena, |e| {
             model::encode_next_tok(e, &io);
             model::encode_embed(e, d, w, &io);
-            for ((lw, kvl), win) in w.layers.iter().zip(kv).zip(wins) { model::encode_layer(e, d, lw, kvl, &io, attn, *win); }
+            for (((lw, kvl), win), r) in w.layers.iter().zip(kv).zip(wins).zip(rope) {
+                model::encode_layer(e, d, lw, kvl, &io, attn, *win, *r);
+            }
             model::encode_head(e, d, w, &io);
         })
     }

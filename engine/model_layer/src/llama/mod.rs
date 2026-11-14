@@ -9,10 +9,8 @@
 //! - `template`: chat template kinds (Llama 3 header, Llama 3.1 / 3.2 dated header, ChatML for SmolLM2), picked from
 //!   the model folder's `chat_template.jinja` / `tokenizer_config.json` text markers.
 //!
-//! "mistral" is NOT in `MODEL_TYPES`: its `sliding_window` (v0.1: 4096 on every layer) is handled differently by HF
-//! (masks keys outside the window) and mlx_lm (Mistral runs through the Llama module, which ignores it), and its chat
-//! template is the `[INST]` one, which is not ported. A Mistral folder therefore gets the model layer's
-//! "not supported yet" error, not a silently different model.
+//! "mistral" is NOT in `MODEL_TYPES`: Mistral has its own family folder (`crate::mistral`: config mapping, `[INST]`
+//! chat templates), registered in `family::FAMILIES`.
 //!
 //! Prompt encoding: the rendered chat strings already contain the BOS text where the template puts one
 //! (`<|begin_of_text|>`), so encode them with special-token recognition and WITHOUT the tokenizer's post-processor BOS

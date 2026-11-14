@@ -2,7 +2,8 @@
 // (sdpa_vector / sdpa_vector_2pass: thread layout, reduction order, block partial rounding).
 // Full MIT license text: THIRD_PARTY_NOTICES.md at the repository root.
 //
-// attn_hd128_sdpa.metal - dense-engine: MLX-matching decode attention at head dim D = 64, 128 or 256 (attn<D>_sdpa_vec).
+// attn_hd128_sdpa.metal - dense-engine: MLX-matching decode attention at head dim D = 64, 96, 128, 160 or 256
+// (attn<D>_sdpa_vec; D = 160: same arithmetic, MLX itself has no sdpa_vector for it).
 // Needs engine/shaders/common_bf16.metal (bf, to_bf, SdCtrl) and attn_hd128.metal (function constants QD_FC_*,
 // qd_scale, qd_softcap, qd_key_lo) first in the concatenated source.
 // Port of engine/shaders/attn_gated.metal's attn_sdpa_vec_b16 (D = 256) to a template over D. Optional per-pipeline
@@ -181,4 +182,4 @@ kernel void attn_sdpa_vec(device const ushort* qr [[buffer(0)]], device const us
     device const ushort*, device const ushort*, device const ushort*, device ushort*, device const SdCtrl*, \
     constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, uint2, uint2, uint, \
     uint);
-AVS(128) AVS(64) AVS(256)
+AVS(128) AVS(64) AVS(256) AVS(96) AVS(160)

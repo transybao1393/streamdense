@@ -2,7 +2,8 @@
 // (via engine/shaders/attn_gated.metal: MLX sdpa partition and rounding; steel BaseMMAFrag fragment layout).
 // Full MIT license text: THIRD_PARTY_NOTICES.md at the repository root.
 //
-// attn_hd128_flash.metal - dense-engine: prefill flash attention at head dim HD = 64, 128 or 256 (attn{HD}_flash).
+// attn_hd128_flash.metal - dense-engine: prefill flash attention at head dim HD = 64, 96, 128, 160 or 256
+// (attn{HD}_flash).
 // Needs engine/shaders/common_bf16.metal (bf, to_bf, SdCtrl) and attn_hd128.metal (function constants QD_FC_*,
 // qd_scale, qd_softcap, qd_key_ok, qd_key_lo) first in the concatenated source.
 // Port of engine/shaders/attn_gated.metal's attn_flash_b16 (HD = 256, always gated) to a template over HD, ungated by
@@ -155,4 +156,4 @@ kernel void attn_flash(device const ushort* qr [[buffer(0)]], device const ushor
 #define AQF(HD_) template [[host_name("attn" #HD_ "_flash")]] kernel void attn_flash<HD_>(device const ushort*, \
     device const ushort*, device const ushort*, device const ushort*, device ushort*, device const SdCtrl*, \
     constant uint&, constant uint&, constant uint&, constant uint&, constant uint&, uint2, uint2, uint, uint, uint);
-AQF(128) AQF(64) AQF(256)
+AQF(128) AQF(64) AQF(256) AQF(96) AQF(160)

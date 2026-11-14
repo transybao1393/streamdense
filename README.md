@@ -78,7 +78,8 @@ Options, snapshots, the 12 GB mode and the request log are described in [docs/GA
 ## Supported models
 
 The gateway above (MTP speculative decoding, 12 GB mode) is built for Qwen3.8-27B. Other dense models run through
-`sd-model-layer`, plain greedy decoding, raw prompt (`--prompt`) or the model's chat template (`--chat`, every family below).
+`sd-model-layer`, plain greedy decoding, raw prompt (`--prompt`) or the model's chat template (`--chat`, every family below
+except the StarCoder2 base model). Head dims 64 / 96 / 128 / 160 / 256.
 Full guide, limits and example output: [engine/model_layer/README.md](engine/model_layer/README.md).
 
 | Family | `model_type` | Engine | Notes |
@@ -89,8 +90,16 @@ Full guide, limits and example output: [engine/model_layer/README.md](engine/mod
 | Llama (Llama 3.x, SmolLM) | `llama` | [engine/dense-engine](engine/dense-engine/README.md) | head dim 64 / 128 / 256, llama3 RoPE; checked against MLX on Llama-3.2-1B-Instruct and SmolLM-135M-Instruct ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
 | Granite (dense) | `granite` | [engine/dense-engine](engine/dense-engine/README.md) | Granite multipliers; checked against MLX on granite-4.2-3b ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)); MoE / Mamba-hybrid Granite refused |
 | Gemma 1 | `gemma` | [engine/dense-engine](engine/dense-engine/README.md) | tanh GELU (per config); checked against MLX on gemma-1.1-2b-it ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
-| Gemma 2 | `gemma2` | [engine/dense-engine](engine/dense-engine/README.md) | soft caps, sliding window; checked against MLX on gemma-2-2b-it; past the 4096-token window not verified ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
-| Gemma 3 (text) | `gemma3_text` | [engine/dense-engine](engine/dense-engine/README.md) | head dim 256, sliding window; checked against MLX on gemma-3-270m-it; beyond 512 tokens near-match, open issue ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
+| Gemma 2 | `gemma2` | [engine/dense-engine](engine/dense-engine/README.md) | soft caps, sliding window; checked against MLX on gemma-2-2b-it, also past the 4096-token window (16 / 16 at 4331 prompt tokens vs a correctly windowed reference) ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
+| Gemma 3 (text) | `gemma3_text` | [engine/dense-engine](engine/dense-engine/README.md) | head dim 256, sliding window; checked against MLX on gemma-3-270m-it; past the 512-token window the misses are bf16 near-ties (layer-by-layer check, no bug found) ([results](engine/model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14)) |
+| Mistral | `mistral` | [engine/dense-engine](engine/dense-engine/README.md) | Llama layer math, `[INST]` chat templates (v0.3, Nemo, Tekken); checked against MLX on Mistral-7B-Instruct-v0.3 ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
+| Phi-3 / Phi-3.5 / Phi-4-mini | `phi3` | [engine/dense-engine](engine/dense-engine/README.md) | fused qkv / gate_up, partial rotary, LongRoPE (as mlx_lm), head dim 96 / 128; checked against MLX on Phi-4-mini-instruct and Phi-3.5-mini-instruct; prompts over 4096 tokens not exercised ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
+| OLMo 2 | `olmo2` | [engine/dense-engine](engine/dense-engine/README.md) | post-norm layers, q / k norm over the whole projection; checked against MLX on OLMo-2-1124-7B-Instruct ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
+| SmolLM3 | `smollm3` | [engine/dense-engine](engine/dense-engine/README.md) | no-RoPE layers; chat template with the local date (as HF); checked against MLX on SmolLM3-3B ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
+| GLM-4 (0414) | `glm4` | [engine/dense-engine](engine/dense-engine/README.md) | four norms, fused gate_up, interleaved partial RoPE; checked against MLX on GLM-4-9B-0414 ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
+| StableLM 2 | `stablelm` | [engine/dense-engine](engine/dense-engine/README.md) | LayerNorm, sequential or parallel residual, per-head LayerNorm QK-norm, partial RoPE, head dim 64 / 160 (160 synthetic-tested only); checked against MLX on stablelm-2-1_6b-chat ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
+| Command R7B | `cohere2` | [engine/dense-engine](engine/dense-engine/README.md) | LayerNorm, parallel block, sliding layers + no-RoPE full layers, logit scale; checked against MLX on c4ai-command-r7b-12-2024 ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
+| StarCoder2 | `starcoder2` | [engine/dense-engine](engine/dense-engine/README.md) | LayerNorm, non-gated GELU MLP, biases; base model, `--prompt` only (no chat template); checked against MLX on starcoder2-3b ([results](engine/model_layer/README.md#more-families-vs-mlx-2026-11-15)) |
 
 MLX 4-bit (group 64) weights only. MoE models and other families are refused by name.
 

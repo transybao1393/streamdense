@@ -31,11 +31,13 @@
 //! `attn{HD}_flash` with function constants), unfused residuals (o / down bias, post-attention / post-feedforward
 //! norm, residual multiplier: GEMM m0 -> qd_bias_add -> rmsnorm_b -> qd_residual), unfused FFN (GeGLU or MLP bias:
 //! gate GEMM m0, up GEMM m0, biases, qd_glu), logits scaling / final soft cap (qd_logits_post) before argmax_b.
+//! Layer forms, norms, plain MLP, OLMo 2 full-projection QK-norm and the prep variants as `model::encode_layer`
+//! (see model.rs), with GEMMs.
 use std::ptr::NonNull;
 
 use objc2_metal::*;
 
-use super::config::{rope_inv_freq, DenseConfig, RopeScaling};
+use super::config::{rope_inv_freq, su_inv_freq, Block, DenseConfig, NormKind, RopeScaling};
 use super::gpu::{Arena, Buffer, Gpu, SdCtrl};
 use super::model::{self, Dims};
 use super::weights::{LayerW, Q4, Weights};
@@ -61,12 +63,13 @@ pub fn pipelines(cfg: &DenseConfig) -> Vec<String> {
         v.push(format!("q4b_gemm_swiglu_{}x{}", bm, bn));
     }
     for n in ["qd_embed_q4", "rmsnorm_b", "qd_bias_add", "attn128_rope_invf", "argmax_b", "qm_gemvt_k1_s8_m3",
-              "qd_scale_b16", "qd_residual", "qd_glu", "qd_logits_post", "qd_embed_b16", "qd_gemv_b16_f32"] {
+              "qd_scale_b16", "qd_residual", "qd_glu", "qd_logits_post", "qd_embed_b16", "qd_gemv_b16_f32",
+              "qd_layernorm", "qd_rmsnorm_rows", "qd_act_b16"] {
         v.push(n.into());
     }
     let d = Dims::new(cfg);
-    for w in model::layer_windows(cfg) {
-        let av = d.variant(w);
+    for (w, r) in model::layer_windows(cfg).into_iter().zip(model::layer_rope(cfg)) {
+        let av = d.variant(w, r);
         v.push(av.prep());
         v.push(av.flash());
     }
@@ -118,6 +121,7 @@ pub struct Prefill {
     vocab: usize,
     dims: Dims,
     windows: Vec<Option<u32>>,
+    rope: Vec<bool>,
 }
 
 /// Encoder binding either the engine arena (`a`) or the prefill scratch (`s`).
@@ -174,6 +178,16 @@ impl PEnc<'_> {
     fn rmsnorm(&self, n: usize, eps: f32, t: usize, x: usize, w: usize, out: usize) {
         self.pso("rmsnorm_b").s(0, x).a(1, w).s(2, out).u(3, n as u32).f(4, eps).u(5, n as u32).groups((t, 1), 1024);
     }
+    /// t rows of hidden size `n`: RMSNorm (rmsnorm_b) or LayerNorm with optional bias (qd_layernorm).
+    fn norm(&self, kind: NormKind, n: usize, eps: f32, t: usize, x: usize, w: usize, b: Option<usize>, out: usize) {
+        match kind {
+            NormKind::Rms => self.rmsnorm(n, eps, t, x, w, out),
+            NormKind::LayerNorm { .. } => {
+                self.pso("qd_layernorm").s(0, x).a(1, w).a(2, b.unwrap_or(w)).s(3, out).u(4, n as u32).f(5, eps)
+                    .u(6, b.is_some() as u32).groups((t, 1), 1024);
+            }
+        }
+    }
     /// scratch p bf16 [t][n] += arena bias [n]
     fn bias_add(&self, p: usize, b: usize, n: usize, t: usize) {
         self.pso("qd_bias_add").s(0, p).a(1, b).u(2, n as u32).threads((n, t), 256);
@@ -196,7 +210,7 @@ impl Prefill {
     pub fn new(gpu: &mut Gpu, cfg: &DenseConfig, t_max: usize) -> Result<Prefill, String> {
         if t_max == 0 { return Err("prefill: t_max 0".into()); }
         if !crate::config::HEAD_DIMS.contains(&cfg.head_dim) {
-            return Err(format!("prefill: head_dim {} (need 64, 128 or 256)", cfg.head_dim));
+            return Err(format!("prefill: head_dim {} (need 64, 96, 128, 160 or 256)", cfg.head_dim));
         }
         let grp = cfg.grp();
         if grp == 0 || cfg.heads % cfg.kv_heads != 0 || grp > 32 {
@@ -211,7 +225,7 @@ impl Prefill {
             t * cfg.inter * BF, h * BF, cfg.vocab * F32, (cfg.rope_dims / 2) * F32, std::mem::size_of::<SdCtrl>(),
             std::mem::size_of::<SdCtrl>(), 16, 256,
             if dims.ffn_unfused { t * cfg.inter * BF } else { 0 },
-            if dims.resid_mult != 1.0 || cfg.o_bias || cfg.mlp_bias || cfg.four_norms { t * h * BF } else { 0 },
+            if dims.resid_mult != 1.0 || cfg.o_bias || cfg.mlp_bias || cfg.four_norms || cfg.block != Block::Sequential { t * h * BF } else { 0 },
             if cfg.rope_local_theta.is_some() { (cfg.rope_dims / 2) * F32 } else { 0 },
         ];
         let total = sizes.iter().map(|n| (n + 255) / 256 * 256).sum::<usize>() + 256;
@@ -223,9 +237,12 @@ impl Prefill {
             ctrl: nx(), hctrl: nx(), rec: nx(), dummy: nx(), f2: nx(), r: nx(), invf_local: nx(),
         };
         if cfg.rope_local_theta.is_none() { io.invf_local = io.invf; }
-        let pf = Prefill { t_max, scratch, io, hidden: h, vocab: cfg.vocab, dims, windows: model::layer_windows(cfg) };
+        let pf = Prefill { t_max, scratch, io, hidden: h, vocab: cfg.vocab, dims, windows: model::layer_windows(cfg),
+                           rope: model::layer_rope(cfg) };
         let n = cfg.rope_dims / 2;
-        if cfg.rope_scale == RopeScaling::None {
+        if let Some(su) = &cfg.rope_su {
+            pf.scratch.put(pf.io.invf, &su_inv_freq(cfg.rope_dims, cfg.rope_theta, su));
+        } else if cfg.rope_scale == RopeScaling::None {
             let l2 = (cfg.rope_theta as f32).log2();
             pf.run_cb(gpu, &pf.scratch.buf, |e| { e.pso("attn128_rope_invf").s(0, pf.io.invf).f(1, l2).threads((n, 1), n); })?;
         } else {
@@ -304,11 +321,13 @@ impl Prefill {
             let n = t * cfg.hidden;
             e.pso("qd_scale_b16").s(0, io.h).u(1, n as u32).f(2, self.dims.embed_scale).threads((n, 1), 256);
         }
-        for ((lw, &kv), &win) in m.w.layers.iter().zip(&m.kv).zip(&self.windows) { self.encode_layer(e, m, lw, kv, win, t); }
+        for (((lw, &kv), &win), &rope) in m.w.layers.iter().zip(&m.kv).zip(&self.windows).zip(&self.rope) {
+            self.encode_layer(e, m, lw, kv, win, rope, t);
+        }
     }
 
     /// h += mult * post(m x + bias) over t rows (fused GEMM MODE 2 when there is nothing else, as before).
-    fn residual(&self, e: &PEnc, mat: &Q4, bias: Option<usize>, post: Option<usize>, t: usize, x: usize) {
+    fn residual(&self, e: &PEnc, mat: &Q4, bias: Option<usize>, post: Option<(usize, Option<usize>)>, t: usize, x: usize) {
         let (d, io) = (&self.dims, &self.io);
         if bias.is_none() && post.is_none() && d.resid_mult == 1.0 {
             e.gemm(mat, t, 2, x, io.h);
@@ -316,23 +335,53 @@ impl Prefill {
         }
         e.gemm(mat, t, 0, x, io.r);
         if let Some(b) = bias { e.bias_add(io.r, b, d.hidden, t); }
-        let r = match post { Some(w) => { e.rmsnorm(d.hidden, d.eps, t, io.r, w, io.x); io.x } None => io.r };
+        let r = match post { Some((w, b)) => { e.norm(d.norm, d.hidden, d.eps, t, io.r, w, b, io.x); io.x } None => io.r };
         let n = t * d.hidden;
         e.pso("qd_residual").s(0, io.h).s(1, r).u(2, n as u32).f(3, d.resid_mult).threads((n, 1), 256);
     }
 
-    fn encode_layer(&self, e: &PEnc, m: &PrefillModel, lw: &LayerW, (kc, vc): (usize, usize), win: Option<u32>, t: usize) {
+    /// io.f = FFN activation of t rows of `x` (fused SwiGLU GEMM; gate / up GEMMs + biases + qd_glu; or `Mlp::Plain`
+    /// up GEMM + bias + qd_act_b16).
+    fn ffn(&self, e: &PEnc, lw: &LayerW, t: usize, x: usize) {
+        let (d, io) = (&self.dims, &self.io);
+        let n = t * d.inter;
+        if d.mlp_plain {
+            e.gemm(&lw.up, t, 0, x, io.f);
+            if let Some(b) = lw.up_bias { e.bias_add(io.f, b, d.inter, t); }
+            e.pso("qd_act_b16").s(0, io.f).u(1, n as u32).u(2, d.act).threads((n, 1), 256);
+        } else if d.ffn_unfused {
+            e.gemm(&lw.gate, t, 0, x, io.f);
+            e.gemm(&lw.up, t, 0, x, io.f2);
+            if let Some(b) = lw.gate_bias { e.bias_add(io.f, b, d.inter, t); }
+            if let Some(b) = lw.up_bias { e.bias_add(io.f2, b, d.inter, t); }
+            e.pso("qd_glu").s(0, io.f).s(1, io.f2).s(2, io.f).u(3, n as u32).u(4, d.act).threads((n, 1), 256);
+        } else {
+            e.swiglu(&lw.gate, &lw.up, t, x, io.f);
+        }
+    }
+
+    fn encode_layer(&self, e: &PEnc, m: &PrefillModel, lw: &LayerW, (kc, vc): (usize, usize), win: Option<u32>, rope: bool, t: usize) {
         let (d, io) = (&self.dims, &self.io);
         let (h, nh, nkv, eps) = (d.hidden, d.nh, d.nkv, d.eps);
         let prow = lw.qkv.rows;
-        let av = d.variant(win);
-        e.rmsnorm(h, eps, t, io.h, lw.in_norm, io.x);
-        e.gemm(&lw.qkv, t, 0, io.x, io.p);
+        let av = d.variant(win, rope);
+        let ain = if d.block == Block::PostNorm { io.h } else {
+            e.norm(d.norm, h, eps, t, io.h, lw.in_norm, lw.in_norm_bias, io.x);
+            io.x
+        };
+        e.gemm(&lw.qkv, t, 0, ain, io.p);
         if let Some(b) = lw.qkv_bias { e.bias_add(io.p, b, prow, t); }
-        let flags = if lw.q_norm.is_some() { 1u32 } else { 0 };
+        if d.qk_full {
+            let (qd, kvd) = (nh * d.hd, nkv * d.hd);
+            for (off, n, w) in [(0, qd, lw.q_norm), (qd, kvd, lw.k_norm)] {
+                e.pso("qd_rmsnorm_rows").s(0, io.p + off * BF).a(1, w.unwrap()).u(2, n as u32).f(3, eps)
+                    .u(4, prow as u32).groups((t, 1), 1024);
+            }
+        }
+        let flags = if lw.q_norm.is_some() && !d.qk_full { 1u32 } else { 0 };
         e.pso(&av.prep()).s(0, io.p);
-        match (lw.q_norm, lw.k_norm) {
-            (Some(q), Some(k)) => { e.a(1, q).a(2, k); }
+        match (lw.q_norm, lw.k_norm, d.qk_full) {
+            (Some(q), Some(k), false) => { e.a(1, q).a(2, k); }
             _ => { e.s(1, io.dummy).s(2, io.dummy); }
         }
         let invf = if win.is_some() { io.invf_local } else { io.invf };
@@ -343,26 +392,48 @@ impl Prefill {
         e.pso(&av.flash()).s(0, io.qr).a(1, kc).a(2, vc).s(3, io.p).s(4, io.ao).s(5, io.ctrl)
             .u(6, m.max_ctx as u32).u(7, grp as u32).u(8, prow as u32).u(9, t as u32).u(10, 0)
             .groups((t.div_ceil(8), nkv), 32 * grp);
-        self.residual(e, &lw.o, lw.o_bias, lw.post_attn_norm, t, io.ao);
-        e.rmsnorm(h, eps, t, io.h, lw.post_norm, io.x);
-        if d.ffn_unfused {
-            e.gemm(&lw.gate, t, 0, io.x, io.f);
-            e.gemm(&lw.up, t, 0, io.x, io.f2);
-            if let Some(b) = lw.gate_bias { e.bias_add(io.f, b, d.inter, t); }
-            if let Some(b) = lw.up_bias { e.bias_add(io.f2, b, d.inter, t); }
-            let n = t * d.inter;
-            e.pso("qd_glu").s(0, io.f).s(1, io.f2).s(2, io.f).u(3, n as u32).u(4, d.act).threads((n, 1), 256);
-        } else {
-            e.swiglu(&lw.gate, &lw.up, t, io.x, io.f);
+        let post_attn = lw.post_attn_norm.map(|w| (w, lw.post_attn_norm_bias));
+        let post_ffw = lw.post_ffw_norm.map(|w| (w, lw.post_ffw_norm_bias));
+        match d.block {
+            Block::Sequential => {
+                self.residual(e, &lw.o, lw.o_bias, post_attn, t, io.ao);
+                e.norm(d.norm, h, eps, t, io.h, lw.post_norm, lw.post_norm_bias, io.x);
+                self.ffn(e, lw, t, io.x);
+                self.residual(e, &lw.down, lw.down_bias, post_ffw, t, io.f);
+            }
+            Block::PostNorm => {
+                self.residual(e, &lw.o, lw.o_bias, post_attn, t, io.ao);
+                self.ffn(e, lw, t, io.h);
+                self.residual(e, &lw.down, lw.down_bias, post_ffw, t, io.f);
+            }
+            Block::Parallel => {
+                self.residual(e, &lw.o, lw.o_bias, None, t, io.ao);
+                self.ffn(e, lw, t, io.x);
+                self.residual(e, &lw.down, lw.down_bias, None, t, io.f);
+            }
+            Block::ParallelBranchesFirst => {
+                e.gemm(&lw.o, t, 0, io.ao, io.r);
+                if let Some(b) = lw.o_bias { e.bias_add(io.r, b, h, t); }
+                self.ffn(e, lw, t, io.x);
+                let n = t * h;
+                match lw.down_bias {
+                    None => e.gemm(&lw.down, t, 2, io.f, io.r),
+                    Some(b) => {
+                        e.gemm(&lw.down, t, 0, io.f, io.x);
+                        e.bias_add(io.x, b, h, t);
+                        e.pso("qd_residual").s(0, io.r).s(1, io.x).u(2, n as u32).f(3, 1.0).threads((n, 1), 256);
+                    }
+                }
+                e.pso("qd_residual").s(0, io.h).s(1, io.r).u(2, n as u32).f(3, d.resid_mult).threads((n, 1), 256);
+            }
         }
-        self.residual(e, &lw.down, lw.down_bias, lw.post_ffw_norm, t, io.f);
     }
 
     /// Decode-identical head on row t - 1: hf = final_norm(h), logits = lm_head hf (twin gemv K = 1, f32)
     /// [/ logits_scaling, soft cap], argmax.
     fn encode_head(&self, e: &PEnc, m: &PrefillModel, t: usize) {
         let (cfg, io, lm, d) = (m.cfg, &self.io, &m.w.lm_head, &self.dims);
-        e.rmsnorm(cfg.hidden, cfg.eps, 1, io.h + (t - 1) * cfg.hidden * BF, m.w.final_norm, io.hf);
+        e.norm(d.norm, cfg.hidden, cfg.eps, 1, io.h + (t - 1) * cfg.hidden * BF, m.w.final_norm, m.w.final_norm_bias, io.hf);
         if m.w.tied && m.w.embed_bf16 {
             e.pso("qd_gemv_b16_f32").a(0, lm.w).s(1, io.hf).s(2, io.logits).u(3, lm.rows as u32).u(4, lm.cols as u32)
                 .groups((lm.rows.div_ceil(8), 1), 256);

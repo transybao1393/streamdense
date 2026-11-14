@@ -72,6 +72,12 @@ unchanged copy of the chat template of [Qwen/Qwen3.5-0.8B](https://huggingface.c
 [mlx-community/Qwen3.5-0.8B-4bit](https://huggingface.co/mlx-community/Qwen3.5-0.8B-4bit)), used as a test fixture for
 `sd-model-layer run --chat`. Licensed under the Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
 
+### SmolLM3 chat template file, Apache-2.0
+
+[engine/model_layer/src/smollm3/smollm3_chat_template.jinja](engine/model_layer/src/smollm3/smollm3_chat_template.jinja)
+is an unchanged copy of the chat template of [HuggingFaceTB/SmolLM3-3B](https://huggingface.co/HuggingFaceTB/SmolLM3-3B),
+used as a test fixture. Licensed under the Apache License 2.0: https://www.apache.org/licenses/LICENSE-2.0
+
 ### Reimplemented behavior (no code copied)
 
 These parts are written from scratch to give the same results as another project. No source code was copied,
@@ -133,6 +139,11 @@ of each model card, checked 2026-11-02.
 | [HuggingFaceTB/SmolLM-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM-135M-Instruct), [ibm-granite/granite-4.2-3b](https://huggingface.co/ibm-granite/granite-4.2-3b) | Real-model tests of `sd-model-layer` vs MLX (Llama, Granite families) | Apache-2.0 (checked 2026-11-15) |
 | [meta-llama/Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) | Real-model test of `sd-model-layer` vs MLX (Llama 3 family) | Llama 3.2 Community License (checked 2026-11-15) |
 | [google/gemma-1.1-2b-it](https://huggingface.co/google/gemma-1.1-2b-it), [google/gemma-2-2b-it](https://huggingface.co/google/gemma-2-2b-it), [google/gemma-3-270m-it](https://huggingface.co/google/gemma-3-270m-it) | Real-model tests of `sd-model-layer` vs MLX (Gemma 1 / 2 / 3 families) | Gemma Terms of Use (checked 2026-11-15) |
+| [mistralai/Mistral-7B-Instruct-v0.3](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3), [allenai/OLMo-2-1124-7B-Instruct](https://huggingface.co/allenai/OLMo-2-1124-7B-Instruct), [HuggingFaceTB/SmolLM3-3B](https://huggingface.co/HuggingFaceTB/SmolLM3-3B) | Real-model tests of `sd-model-layer` vs MLX (Mistral, OLMo 2, SmolLM3 families) | Apache-2.0 (checked 2026-11-15) |
+| [microsoft/Phi-4-mini-instruct](https://huggingface.co/microsoft/Phi-4-mini-instruct), [microsoft/Phi-3.5-mini-instruct](https://huggingface.co/microsoft/Phi-3.5-mini-instruct), [zai-org/GLM-4-9B-0414](https://huggingface.co/zai-org/GLM-4-9B-0414) | Real-model tests of `sd-model-layer` vs MLX (Phi-3, GLM-4 families) | MIT (checked 2026-11-15) |
+| [stabilityai/stablelm-2-1_6b-chat](https://huggingface.co/stabilityai/stablelm-2-1_6b-chat) | Real-model test of `sd-model-layer` vs MLX (StableLM family) | StabilityAI Non-Commercial Research Community License (checked 2026-11-15) |
+| [CohereLabs/c4ai-command-r7b-12-2024](https://huggingface.co/CohereLabs/c4ai-command-r7b-12-2024) | Real-model test of `sd-model-layer` vs MLX (Cohere2 family) | CC-BY-NC-4.0 (checked 2026-11-15) |
+| [bigcode/starcoder2-3b](https://huggingface.co/bigcode/starcoder2-3b) | Real-model test of `sd-model-layer` vs MLX (StarCoder2 family) | BigCode OpenRAIL-M (checked 2026-11-15) |
 
 Test data: [engine/testdata/vectors/](engine/testdata/vectors) holds random inputs at real shapes run through MLX
 ops (no model weights); [engine/refs/](engine/refs) holds token ids, logits and activation dumps produced with MLX / mlx-lm from a

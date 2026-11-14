@@ -21,7 +21,7 @@ impl EngineKind {
 
 /// Whose code a folder goes to, in `Model::load` and `report::inspect_text`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Family { Qwen, Llama, Granite, Gemma }
+pub enum Family { Qwen, Llama, Granite, Gemma, Mistral, Phi3, Olmo2, SmolLM3, Glm4, StableLm, Cohere2, Starcoder2 }
 
 /// What the layer types of a config must look like for this family (`dense_engine::config::is_hybrid`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +44,14 @@ pub const FAMILIES: &[FamilyEntry] = &[
     FamilyEntry { name: "llama", family: Family::Llama, model_types: crate::llama::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
     FamilyEntry { name: "granite", family: Family::Granite, model_types: crate::granite::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
     FamilyEntry { name: "gemma", family: Family::Gemma, model_types: crate::gemma::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "mistral", family: Family::Mistral, model_types: crate::mistral::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "phi3", family: Family::Phi3, model_types: crate::phi3::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "olmo2", family: Family::Olmo2, model_types: crate::olmo2::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "smollm3", family: Family::SmolLM3, model_types: crate::smollm3::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "glm4", family: Family::Glm4, model_types: crate::glm4::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "stablelm", family: Family::StableLm, model_types: crate::stablelm::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "cohere2", family: Family::Cohere2, model_types: crate::cohere2::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
+    FamilyEntry { name: "starcoder2", family: Family::Starcoder2, model_types: crate::starcoder2::MODEL_TYPES, shape: Shape::Dense, engine: EngineKind::DenseEngine },
 ];
 
 /// Keys that mark a mixture-of-experts config (same list as `DenseConfig::from_json`).
@@ -142,6 +150,11 @@ mod tests {
     #[test]
     fn other_families_go_to_dense_engine() {
         for (t, name) in [("llama", "llama"), ("granite", "granite"), ("gemma", "gemma"), ("gemma2", "gemma"), ("gemma3_text", "gemma")] {
+            let d = detect_json(&json!({"model_type": t, "hidden_size": 512})).unwrap();
+            assert_eq!((d.entry.name, d.entry.engine), (name, EngineKind::DenseEngine));
+        }
+        for (t, name) in [("mistral", "mistral"), ("phi3", "phi3"), ("olmo2", "olmo2"), ("smollm3", "smollm3"), ("glm4", "glm4"),
+                          ("stablelm", "stablelm"), ("cohere2", "cohere2"), ("starcoder2", "starcoder2")] {
             let d = detect_json(&json!({"model_type": t, "hidden_size": 512})).unwrap();
             assert_eq!((d.entry.name, d.entry.engine), (name, EngineKind::DenseEngine));
         }

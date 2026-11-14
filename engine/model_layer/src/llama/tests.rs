@@ -138,7 +138,8 @@ fn refusals() {
     assert!(dc(&mlx(edit(llama2_7b(), |v| v["rope_traditional"] = true.into()))).unwrap_err().contains("rope_traditional"));
     assert!(blockers(&mlx(edit(llama2_7b(), |v| v["rope_traditional"] = true.into())))[0].contains("rope_traditional"));
     // engine limits come through validate()
-    assert!(dc(&mlx(edit(llama2_7b(), |v| v["head_dim"] = 96.into()))).unwrap_err().contains("head_dim must be 64, 128 or 256"));
+    assert!(dc(&mlx(edit(llama2_7b(), |v| v["head_dim"] = 80.into()))).unwrap_err().contains("head_dim must be 64, 96, 128, 160 or 256"));
+    assert!(dc(&mlx(edit(llama2_7b(), |v| v["head_dim"] = 96.into()))).is_ok());
     assert!(dc(&mlx(edit(llama2_7b(), |v| v["hidden_act"] = "relu".into()))).unwrap_err().contains("hidden_act"));
     assert!(dc(&edit(llama2_7b(), |v| v["quantization"] = json!({"group_size": 32, "bits": 3}))).unwrap_err().contains("group_size 32 bits 3"));
     assert!(dc(&edit(llama2_7b(), |v| v["layer_types"] = json!(["sliding_attention"]))).unwrap_err().contains("full attention"));

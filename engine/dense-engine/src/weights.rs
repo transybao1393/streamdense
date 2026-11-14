@@ -21,13 +21,19 @@
 //! - Optional tensors by config: o_proj.bias (`o_bias`), mlp.{gate,up,down}_proj.bias (`mlp_bias`), the Gemma 2 / 3
 //!   `pre_feedforward_layernorm` / `post_feedforward_layernorm` (`four_norms`; then `post_attention_layernorm` is the
 //!   norm on the attention output and `pre_feedforward_layernorm` the FFN input norm).
+//! - Other families (config `names`, `norm`, `block`, `mlp`, `qk_norm_kind`): tensor names from `TensorNames`; LayerNorm
+//!   biases (`{norm}.bias`); only the norms the block reads (Parallel: input; PostNorm: post-attention + post-FFN);
+//!   fused `qkv_proj` loaded as the q|k|v matrix as is; fused `gate_up_proj` loaded once, `gate` / `up` are views of
+//!   its first / second `inter` rows (no copy); `Mlp::Plain` has no gate (up = c_fc); QK-norm weights [head_dim]
+//!   (HeadRms), [heads x head_dim] / [kv_heads x head_dim] (FullRms), or per-head `{q_norm}.norms.{h}.weight`
+//!   concatenated (HeadLayerNorm).
 use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
 
 use streamdense_core::f16::f16_to_f32;
 use streamdense_core::{bf16_to_f32, f32_to_bf16, DType, SafeIndex};
 
-use crate::config::DenseConfig;
+use crate::config::{Block, DenseConfig, Mlp, NormKind, QkNorm};
 
 /// Tensor provider: dtype + shape by name, and the raw little-endian bytes.
 pub trait TensorSource {
@@ -124,6 +130,12 @@ pub struct LayerW {
     pub gate_bias: Option<usize>,
     pub up_bias: Option<usize>,
     pub down_bias: Option<usize>,
+    /// LayerNorm biases bf16 [hidden] (`NormKind::LayerNorm { bias: true }`) of in_norm / post_norm / post_attn_norm /
+    /// post_ffw_norm
+    pub in_norm_bias: Option<usize>,
+    pub post_norm_bias: Option<usize>,
+    pub post_attn_norm_bias: Option<usize>,
+    pub post_ffw_norm_bias: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -136,6 +148,8 @@ pub struct Weights {
     pub embed_bf16: bool,
     pub tied: bool,
     pub final_norm: usize,
+    /// final LayerNorm bias bf16 [hidden]
+    pub final_norm_bias: Option<usize>,
     pub layers: Vec<LayerW>,
     /// bytes of the weight region
     pub bytes: usize,
@@ -148,12 +162,14 @@ impl Weights {
         q(&mut self.embed);
         q(&mut self.lm_head);
         self.final_norm += base;
+        if let Some(b) = &mut self.final_norm_bias { *b += base; }
         for l in &mut self.layers {
             l.in_norm += base;
             l.post_norm += base;
             for m in [&mut l.qkv, &mut l.o, &mut l.gate, &mut l.up, &mut l.down] { q(m); }
             for o in [&mut l.qkv_bias, &mut l.q_norm, &mut l.k_norm, &mut l.post_attn_norm, &mut l.post_ffw_norm, &mut l.o_bias,
-                      &mut l.gate_bias, &mut l.up_bias, &mut l.down_bias].into_iter().flatten() { *o += base; }
+                      &mut l.gate_bias, &mut l.up_bias, &mut l.down_bias, &mut l.in_norm_bias, &mut l.post_norm_bias,
+                      &mut l.post_attn_norm_bias, &mut l.post_ffw_norm_bias].into_iter().flatten() { *o += base; }
         }
     }
 }
@@ -252,79 +268,156 @@ impl Lay<'_> {
     }
 }
 
+/// Rows `r0 .. r0 + rows` of a 4-bit matrix as its own `Q4` (offsets into the same region, no copy).
+fn q4_rows(m: &Q4, r0: usize, rows: usize) -> Q4 {
+    Q4 { w: m.w + r0 * m.cols / 2, s: m.s + r0 * (m.cols / 64) * 2, b: m.b + r0 * (m.cols / 64) * 2, rows, cols: m.cols }
+}
+
 /// Weight layout of `cfg` from `src` (offsets relative to the weight region) + the copy jobs.
 pub fn layout(cfg: &DenseConfig, src: &dyn TensorSource) -> Result<(Weights, Vec<Job>), String> {
     let (group, bits) = cfg.quant.ok_or("weights: config has no `quantization` block (want an MLX 4-bit model)")?;
     if bits != 4 { return Err(format!("weights: {}-bit model (only 4-bit)", bits)); }
     let mut l = Lay { src, used: 0, jobs: vec![] };
     let (h, qd, kvd, hd) = (cfg.hidden, cfg.q_dim(), cfg.kv_dim(), cfg.head_dim);
-    let en = "model.embed_tokens.weight";
-    let embed_bf16 = matches!(l.info(en)?, (DType::F16 | DType::BF16, _));
+    let nm = &cfg.names;
+    let en = format!("{}.weight", nm.embed);
+    let embed_bf16 = matches!(l.info(&en)?, (DType::F16 | DType::BF16, _));
     let embed = if embed_bf16 {
-        let (_, es) = l.info(en)?;
+        let (_, es) = l.info(&en)?;
         if es.len() != 2 || es[1] != h { return Err(format!("weights: {} shape {:?}, want [{}, {}]", en, es, cfg.vocab, h)); }
-        Q4 { w: l.cat(&[en.to_string()], Conv::ToBf16)?, s: 0, b: 0, rows: es[0], cols: h }
+        Q4 { w: l.cat(std::slice::from_ref(&en), Conv::ToBf16)?, s: 0, b: 0, rows: es[0], cols: h }
     } else {
-        l.q4(&["model.embed_tokens".to_string()], h, group)?
+        l.q4(std::slice::from_ref(&nm.embed), h, group)?
     };
-    if embed.rows != cfg.vocab { return Err(format!("weights: embed_tokens has {} rows, vocab_size {}", embed.rows, cfg.vocab)); }
+    if embed.rows != cfg.vocab { return Err(format!("weights: {} has {} rows, vocab_size {}", nm.embed, embed.rows, cfg.vocab)); }
     let nc = if cfg.norm_plus_one { Conv::ToBf16PlusOne } else { Conv::ToBf16 };
-    let final_norm = l.vec_c("model.norm.weight", h, nc.clone())?;
+    let nbias = matches!(cfg.norm, NormKind::LayerNorm { bias: true });
+    let final_norm = l.vec_c(&format!("{}.weight", nm.final_norm), h, nc.clone())?;
+    let final_norm_bias = if nbias { Some(l.vec(&format!("{}.bias", nm.final_norm), h)?) } else { None };
     let mut layers = Vec::with_capacity(cfg.layers);
     for i in 0..cfg.layers {
-        let p = format!("model.layers.{}", i);
-        let a = format!("{}.self_attn", p);
-        let mut norm = |n: &str| l.vec_c(&format!("{}.{}.weight", p, n), h, nc.clone());
-        let mut lw = LayerW { in_norm: norm("input_layernorm")?, ..Default::default() };
-        if cfg.four_norms {
-            lw.post_attn_norm = Some(norm("post_attention_layernorm")?);
-            lw.post_norm = norm("pre_feedforward_layernorm")?;
-            lw.post_ffw_norm = Some(norm("post_feedforward_layernorm")?);
-        } else {
-            lw.post_norm = norm("post_attention_layernorm")?;
+        let p = format!("{}.{}", nm.layer_prefix, i);
+        let t = |n: &str| format!("{}.{}", p, n);
+        // hidden-size norm `n`: weight (+ bias for LayerNorm with bias)
+        let mut norm = |n: &str| -> Result<(usize, Option<usize>), String> {
+            let w = l.vec_c(&format!("{}.{}.weight", p, n), h, nc.clone())?;
+            let b = if nbias { Some(l.vec(&format!("{}.{}.bias", p, n), h)?) } else { None };
+            Ok((w, b))
+        };
+        let mut lw = LayerW::default();
+        match cfg.block {
+            Block::Sequential => {
+                (lw.in_norm, lw.in_norm_bias) = norm(&nm.input_norm)?;
+                if cfg.four_norms {
+                    let (a, ab) = norm(&nm.post_attn_norm)?;
+                    (lw.post_attn_norm, lw.post_attn_norm_bias) = (Some(a), ab);
+                    (lw.post_norm, lw.post_norm_bias) = norm(&nm.pre_ffn_norm)?;
+                    let (f, fb) = norm(&nm.post_ffn_norm)?;
+                    (lw.post_ffw_norm, lw.post_ffw_norm_bias) = (Some(f), fb);
+                } else {
+                    (lw.post_norm, lw.post_norm_bias) = norm(&nm.post_attn_norm)?;
+                }
+            }
+            Block::Parallel | Block::ParallelBranchesFirst => (lw.in_norm, lw.in_norm_bias) = norm(&nm.input_norm)?,
+            Block::PostNorm => {
+                let (a, ab) = norm(&nm.post_attn_norm)?;
+                (lw.post_attn_norm, lw.post_attn_norm_bias) = (Some(a), ab);
+                let (f, fb) = norm(&nm.post_ffn_norm)?;
+                (lw.post_ffw_norm, lw.post_ffw_norm_bias) = (Some(f), fb);
+            }
         }
-        lw.qkv = l.q4(&[format!("{}.q_proj", a), format!("{}.k_proj", a), format!("{}.v_proj", a)], h, group)?;
+        let qkv_parts: Vec<String> = match &nm.qkv {
+            Some(f) => vec![t(f)],
+            None => vec![t(&nm.q), t(&nm.k), t(&nm.v)],
+        };
+        lw.qkv = l.q4(&qkv_parts, h, group)?;
         if lw.qkv.rows != qd + 2 * kvd {
             return Err(format!("weights: layer {} q|k|v rows {}, want {} + 2 x {}", i, lw.qkv.rows, qd, kvd));
         }
         if cfg.attention_bias {
-            let names = [format!("{}.q_proj.bias", a), format!("{}.k_proj.bias", a), format!("{}.v_proj.bias", a)];
-            for (n, want) in names.iter().zip([qd, kvd, kvd]) {
+            let names: Vec<String> = qkv_parts.iter().map(|n| format!("{}.bias", n)).collect();
+            let wants: Vec<usize> = if nm.qkv.is_some() { vec![qd + 2 * kvd] } else { vec![qd, kvd, kvd] };
+            for (n, want) in names.iter().zip(wants) {
                 let (_, s) = l.info(n)?;
                 if s != [want] { return Err(format!("weights: {} shape {:?}, want [{}]", n, s, want)); }
             }
             lw.qkv_bias = Some(l.cat(&names, Conv::ToBf16)?);
         }
         if cfg.qk_norm {
-            lw.q_norm = Some(l.vec_c(&format!("{}.q_norm.weight", a), hd, nc.clone())?);
-            lw.k_norm = Some(l.vec_c(&format!("{}.k_norm.weight", a), hd, nc.clone())?);
+            let (qn, kn) = (t(&nm.q_norm), t(&nm.k_norm));
+            match cfg.qk_norm_kind {
+                QkNorm::HeadRms => {
+                    lw.q_norm = Some(l.vec_c(&format!("{}.weight", qn), hd, nc.clone())?);
+                    lw.k_norm = Some(l.vec_c(&format!("{}.weight", kn), hd, nc.clone())?);
+                }
+                QkNorm::FullRms => {
+                    lw.q_norm = Some(l.vec_c(&format!("{}.weight", qn), qd, nc.clone())?);
+                    lw.k_norm = Some(l.vec_c(&format!("{}.weight", kn), kvd, nc.clone())?);
+                }
+                QkNorm::HeadLayerNorm => {
+                    let heads = |base: &str, n: usize, l: &Lay| -> Result<Vec<String>, String> {
+                        let v: Vec<String> = (0..n).map(|j| format!("{}.norms.{}.weight", base, j)).collect();
+                        for x in &v {
+                            let (_, s) = l.info(x)?;
+                            if s != [hd] { return Err(format!("weights: {} shape {:?}, want [{}]", x, s, hd)); }
+                        }
+                        Ok(v)
+                    };
+                    let (qv, kv) = (heads(&qn, cfg.heads, &l)?, heads(&kn, cfg.kv_heads, &l)?);
+                    lw.q_norm = Some(l.cat(&qv, nc.clone())?);
+                    lw.k_norm = Some(l.cat(&kv, nc.clone())?);
+                }
+            }
         }
-        lw.o = l.q4(&[format!("{}.o_proj", a)], qd, group)?;
-        lw.gate = l.q4(&[format!("{}.mlp.gate_proj", p)], h, group)?;
-        lw.up = l.q4(&[format!("{}.mlp.up_proj", p)], h, group)?;
-        lw.down = l.q4(&[format!("{}.mlp.down_proj", p)], cfg.inter, group)?;
-        if lw.o.rows != h || lw.gate.rows != cfg.inter || lw.up.rows != cfg.inter || lw.down.rows != h {
+        lw.o = l.q4(&[t(&nm.o)], qd, group)?;
+        let gated = cfg.mlp == Mlp::Gated;
+        match (&nm.gate_up, gated) {
+            (Some(gu), true) => {
+                let m = l.q4(&[t(gu)], h, group)?;
+                if m.rows != 2 * cfg.inter {
+                    return Err(format!("weights: layer {} {} rows {}, want 2 x {}", i, gu, m.rows, cfg.inter));
+                }
+                (lw.gate, lw.up) = (q4_rows(&m, 0, cfg.inter), q4_rows(&m, cfg.inter, cfg.inter));
+            }
+            (_, true) => {
+                lw.gate = l.q4(&[t(&nm.gate)], h, group)?;
+                lw.up = l.q4(&[t(&nm.up)], h, group)?;
+            }
+            (_, false) => lw.up = l.q4(&[t(&nm.up)], h, group)?,
+        }
+        lw.down = l.q4(&[t(&nm.down)], cfg.inter, group)?;
+        if lw.o.rows != h || (gated && lw.gate.rows != cfg.inter) || lw.up.rows != cfg.inter || lw.down.rows != h {
             return Err(format!("weights: layer {} o/gate/up/down rows {}/{}/{}/{} do not match the config", i,
                                lw.o.rows, lw.gate.rows, lw.up.rows, lw.down.rows));
         }
-        if cfg.o_bias { lw.o_bias = Some(l.vec(&format!("{}.o_proj.bias", a), h)?); }
+        if cfg.o_bias { lw.o_bias = Some(l.vec(&format!("{}.bias", t(&nm.o)), h)?); }
         if cfg.mlp_bias {
-            lw.gate_bias = Some(l.vec(&format!("{}.mlp.gate_proj.bias", p), cfg.inter)?);
-            lw.up_bias = Some(l.vec(&format!("{}.mlp.up_proj.bias", p), cfg.inter)?);
-            lw.down_bias = Some(l.vec(&format!("{}.mlp.down_proj.bias", p), h)?);
+            match (&nm.gate_up, gated) {
+                (Some(gu), true) => {
+                    let b = l.vec(&format!("{}.bias", t(gu)), 2 * cfg.inter)?;
+                    (lw.gate_bias, lw.up_bias) = (Some(b), Some(b + cfg.inter * 2));
+                }
+                (_, true) => {
+                    lw.gate_bias = Some(l.vec(&format!("{}.bias", t(&nm.gate)), cfg.inter)?);
+                    lw.up_bias = Some(l.vec(&format!("{}.bias", t(&nm.up)), cfg.inter)?);
+                }
+                (_, false) => lw.up_bias = Some(l.vec(&format!("{}.bias", t(&nm.up)), cfg.inter)?),
+            }
+            lw.down_bias = Some(l.vec(&format!("{}.bias", t(&nm.down)), h)?);
         }
         layers.push(lw);
     }
-    let (lm_head, tied) = if cfg.tie_word_embeddings || src.info("lm_head.weight").is_none() {
-        if !cfg.tie_word_embeddings { return Err("weights: no lm_head and tie_word_embeddings = false".into()); }
+    let lm_name = format!("{}.weight", nm.lm_head);
+    let (lm_head, tied) = if cfg.tie_word_embeddings || src.info(&lm_name).is_none() {
+        if !cfg.tie_word_embeddings { return Err(format!("weights: no {} and tie_word_embeddings = false", nm.lm_head)); }
         (embed, true)
     } else {
-        let m = l.q4(&["lm_head".to_string()], h, group)?;
-        if m.rows != cfg.vocab { return Err(format!("weights: lm_head has {} rows, vocab_size {}", m.rows, cfg.vocab)); }
+        let m = l.q4(std::slice::from_ref(&nm.lm_head), h, group)?;
+        if m.rows != cfg.vocab { return Err(format!("weights: {} has {} rows, vocab_size {}", nm.lm_head, m.rows, cfg.vocab)); }
         (m, false)
     };
     let bytes = (l.used + ALIGN - 1) / ALIGN * ALIGN;
-    Ok((Weights { embed, lm_head, tied, embed_bf16, final_norm, layers, bytes }, l.jobs))
+    Ok((Weights { embed, lm_head, tied, embed_bf16, final_norm, final_norm_bias, layers, bytes }, l.jobs))
 }
 
 /// Run the jobs into `region` (the weight region: `Weights::bytes` long, offsets as `layout` returned them).

@@ -5,6 +5,13 @@
 //! last row, lm_head gemv, logits scaling / soft cap, argmax). Without those options (Qwen) the dispatches are exactly
 //! the original ones: fused MODE 2 residual gemvs, fused SwiGLU, no extra kernels. Every buffer is an absolute arena offset (`gpu::Enc`).
 //!
+//! Other layer forms (config `norm` / `block` / `mlp` / `qk_norm_kind`, RoPE variants): LayerNorm (qd_layernorm, with
+//! or without bias) wherever an RMSNorm stands; `Block::Parallel` (h += o; h += down, both branches from the one input
+//! norm), `ParallelBranchesFirst` (r = o, r += down (MODE 2), h += r), `PostNorm` (attention / FFN read h, outputs
+//! post-normed); `Mlp::Plain` (up gemv -> qd_act_b16 -> down); OLMo 2 q / k RMSNorm over the whole projection
+//! (qd_rmsnorm_rows on p before the prep); per-layer prep variants (traditional / no RoPE, su multiplier, per-head
+//! LayerNorm QK-norm) as function constants of attn{HD}_prep.
+//!
 //! Matmuls: the engine's MMA 4-bit family (engine/shaders/gemv_mma_q4.metal), dispatched exactly as
 //! streamdense-model `qwen_layers::gemv` / `swiglu` with `GemvImpl::Mma`: the scalar twins `qm_gemvt_k{K}_s8_m*` /
 //! `qm_swiglut_k{K}_s8` where `mma_use_twin`, else `qm_gemv_n2_s8_m*` / `qm_swiglu_n1_s8`. Both are bit-identical per
@@ -19,13 +26,13 @@
 //! Pass size: split-K / sdpa passes are 1..=8 rows (attn128_partial_k1..8). Flash / auto passes take up to
 //! `PASS_MAX` rows; the matmuls of such a pass run in chunks of <= 8 rows (`gemv` / `swiglu` loop over row chunks).
 //! The MMA family is bit-identical per row for any K, so chunking changes nothing numerically.
-use crate::config::{Activation, DenseConfig, LayerKind};
-use crate::gpu::{fc_key, Enc};
+use crate::config::{Activation, Block, DenseConfig, LayerKind, Mlp, NormKind, QkNorm};
+use crate::gpu::{fc_key, fc_key_prep, Enc};
 use crate::weights::{LayerW, Q4, Weights};
 
 pub const BF: usize = 2;
 pub const F32: usize = 4;
-/// Head dim of the original (Qwen) kernels; the engine takes 64 / 128 / 256 (`DenseConfig::head_dim`).
+/// Head dim of the original (Qwen) kernels; the engine takes 64 / 96 / 128 / 160 / 256 (`DenseConfig::head_dim`).
 pub const HD: usize = 128;
 /// attn128_partial key chunk.
 pub const CHUNK: usize = 256;
@@ -127,6 +134,20 @@ pub fn rmsnorm(e: &Enc, n: usize, eps: f32, k: usize, x: usize, w: usize, out: u
     e.pso("rmsnorm_b").b(0, x).b(1, w).b(2, out).u(3, n as u32).f(4, eps).u(5, n as u32).groups((k, 1), 1024);
 }
 
+/// k rows: out = layer_norm(x) * w [+ b] (qd_layernorm, mx.fast.layer_norm rounding).
+pub fn layernorm(e: &Enc, n: usize, eps: f32, k: usize, x: usize, w: usize, b: Option<usize>, out: usize) {
+    e.pso("qd_layernorm").b(0, x).b(1, w).b(2, b.unwrap_or(w)).b(3, out).u(4, n as u32).f(5, eps)
+        .u(6, b.is_some() as u32).groups((k, 1), 1024);
+}
+
+/// k rows of hidden size: the model's norm kind (RMSNorm as before, or LayerNorm with optional bias).
+fn norm(e: &Enc, d: &Dims, k: usize, x: usize, w: usize, b: Option<usize>, out: usize) {
+    match d.norm {
+        NormKind::Rms => rmsnorm(e, d.hidden, d.eps, k, x, w, out),
+        NormKind::LayerNorm { .. } => layernorm(e, d.hidden, d.eps, k, x, w, b, out),
+    }
+}
+
 /// Attention core implementation (after the shared prep).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AttnImpl {
@@ -174,13 +195,17 @@ pub struct AttnVariant {
     pub softcap: Option<f32>,
     /// sliding window (sliding layers only)
     pub window: Option<u32>,
+    /// prep only: RoPE mode bits (1 traditional, 2 no RoPE), su multiplier, QK-norm mode (1 per-head LayerNorm)
+    pub rope: u32,
+    pub mscale: Option<f32>,
+    pub qkn: u32,
 }
 
 impl AttnVariant {
     fn key(&self, base: &str) -> String {
         fc_key(&format!("attn{}_{}", self.hd, base), self.scale, self.softcap, self.window)
     }
-    pub fn prep(&self) -> String { format!("attn{}_prep_b16", self.hd) }
+    pub fn prep(&self) -> String { fc_key_prep(&format!("attn{}_prep_b16", self.hd), self.rope, self.mscale, self.qkn) }
     pub fn partial(&self, k: usize) -> String { self.key(&format!("partial_k{}_b16", k)) }
     pub fn reduce(&self) -> String { format!("attn{}_reduce", self.hd) }
     pub fn flash(&self) -> String { self.key("flash") }
@@ -347,24 +372,41 @@ pub struct Dims {
     /// attention scale (None = hd^-0.5) and score soft cap
     pub scale: Option<f32>,
     pub softcap: Option<f32>,
+    pub norm: NormKind,
+    pub block: Block,
+    /// `Mlp::Plain`: up -> act -> down
+    pub mlp_plain: bool,
+    /// q_norm / k_norm over the whole projection (qd_rmsnorm_rows), not in the prep
+    pub qk_full: bool,
+    /// prep constants: traditional RoPE bit, su multiplier (bf16-rounded), QK-norm mode
+    pub rope_trad: bool,
+    pub mscale: Option<f32>,
+    pub qkn: u32,
 }
 
 fn rbf(x: f32) -> f32 { streamdense_core::bf16_to_f32(streamdense_core::f32_to_bf16(x)) }
 
 impl Dims {
     pub fn new(cfg: &DenseConfig) -> Dims {
-        let act = if cfg.activation == Activation::GeluTanh { 1 } else { 0 };
+        let act = match cfg.activation { Activation::GeluTanh => 1, Activation::GeluErf => 2, _ => 0 };
         Dims {
             hidden: cfg.hidden, inter: cfg.inter, nh: cfg.heads, nkv: cfg.kv_heads, hd: cfg.head_dim, rdims: cfg.rope_dims,
             eps: cfg.eps, vocab: cfg.vocab, act, ffn_unfused: act != 0 || cfg.mlp_bias,
             embed_scale: rbf(cfg.embed_scale as f32), resid_mult: rbf(cfg.residual_multiplier as f32),
             logit_div: cfg.logits_scaling as f32, final_cap: cfg.final_softcap.unwrap_or(0.0) as f32,
             scale: cfg.attn_scale.map(|s| s as f32), softcap: cfg.attn_softcap.map(|s| s as f32),
+            norm: cfg.norm, block: cfg.block, mlp_plain: cfg.mlp == Mlp::Plain,
+            qk_full: cfg.qk_norm && cfg.qk_norm_kind == QkNorm::FullRms, rope_trad: cfg.rope_traditional,
+            // mlx_lm SuScaledRoPE multiplies the bf16 q / k by a weakly typed scalar: the scale is rounded to bf16
+            mscale: cfg.rope_su.as_ref().map(|s| rbf(s.mscale as f32)),
+            qkn: if cfg.qk_norm && cfg.qk_norm_kind == QkNorm::HeadLayerNorm { 1 } else { 0 },
         }
     }
-    /// Attention kernels of a layer with sliding window `window` (None = full attention).
-    pub fn variant(&self, window: Option<u32>) -> AttnVariant {
-        AttnVariant { hd: self.hd, scale: self.scale, softcap: self.softcap, window }
+    /// Attention kernels of a layer with sliding window `window` (None = full attention), RoPE on or off.
+    pub fn variant(&self, window: Option<u32>, rope: bool) -> AttnVariant {
+        let mode = if !rope { 2 } else if self.rope_trad { 1 } else { 0 };
+        AttnVariant { hd: self.hd, scale: self.scale, softcap: self.softcap, window, rope: mode,
+                      mscale: if rope { self.mscale } else { None }, qkn: self.qkn }
     }
 }
 
@@ -375,6 +417,9 @@ pub fn layer_windows(cfg: &DenseConfig) -> Vec<Option<u32>> {
         LayerKind::Full => None,
     }).collect()
 }
+
+/// Per-layer RoPE switch of `cfg` (false on `no_rope_layers`).
+pub fn layer_rope(cfg: &DenseConfig) -> Vec<bool> { (0..cfg.layers).map(|l| cfg.rope_on(l)).collect() }
 
 /// Per-layer KV cache offsets.
 #[derive(Clone, Copy, Debug, Default)]
@@ -410,58 +455,109 @@ fn bias_add(e: &Enc, p: usize, b: usize, n: usize, k: usize) {
 }
 
 /// h += m * post(m x + bias): the fused MODE 2 gemv when there is no bias / post-norm / multiplier, else MODE 0 into
-/// io.r, bias, [RMSNorm -> io.x], qd_residual.
-fn residual(e: &Enc, d: &Dims, m: &Q4, bias: Option<usize>, post: Option<usize>, k: usize, x: usize, io: &PassIo) {
+/// io.r, bias, [norm -> io.x], qd_residual. `post` = (weight, LayerNorm bias).
+fn residual(e: &Enc, d: &Dims, m: &Q4, bias: Option<usize>, post: Option<(usize, Option<usize>)>, k: usize, x: usize, io: &PassIo) {
     if bias.is_none() && post.is_none() && d.resid_mult == 1.0 {
         gemv(e, m, k, 2, x, io.h);
         return;
     }
     gemv(e, m, k, 0, x, io.r);
     if let Some(b) = bias { bias_add(e, io.r, b, d.hidden, k); }
-    let r = match post { Some(w) => { rmsnorm(e, d.hidden, d.eps, k, io.r, w, io.x); io.x } None => io.r };
+    let r = match post { Some((w, b)) => { norm(e, d, k, io.r, w, b, io.x); io.x } None => io.r };
     let n = k * d.hidden;
     e.pso("qd_residual").b(0, io.h).b(1, r).u(2, n as u32).f(3, d.resid_mult).threads((n, 1), 256);
 }
 
-/// io.f = act(gate x + bias) * (up x + bias): fused SwiGLU, or gate / up gemvs + biases + qd_glu.
-fn ffn(e: &Enc, d: &Dims, lw: &LayerW, k: usize, io: &PassIo) {
-    if !d.ffn_unfused {
-        swiglu(e, &lw.gate, &lw.up, k, io.x, io.f);
+/// io.f = act(gate x + bias) * (up x + bias): fused SwiGLU, or gate / up gemvs + biases + qd_glu; `Mlp::Plain`:
+/// io.f = act(up x + bias) (qd_act_b16). x = the FFN input rows.
+fn ffn(e: &Enc, d: &Dims, lw: &LayerW, k: usize, x: usize, io: &PassIo) {
+    let n = k * d.inter;
+    if d.mlp_plain {
+        gemv(e, &lw.up, k, 0, x, io.f);
+        if let Some(b) = lw.up_bias { bias_add(e, io.f, b, d.inter, k); }
+        e.pso("qd_act_b16").b(0, io.f).u(1, n as u32).u(2, d.act).threads((n, 1), 256);
         return;
     }
-    gemv(e, &lw.gate, k, 0, io.x, io.f);
-    gemv(e, &lw.up, k, 0, io.x, io.f2);
+    if !d.ffn_unfused {
+        swiglu(e, &lw.gate, &lw.up, k, x, io.f);
+        return;
+    }
+    gemv(e, &lw.gate, k, 0, x, io.f);
+    gemv(e, &lw.up, k, 0, x, io.f2);
     if let Some(b) = lw.gate_bias { bias_add(e, io.f, b, d.inter, k); }
     if let Some(b) = lw.up_bias { bias_add(e, io.f2, b, d.inter, k); }
-    let n = k * d.inter;
     e.pso("qd_glu").b(0, io.f).b(1, io.f2).b(2, io.f).u(3, n as u32).u(4, d.act).threads((n, 1), 256);
 }
 
-/// One decoder layer for io.k rows (h in place); `window` = this layer's sliding window (None: full attention).
-pub fn encode_layer(e: &Enc, d: &Dims, lw: &LayerW, kv: &Kv, io: &PassIo, attn: AttnImpl, window: Option<u32>) {
+/// One decoder layer for io.k rows (h in place); `window` = this layer's sliding window (None: full attention),
+/// `rope` = this layer applies RoPE.
+pub fn encode_layer(e: &Enc, d: &Dims, lw: &LayerW, kv: &Kv, io: &PassIo, attn: AttnImpl, window: Option<u32>, rope: bool) {
     let k = io.k;
-    rmsnorm(e, d.hidden, d.eps, k, io.h, lw.in_norm, io.x);
-    gemv(e, &lw.qkv, k, 0, io.x, io.p);
+    // attention input: input norm, or h itself (PostNorm)
+    let ain = if d.block == Block::PostNorm { io.h } else { norm(e, d, k, io.h, lw.in_norm, lw.in_norm_bias, io.x); io.x };
+    gemv(e, &lw.qkv, k, 0, ain, io.p);
     if let Some(b) = lw.qkv_bias { bias_add(e, io.p, b, lw.qkv.rows, k); }
+    let (qd, kvd) = (d.nh * d.hd, d.nkv * d.hd);
+    if d.qk_full {
+        // OLMo 2: RMSNorm over the whole q and k projections, in place in p (the prep then runs without QK-norm)
+        for (off, n, w) in [(0, qd, lw.q_norm), (qd, kvd, lw.k_norm)] {
+            e.pso("qd_rmsnorm_rows").b(0, io.p + off * BF).b(1, w.unwrap()).u(2, n as u32).f(3, d.eps)
+                .u(4, lw.qkv.rows as u32).groups((k, 1), 1024);
+        }
+    }
+    let (q_norm, k_norm) = if d.qk_full { (None, None) } else { (lw.q_norm, lw.k_norm) };
     let a = AttnIo {
-        k, pos: io.pos, nh: d.nh, nkv: d.nkv, rdims: d.rdims, eps: d.eps, max_ctx: io.max_ctx, v: d.variant(window),
-        p: io.p, q_norm: lw.q_norm, k_norm: lw.k_norm, qr: io.qr, kc: kv.k, vc: kv.v, dummy: io.dummy,
+        k, pos: io.pos, nh: d.nh, nkv: d.nkv, rdims: d.rdims, eps: d.eps, max_ctx: io.max_ctx, v: d.variant(window, rope),
+        p: io.p, q_norm, k_norm, qr: io.qr, kc: kv.k, vc: kv.v, dummy: io.dummy,
         invf: if window.is_some() { io.invf_local } else { io.invf }, ctrl: io.ctrl, po: io.po, pml: io.pml,
         nch_max: io.nch_max, ao: io.ao,
     };
     encode_attn_prep(e, &a);
     encode_attn_core(e, attn, &a);
-    residual(e, d, &lw.o, lw.o_bias, lw.post_attn_norm, k, io.ao, io);
-    rmsnorm(e, d.hidden, d.eps, k, io.h, lw.post_norm, io.x);
-    ffn(e, d, lw, k, io);
-    residual(e, d, &lw.down, lw.down_bias, lw.post_ffw_norm, k, io.f, io);
+    let post_attn = lw.post_attn_norm.map(|w| (w, lw.post_attn_norm_bias));
+    let post_ffw = lw.post_ffw_norm.map(|w| (w, lw.post_ffw_norm_bias));
+    match d.block {
+        Block::Sequential => {
+            residual(e, d, &lw.o, lw.o_bias, post_attn, k, io.ao, io);
+            norm(e, d, k, io.h, lw.post_norm, lw.post_norm_bias, io.x);
+            ffn(e, d, lw, k, io.x, io);
+            residual(e, d, &lw.down, lw.down_bias, post_ffw, k, io.f, io);
+        }
+        Block::PostNorm => {
+            residual(e, d, &lw.o, lw.o_bias, post_attn, k, io.ao, io);
+            ffn(e, d, lw, k, io.h, io);
+            residual(e, d, &lw.down, lw.down_bias, post_ffw, k, io.f, io);
+        }
+        Block::Parallel => {
+            // h = (h + attn) + mlp; io.x (the normed input) is not touched by a residual without post-norm
+            residual(e, d, &lw.o, lw.o_bias, None, k, io.ao, io);
+            ffn(e, d, lw, k, io.x, io);
+            residual(e, d, &lw.down, lw.down_bias, None, k, io.f, io);
+        }
+        Block::ParallelBranchesFirst => {
+            // r = bf(attn [+ bias]); r = bf(r + bf(mlp [+ bias])); h = bf(h + bf(r * m))
+            gemv(e, &lw.o, k, 0, io.ao, io.r);
+            if let Some(b) = lw.o_bias { bias_add(e, io.r, b, d.hidden, k); }
+            ffn(e, d, lw, k, io.x, io);
+            let n = k * d.hidden;
+            match lw.down_bias {
+                None => gemv(e, &lw.down, k, 2, io.f, io.r),
+                Some(b) => {
+                    gemv(e, &lw.down, k, 0, io.f, io.x);
+                    bias_add(e, io.x, b, d.hidden, k);
+                    e.pso("qd_residual").b(0, io.r).b(1, io.x).u(2, n as u32).f(3, 1.0).threads((n, 1), 256);
+                }
+            }
+            e.pso("qd_residual").b(0, io.h).b(1, io.r).u(2, n as u32).f(3, d.resid_mult).threads((n, 1), 256);
+        }
+    }
 }
 
 /// Head on the last row: hf = final_norm(h[k-1]); logits f32 = lm_head hf [/ logits_scaling, soft cap];
 /// argmax_b -> ctrl.tok[0]. lm_head: 4-bit gemv, or the dense bf16 gemv when tied to a bf16 embedding.
 pub fn encode_head(e: &Enc, d: &Dims, w: &Weights, io: &PassIo) {
     let last = io.h + (io.k - 1) * d.hidden * BF;
-    rmsnorm(e, d.hidden, d.eps, 1, last, w.final_norm, io.hf);
+    norm(e, d, 1, last, w.final_norm, w.final_norm_bias, io.hf);
     if w.tied && w.embed_bf16 {
         let m = &w.lm_head;
         e.pso("qd_gemv_b16_f32").b(0, m.w).b(1, io.hf).b(2, io.logits).u(3, m.rows as u32).u(4, m.cols as u32)
@@ -487,8 +583,8 @@ pub fn encode_next_tok(e: &Enc, io: &PassIo) {
     e.pso("qd_next_tok").b(0, io.ctrl).b(1, io.tok).u(2, io.pos as u32).threads((1, 1), 1);
 }
 
-/// Every pipeline a pass uses with attention impl `attn`, for the model's dims and per-layer windows.
-pub fn pipelines(attn: AttnImpl, d: &Dims, windows: &[Option<u32>]) -> Vec<String> {
+/// Every pipeline a pass uses with attention impl `attn`, for the model's dims and per-layer windows / RoPE switches.
+pub fn pipelines(attn: AttnImpl, d: &Dims, windows: &[Option<u32>], rope: &[bool]) -> Vec<String> {
     let mut v: Vec<String> = vec![];
     for k in 1..=MMA_TWIN_K_MAX {
         for m in [0u32, 2, 3] { v.push(twin_gemv_name(k, m)); }
@@ -497,14 +593,16 @@ pub fn pipelines(attn: AttnImpl, d: &Dims, windows: &[Option<u32>]) -> Vec<Strin
     for m in [0u32, 2, 3] { v.push(mma_gemv_name(m)); }
     v.push(mma_swiglu_name());
     for n in ["rmsnorm_b", "argmax_b", "qd_embed_q4", "qd_bias_add", "qd_next_tok", "attn128_rope_invf", "qd_scale_b16",
-              "qd_residual", "qd_glu", "qd_logits_post", "qd_embed_b16", "qd_gemv_b16_f32"] {
+              "qd_residual", "qd_glu", "qd_logits_post", "qd_embed_b16", "qd_gemv_b16_f32", "qd_layernorm",
+              "qd_rmsnorm_rows", "qd_act_b16"] {
         v.push(n.into());
     }
-    let mut seen: Vec<Option<u32>> = vec![];
-    for w in windows {
-        if !seen.contains(w) { seen.push(*w); v.extend(d.variant(*w).pipelines(attn)); }
+    let mut seen: Vec<(Option<u32>, bool)> = vec![];
+    for (l, w) in windows.iter().enumerate() {
+        let r = rope.get(l).copied().unwrap_or(true);
+        if !seen.contains(&(*w, r)) { seen.push((*w, r)); v.extend(d.variant(*w, r).pipelines(attn)); }
     }
-    if windows.is_empty() { v.extend(d.variant(None).pipelines(attn)); }
+    if windows.is_empty() { v.extend(d.variant(None, true).pipelines(attn)); }
     v.sort();
     v.dedup();
     v

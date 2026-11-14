@@ -17,7 +17,7 @@
 //! 4. auto engine == flash body + sdpa last token, bit for bit (its prefill split).
 //! 5. The local tokenizer.json files (read-only, no weights) round-trip text through encode / decode.
 //!
-//! 6. Other dense families (`family_specs`: head dim 64 GQA / MHA, 256 MQA; Llama q/k/v/o and MLP biases, untied head,
+//! 6. Other dense families (`family_specs`: head dim 64 GQA / MHA, 96 / 160 GQA, 256 MQA; Llama q/k/v/o and MLP biases, untied head,
 //!    llama3 RoPE; Granite multipliers; Gemma GeGLU, (1 + w) norms, embedding scale; Gemma 2 four norms, attention /
 //!    final soft caps, alternating sliding window; Gemma 3 QK-norm, local RoPE theta, linear-scaled global RoPE), every
 //!    field set on `DenseConfig` as a family reader would: the same CPU-reference check as 1 for every attention impl
@@ -526,6 +526,15 @@ fn family_specs() -> Vec<(&'static str, Spec)> {
     let mut x = Ext::fam(Family::Llama, 128);
     (x.qkv_bias, x.o_bias, x.mlp_bias) = (true, true, true);
     v.push(("llama biases hd128 4/2 (attn + mlp)", sp(256, 640, 4, 2, 320, x)));
+    // head dim 96 (Phi-3 / Phi-3.5-mini) and 160 (stablelm-2-12b): split-K runs 3 / 5 32-dim slices per row on 4 / 8
+    // lanes; the 160 case also takes the window and soft-cap variants
+    let mut x = Ext::fam(Family::Llama, 96);
+    x.qk_norm = true;
+    v.push(("hd96 gqa 4/2 (qk-norm)", sp(256, 512, 4, 2, 384, x)));
+    let mut x = Ext::fam(Family::Llama, 160);
+    (x.qkv_bias, x.attn_cap) = (true, Some(1.5));
+    (x.window, x.sliding) = (Some(37), vec![true, false]);
+    v.push(("hd160 gqa 4/2 (bias, window, attn cap)", sp(256, 512, 4, 2, 384, x)));
     v
 }
 
@@ -601,14 +610,15 @@ fn families_weight_layout() {
     }
 }
 
-/// The new kernel variants keep the engine's invariants: head dim 64 / 128 (window, soft caps) / 256 (window, two RoPE
-/// tables). Prefill in passes of 8 == one token per pass == mixed sizes, bit for bit (split-K, sdpa, flash); and
+/// The new kernel variants keep the engine's invariants: head dim 64 / 96 / 128 (window, soft caps) / 160 (window,
+/// soft cap) / 256 (window, two RoPE tables). Prefill in passes of 8 == one token per pass == mixed sizes, bit for bit (split-K, sdpa, flash); and
 /// pipelined decode == sync decode, bit for bit.
 #[test]
 fn families_k_invariant_and_pipelined() {
     use dense_engine::engine::DecodeMode;
     let mixed: Vec<usize> = (1..=8).collect();
-    for (name, sp) in family_specs().into_iter().filter(|(n, _)| n.starts_with("hd64 gqa") || n.starts_with("gemma")) {
+    for (name, sp) in family_specs().into_iter().filter(|(n, _)| n.starts_with("hd64 gqa") || n.starts_with("gemma")
+                                                                     || n.starts_with("hd96 gqa") || n.starts_with("hd160 gqa")) {
         let (cfg, src, _) = build(&sp, 0x77);
         let mut r = Rng(6);
         let prompt: Vec<u32> = (0..270).map(|_| (r.next() % sp.vocab as u64) as u32).collect();

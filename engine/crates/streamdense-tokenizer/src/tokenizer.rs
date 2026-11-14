@@ -187,9 +187,14 @@ impl Tokenizer {
         let vj = model["vocab"].as_object().ok_or("model.vocab: want an object")?;
         let mut vocab: HashMap<Vec<u8>, u32> = HashMap::with_capacity(vj.len());
         let mut max_id = 0u32;
+        // byte-level vocab entries with chars outside the GPT-2 byte alphabet (Cohere2: 1403 raw Unicode tokens such as
+        // U+200D): HF's ByteLevel decoder gives them their raw UTF-8 bytes, and the byte-level pre-tokenizer can never
+        // produce them, so they are decode-only (kept out of `vocab`: their raw bytes may equal another token's)
+        let mut raw_ids: Vec<(u32, Vec<u8>)> = Vec::new();
         for (t, id) in vj {
             let id = id.as_u64().ok_or("vocab id")? as u32;
             max_id = max_id.max(id);
+            if byte_level && t.chars().any(|c| !c2b.contains_key(&c)) { raw_ids.push((id, t.as_bytes().to_vec())); continue; }
             vocab.insert(to_bytes(t)?, id);
         }
         let added_j = j["added_tokens"].as_array().cloned().unwrap_or_default();
@@ -200,6 +205,7 @@ impl Tokenizer {
         let mut bf_ids = if use_bf { vec![false; n] } else { Vec::new() };
         if byte_level {
             for (b, &id) in &vocab { id_bytes[id as usize] = b.clone(); }
+            for (id, b) in raw_ids { id_bytes[id as usize] = b; }
         } else {
             for (t, &id) in &vocab {
                 let (b, is_bf) = pipeline::decode_token(&dec.steps, std::str::from_utf8(t).unwrap());
@@ -554,6 +560,35 @@ mod tests {
             "decoder": {"type": "ByteLevel"},
             "model": {"type": "BPE", "vocab": vocab, "merges": merges, "ignore_merges": ignore_merges}});
         Tokenizer::from_json_str(&j.to_string(), None).unwrap()
+    }
+
+    /// Byte-level vocab entry with a char outside the byte alphabet (Cohere2's raw U+200D, U+2122): loads, decodes to
+    /// its raw UTF-8 bytes (HF ByteLevel decoder), and is never produced by encode even when its raw bytes equal the
+    /// byte-level spelling of another token.
+    #[test]
+    fn non_byte_level_vocab_entry_is_decode_only() {
+        let b2c = byte_to_char();
+        let mut vocab = serde_json::Map::new();
+        for (i, c) in b2c.iter().enumerate() { vocab.insert(c.to_string(), json!(i)); }
+        let zwj: String = "\u{200d}".bytes().map(|b| b2c[b as usize]).collect();
+        vocab.insert(zwj.clone(), json!(257));
+        vocab.insert("\u{200d}".into(), json!(258));
+        vocab.insert("\u{2122}".into(), json!(259));
+        let first2: String = zwj.chars().take(2).collect();
+        vocab.insert(first2.clone(), json!(256));
+        let last: String = zwj.chars().skip(2).collect();
+        let (c0, c1): (String, String) = (zwj.chars().take(1).collect(), zwj.chars().skip(1).take(1).collect());
+        let j = json!({"added_tokens": [], "normalizer": null, "post_processor": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false},
+            "decoder": {"type": "ByteLevel"},
+            "model": {"type": "BPE", "vocab": vocab, "merges": [[c0, c1], [first2, last]]}});
+        let tk = Tokenizer::from_json_str(&j.to_string(), None).unwrap();
+        assert_eq!(tk.id_to_bytes(258), "\u{200d}".as_bytes());
+        assert_eq!(tk.id_to_bytes(259), "\u{2122}".as_bytes());
+        // ids 0..=255 are the bytes; U+200D encodes through the byte-level merge (257), never as the raw entry (258)
+        assert_eq!(tk.encode("a\u{200d}b"), vec![b'a' as u32, 257, b'b' as u32]);
+        assert!(!tk.encode("\u{200d}\u{2122}").iter().any(|&i| i == 258 || i == 259));
+        assert_eq!(tk.decode(&[258, 259]), "\u{200d}\u{2122}");
     }
 
     #[test]

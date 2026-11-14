@@ -2,8 +2,9 @@
 
 Standalone engine for ordinary **dense decoder** models on Metal: **Qwen** dense (Qwen2 / Qwen2.5 / Qwen3, config.json
 parsed here) and, through explicit `DenseConfig` fields filled by family config readers, the math of **Llama** (incl.
-SmolLM2, Llama 3), **Granite** and **Gemma 1 / 2 / 3-text**: head dim 64 / 128 / 256, GQA or plain multi-head (see
-"Other dense families" below). Own crate (empty `[workspace]` table in `Cargo.toml`), not a member of the engine
+SmolLM2, Llama 3), **Granite**, **Gemma 1 / 2 / 3-text**, **Mistral**, **Phi-3 / Phi-4-mini**, **OLMo 2**, **SmolLM3**,
+**GLM-4**, **StableLM 2**, **Cohere2** and **StarCoder2**: head dim 64 / 96 / 128 / 160 / 256, GQA or plain multi-head
+(see "Other dense families" below). Own crate (empty `[workspace]` table in `Cargo.toml`), not a member of the engine
 workspace: `cargo` in `engine/` never builds it. The model layer ([../model_layer](../model_layer/README.md),
 `sd-model-layer`) is the user-facing entry point that routes these models here; this README is the engine's own
 reference.
@@ -13,7 +14,7 @@ reference.
 | file | what |
 |---|---|
 | `src/config.rs` | `DenseConfig`: every math switch as an explicit field (defaults = Qwen; see "Other dense families"), `DenseConfig::base` for family readers, `rope_inv_freq` (plain / linear / llama3 tables). config.json reader for `model_type` qwen2 / qwen3 (also inside `text_config`, and the newer `rope_parameters` form). `validate()` / `unsupported()` name every unsupported feature. Hybrid configs (Qwen3.5 / 3.8: `linear_attention` layers, `linear_*` fields, `full_attention_interval`) are refused with "hybrid ... use the main engine"; MoE configs are refused. Unit tests embed Qwen2.5-0.5B / 7B / 14B and Qwen3-8B / 14B / 32B config shapes (values not checked against the published config are marked `unverified` in comments). |
-| `shaders/attn_hd128.metal` | Port of `engine/shaders/attn_gated.metal`'s split-K pipeline as templates over the head dim HD = 64 / 128 / 256 (kernel names `attn{HD}_...`; the HD-128 names are the original `attn128_` ones): `attn128_rope_invf`, `attn{HD}_prep_b16` (+ `attn128_prep_q8`) (optional QK-norm, RoPE with any rdims, KV append, q8 per-32-dim quantization), `attn{HD}_partial_k{1..8}_b16` (+ `attn128_..._q8`) (256-key chunks, GQA), `attn{HD}_reduce` and `attn128_reduce_gate` (sigmoid output gate). Declares the per-pipeline function constants (scale [20], score soft cap [21], sliding window [22]; undefined = HD^-0.5, no cap, full causal) and helpers that the flash / sdpa files use, so it must come before them. Same buffer indices and grid shapes as the attn_gated kernels; prep has one extra uniform, `flags` [14] (bit 0 QK-norm, bit 1 gated q layout). |
+| `shaders/attn_hd128.metal` | Port of `engine/shaders/attn_gated.metal`'s split-K pipeline as templates over the head dim HD = 64 / 96 / 128 / 160 / 256 (kernel names `attn{HD}_...`; the HD-128 names are the original `attn128_` ones): `attn128_rope_invf`, `attn{HD}_prep_b16` (+ `attn128_prep_q8`) (optional QK-norm, RoPE with any rdims, KV append, q8 per-32-dim quantization), `attn{HD}_partial_k{1..8}_b16` (+ `attn128_..._q8`) (256-key chunks, GQA), `attn{HD}_reduce` and `attn128_reduce_gate` (sigmoid output gate). Declares the per-pipeline function constants (scale [20], score soft cap [21], sliding window [22]; undefined = HD^-0.5, no cap, full causal) and helpers that the flash / sdpa files use, so it must come before them. Same buffer indices and grid shapes as the attn_gated kernels; prep has one extra uniform, `flags` [14] (bit 0 QK-norm, bit 1 gated q layout). |
 | `src/gpu.rs` | Minimal Metal harness (same objc2 / objc2-metal versions as the engine): device, library from `SHADER_SOURCE` (the engine's `common_bf16.metal`, read via `include_str!`, + `attn_hd128.metal`, `attn_hd128_flash.metal`, `attn_hd128_sdpa.metal`), pipelines (key `name#s=..,c=..,w=..` sets function constants, `fc_key`), one arena buffer, encoder. Safe math mode, as the engine's `Gpu::from_shader_files`. |
 | `tests/attn_hd128.rs` | GPU kernels vs a CPU f32 reference at Qwen dense shapes; K-invariance. |
 | `src/weights.rs` | MLX 4-bit loader (see "Engine" below): `TensorSource` (`SafeSource` = model dir via streamdense-core `SafeIndex` + pread, `MemSource` = in-memory for tests), `layout()` + `load_into()`, `Weights` / `LayerW` / `Q4`. |
@@ -24,6 +25,7 @@ reference.
 | `examples/qd_run.rs` | CLI: greedy generation, timings, peak footprint, optional JSON. |
 | `examples/qd_compare.rs` | Real-model check: runs the exact prompt ids of an MLX reference JSON (free run + teacher forced), reports identical prefix, first divergence and logit gaps, timings, peak footprint. |
 | `tests/engine_synth.rs` | Whole engine on synthetic tiny Qwen3 / Qwen2 models and eight other-family models vs a CPU reference, every attention impl; per-feature ablations; K-invariance per impl; pipelined == sync; sdpa long-row fallback; tokenizers; weight layout (real models from headers only, family models from the synthetic source). |
+| `tests/families2_synth.rs` | The same checks for the second batch of family features on synthetic models: Phi-3 (fused qkv / gate_up, LongRoPE, hd 96, partial rotary), OLMo 2 (post-norm, full-projection QK-norm), SmolLM3 (no-RoPE layers), GLM-4 (GLM norms, interleaved partial RoPE), StableLM (LayerNorm, parallel / sequential, per-head LayerNorm QK-norm, hd 160), Cohere2 (parallel block, sliding + no-RoPE layers, logit scale), StarCoder2 (non-gated exact-erf GELU MLP, biases); weight layout; config validation. |
 
 Dispatch shape (same as `qwen_layers::encode_attn` for attn_gated; shown for HD 128, `attn{HD}_` with HD threads for prep and HD/4 for reduce at the other head dims):
 
@@ -43,12 +45,14 @@ with the gated flag.
   "Engine") runs Qwen dense models on its own.
 - Converter for dense Qwen checkpoints into the main engine's weight format (the standalone engine reads MLX 4-bit
   safetensors directly).
-- YaRN, dynamic or any `rope_scaling` other than linear / llama3 (reported as unsupported); Qwen's own sliding window
-  (`use_sliding_window`, refused for the Qwen families); partial rotary (the prep kernel takes rdims, untested, refused).
+- YaRN, dynamic or any `rope_scaling` other than linear / llama3 / LongRoPE (su) (reported as unsupported); Qwen's own
+  sliding window (`use_sliding_window`, refused for the Qwen families); partial rotary for Qwen (mlx_lm rotates the full
+  head dim there). LongRoPE past 4096 tokens is not exercised on a real model.
 - The split-K path is accurate to the tolerances below but not bit-exact vs MLX (the `sdpa` path is; see the
   next section).
-- Head dims other than 64 / 128 / 256; exact-erf GELU (`hidden_act` "gelu"). Config readers, tokenizers and chat
-  templates of the other families live in the model layer (`engine/model_layer/src/{llama,granite,gemma}`), not here.
+- Head dims other than 64 / 96 / 128 / 160 / 256 (160 is synthetic-tested only, no real model run); exact-erf GELU from
+  `hidden_act` "gelu" (`GeluErf` is set only where mlx_lm calls `nn.gelu`, StarCoder2). Config readers, tokenizers and
+  chat templates of the other families live in the model layer (`engine/model_layer/src/<family>`), not here.
 
 ## Run the tests
 
@@ -193,8 +197,8 @@ prefill + decode + pipelined generate, every attention impl / prefill mode, chec
 
 | field | values | used by |
 |---|---|---|
-| `family` | `Qwen2`, `Qwen3`, `Llama`, `Granite`, `Gemma`, `Gemma2`, `Gemma3` | informational; Qwen sliding window refused |
-| `head_dim`, `rope_dims` | 64 / 128 / 256; `rope_dims` must equal `head_dim` | all |
+| `family` | `Qwen2`, `Qwen3`, `Llama`, `Granite`, `Gemma`, `Gemma2`, `Gemma3`, `Mistral`, `Phi3`, `Olmo2`, `SmolLM3`, `Glm4`, `StableLm`, `Cohere2`, `Starcoder2` | informational; Qwen sliding window refused |
+| `head_dim`, `rope_dims` | 64 / 96 / 128 / 160 / 256; `rope_dims` even, <= `head_dim` (partial rotary; Qwen: equal) | all; partial: Phi-4-mini, GLM-4, StableLM |
 | `heads`, `kv_heads` | GQA, MQA or plain MHA; group <= 32 | all |
 | `attn_scale` | `None` = head_dim^-0.5 | Granite `attention_multiplier`, Gemma 2 / 3 `query_pre_attn_scalar`^-0.5 |
 | `attn_softcap`, `final_softcap` | `Some(cap)`: cap * tanh(x / cap) | Gemma 2 |
@@ -210,6 +214,14 @@ prefill + decode + pipelined generate, every attention impl / prefill mode, chec
 | `rope_local_theta` | sliding layers' plain RoPE theta | Gemma 3 `rope_local_base_freq` |
 | `attention_bias`, `o_bias`, `mlp_bias` | q/k/v bias / o_proj bias / gate, up, down bias | Qwen2 (q/k/v); Llama `attention_bias` (q/k/v + o), `mlp_bias` |
 | `tie_word_embeddings` | lm_head = embed_tokens, else `lm_head.*` | all |
+| `norm` | `Rms` / `LayerNorm { bias }` | StableLM, StarCoder2 (bias), Cohere2 (no bias) |
+| `block` | `Sequential` / `Parallel` / `ParallelBranchesFirst` / `PostNorm` | StableLM parallel residual, Cohere2, OLMo 2 |
+| `qk_norm_kind` | `HeadRms` / `FullRms` (whole projection) / `HeadLayerNorm` (weight per head) | Qwen3, Gemma 3 / OLMo 2 / StableLM |
+| `mlp` | `Gated` / `Plain` (down(act(up x))) | StarCoder2 (exact-erf GELU) |
+| `rope_traditional` | interleaved RoPE pairs | GLM-4, Cohere2 |
+| `no_rope_layers` | per layer: no RoPE | SmolLM3, Cohere2 full layers |
+| `rope_su` | LongRoPE / su as mlx_lm (long factors, q / k mscale) | Phi-3 / 3.5 / 4-mini |
+| `names` | tensor names, fused `qkv` / `gate_up` | Phi-3, GLM-4, StarCoder2, Cohere2 |
 
 How (kernels): the attention kernels are templates over the head dim (`attn{64,128,256}_prep_b16`, `_partial_k1..8_b16`,
 `_reduce`, `_flash`, `_sdpa_vec`); scale, score soft cap and window are Metal function constants set per pipeline
@@ -247,9 +259,9 @@ checked by an ablated reference with that one feature off, which must miss the t
 | RoPE scaling llama3 | done | llama3 rope (factor 8, low 1, high 4, original 256) | 0.018 (0.26) | 1.37 vs 0.06 |
 | q/k/v + o_proj bias | done | hd64 mha, llama biases | 0.021 / 0.023 | q/k/v 3.0 vs 0.05, o 3.4 vs 0.07 (hd64); 3.0 / 2.3 (hd128) |
 | MLP bias (unfused SiLU) | done | llama biases | 0.023 (0.29) | 1.50 vs 0.06 |
-| YaRN / dynamic / longrope RoPE | refused, named by `unsupported()` | — | — | — |
-| partial rotary | refused (kernel takes rdims, untested) | — | — | — |
-| exact-erf GELU (`hidden_act` "gelu") | refused, named | — | — | — |
+| YaRN / dynamic RoPE | refused, named by `unsupported()` | — | — | — |
+| partial rotary, LongRoPE, fused tensors, LayerNorm, parallel / post-norm blocks, no-RoPE layers, interleaved RoPE, non-gated MLP, hd 96 / 160 | done | `tests/families2_synth.rs` (same method, own ablations) | asserted within tolerance | asserted to miss |
+| exact-erf GELU from `hidden_act` "gelu" | refused, named (`GeluErf` only for StarCoder2, as mlx_lm) | — | — | — |
 
 All argmax tokens equal the reference's in every comparison. `families_k_invariant_and_pipelined`: for hd64 gqa,
 gemma2-style (hd 128, window, soft caps) and gemma3-style (hd 256, window, two RoPE tables), prefill in passes of 8 ==
@@ -324,7 +336,27 @@ pipelined decode), greedy, 32 new tokens, same prompt ids as mlx_lm greedy. Veri
 | gemma-2-2b-it | Gemma 2, soft caps, sliding 4096 | 32 / 32 (teacher-forced 32 / 32) | 685 tokens: 32 / 32 (teacher-forced 32 / 32); past 4096 not verified |
 
 No engine change was needed. Speeds, footprints and the full comparison: the
-[model layer README](../model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14).
+[model layer README](../model_layer/README.md#llama-granite-gemma-vs-mlx-2026-11-14). Gemma 2 past its 4096-token
+window (2026-11-15): 16 / 16 at 4331 prompt tokens vs a correctly windowed reference (mlx_lm with per-layer sliding
+masks). Gemma 3 past 512: the misses are bf16 near-ties (layer-by-layer check, no bug found).
+
+Second batch (2026-11-15, same method, short / ~690-707-token prompt, identical prefix out of 32):
+
+| model | family / features exercised | short prompt | long prompt |
+|---|---|---|---|
+| Mistral-7B-Instruct-v0.3 | Mistral (Llama math), hd 128 | 32 / 32 | 32 / 32 |
+| Phi-4-mini-instruct | Phi-3, fused tensors, partial rotary 0.75, LongRoPE, tied | 6 / 32, near-tie (gap 0.125; teacher-forced 29 / 32) | 32 / 32 |
+| Phi-3.5-mini-instruct | Phi-3, hd 96, LongRoPE | 32 / 32 | 32 / 32 |
+| OLMo-2-1124-7B-Instruct | OLMo 2, post-norm, full-projection QK-norm | 32 / 32 | 30 / 32, near-tie (gap 0.023; teacher-forced 32 / 32) |
+| SmolLM3-3B | SmolLM3, no-RoPE layers | 32 / 32 | 32 / 32 |
+| GLM-4-9B-0414 | GLM-4, four norms, fused gate_up, interleaved partial RoPE | 32 / 32 | 32 / 32 |
+| stablelm-2-1_6b-chat | StableLM, LayerNorm, per-head LayerNorm QK-norm, partial RoPE | 13 / 32 (gap 0.031) | 30 / 32 (gap 0.109) |
+| c4ai-command-r7b-12-2024 | Cohere2, parallel block, sliding + no-RoPE layers, logit scale | 20 / 20 to EOS (chat) | 32 / 32 |
+| starcoder2-3b | StarCoder2, non-gated exact-erf GELU MLP, biases | 32 / 32 | 32 / 32 |
+
+StableLM: mlx computes its F16 norms in f16, this engine in bf16 (teacher-forced 30 / 32, 31 / 32). Head dim 160 has
+no real-model run. Speeds and footprints: the
+[model layer README](../model_layer/README.md#more-families-vs-mlx-2026-11-15).
 
 ## GEMM prefill: `src/prefill.rs`
 

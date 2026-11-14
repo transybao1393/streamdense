@@ -54,7 +54,9 @@ impl Gpu {
     }
     /// Build the pipeline `key` (once). A key is a kernel name, optionally followed by function constant values:
     /// `name#s=<f32 bits hex>,c=<f32 bits hex>,w=<u32>` (any subset; see `fc_key`): s = attention scale
-    /// (function_constant 20), c = score soft cap (21), w = sliding window (22), as declared in attn_hd128.metal.
+    /// (function_constant 20), c = score soft cap (21), w = sliding window (22), and for attn{HD}_prep: r = RoPE mode
+    /// bits (23: 1 traditional, 2 no RoPE), m = q / k multiplier before RoPE (24, f32 bits hex), n = QK-norm mode (25:
+    /// 1 per-head LayerNorm), as declared in attn_hd128.metal.
     /// A plain name specializes with no constant defined (the kernels' defaults).
     pub fn pipeline(&mut self, key: &str) -> Result<(), String> {
         if self.psos.contains_key(key) { return Ok(()); }
@@ -67,6 +69,9 @@ impl Gpu {
                 "s" => (20usize, MTLDataType::Float, u32::from_str_radix(v, 16).map_err(|_| bad())?),
                 "c" => (21, MTLDataType::Float, u32::from_str_radix(v, 16).map_err(|_| bad())?),
                 "w" => (22, MTLDataType::UInt, v.parse::<u32>().map_err(|_| bad())?),
+                "r" => (23, MTLDataType::UInt, v.parse::<u32>().map_err(|_| bad())?),
+                "m" => (24, MTLDataType::Float, u32::from_str_radix(v, 16).map_err(|_| bad())?),
+                "n" => (25, MTLDataType::UInt, v.parse::<u32>().map_err(|_| bad())?),
                 _ => return Err(format!("pipeline key {}: unknown constant {:?}", key, k)),
             };
             // SAFETY: 4 bytes of a live u32 (f32 bits or u32), copied by Metal; ty matches the declared constant type.
@@ -96,6 +101,17 @@ pub fn fc_key(name: &str, scale: Option<f32>, softcap: Option<f32>, window: Opti
     if let Some(s) = scale { parts.push(format!("s={:08x}", s.to_bits())); }
     if let Some(c) = softcap { parts.push(format!("c={:08x}", c.to_bits())); }
     if let Some(w) = window { parts.push(format!("w={}", w)); }
+    if parts.is_empty() { name.to_string() } else { format!("{}#{}", name, parts.join(",")) }
+}
+
+/// Pipeline key of an attn{HD}_prep kernel: `name#r=<bits>,m=<f32 bits hex>,n=<mode>` (any subset; plain name when
+/// all are off: the original kernel). rope: bit 0 traditional pairs, bit 1 no RoPE; mscale: Phi-3 su q / k multiplier;
+/// qkn: 1 = per-head LayerNorm with a weight per head.
+pub fn fc_key_prep(name: &str, rope: u32, mscale: Option<f32>, qkn: u32) -> String {
+    let mut parts: Vec<String> = vec![];
+    if rope != 0 { parts.push(format!("r={}", rope)); }
+    if let Some(m) = mscale { parts.push(format!("m={:08x}", m.to_bits())); }
+    if qkn != 0 { parts.push(format!("n={}", qkn)); }
     if parts.is_empty() { name.to_string() } else { format!("{}#{}", name, parts.join(",")) }
 }
 

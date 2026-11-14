@@ -210,7 +210,8 @@ fn optimizations(engine: EngineKind, dir: &Path, root: &Value, q: Option<&QwenCo
 /// safetensors headers; never the weights, no Metal.
 pub fn inspect_text(dir: &str, conf: &config::Loaded) -> Result<String, String> {
     match detect(dir)?.entry.family {
-        Family::Qwen | Family::Llama | Family::Granite | Family::Gemma => Ok(Report::build(dir, conf)?.text()),
+        Family::Qwen | Family::Llama | Family::Granite | Family::Gemma | Family::Mistral | Family::Phi3 | Family::Olmo2
+        | Family::SmolLM3 | Family::Glm4 | Family::StableLm | Family::Cohere2 | Family::Starcoder2 => Ok(Report::build(dir, conf)?.text()),
     }
 }
 
@@ -225,6 +226,7 @@ fn generation(family: Family, root: &Value, c: Option<&DenseConfig>) -> String {
             _ => format!("Llama-architecture (plain RoPE theta {}, head dim {})", c.rope_theta, c.head_dim),
         },
         (Family::Granite, Some(_)) => "Granite (dense, attention only)".into(),
+        (f, Some(c)) => format!("{:?} (dense-engine {:?} layers)", f, c.family),
         (_, None) => format!("not determined (config not accepted), model_type {}", root["model_type"].as_str().unwrap_or("?")),
     }
 }
@@ -243,7 +245,16 @@ impl Report {
             config_problems = match family {
                 Family::Llama => crate::llama::blockers(&root),
                 Family::Granite => crate::granite::blockers(&root),
-                _ => crate::gemma::blockers(&root),
+                Family::Mistral => crate::mistral::blockers(&root),
+                Family::Phi3 => crate::phi3::blockers(&root),
+                Family::Olmo2 => crate::olmo2::blockers(&root),
+                Family::SmolLM3 => crate::smollm3::blockers(&root),
+                Family::Glm4 => crate::glm4::blockers(&root),
+                Family::StableLm => crate::stablelm::blockers(&root),
+                Family::Cohere2 => crate::cohere2::blockers(&root),
+                Family::Starcoder2 => crate::starcoder2::blockers(&root),
+                Family::Gemma => crate::gemma::blockers(&root),
+                Family::Qwen => vec![],
             };
         }
         match engine {

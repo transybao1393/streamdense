@@ -65,8 +65,9 @@ fn run(dir: &str, args: &[String]) -> Result<(), String> {
             let tk = Tokenizer::from_path(dir)?;
             eprintln!("chat template {}", ct.template);
             if show_ids { eprintln!("chat text {}", serde_json::Value::String(ct.text.clone())); }
-            // the rendered text holds the BOS text where the template puts one: no post-processor BOS
-            let ids = tk.encode(&ct.text);
+            // the rendered text holds the BOS text where the template puts one: no post-processor BOS, except where
+            // mlx_lm adds it to a template without one (`ChatText::add_bos`, Cohere2)
+            let ids = if ct.add_bos { tk.encode_with_special(&ct.text) } else { tk.encode(&ct.text) };
             (Some(tk), ids)
         }
         (None, None, Some(ids)) => (None, ids),

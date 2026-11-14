@@ -8,7 +8,8 @@
 //! Prompts are token ids. The caller tokenizes (`streamdense_tokenizer::Tokenizer`); `chat_text` renders a family's
 //! chat template and says how to encode the result.
 //! Every family is listed in `family::FAMILIES`; a family with its own checks adds them to `check_text_run`.
-//! Llama, Granite and Gemma run on dense-engine with the `DenseConfig` their folder builds (`dense_config`).
+//! Every non-Qwen family (Llama, Granite, Gemma, Mistral, Phi-3, OLMo 2, SmolLM3, GLM-4, StableLM, Cohere2, StarCoder2)
+//! runs on dense-engine with the `DenseConfig` its folder builds (`dense_config`).
 use crate::family::{detect, Detected, EngineKind, Family};
 use dense_engine::config::DenseConfig;
 use dense_engine::weights::SafeSource;
@@ -76,16 +77,27 @@ pub fn dense_config(dir: &str, d: &Detected) -> Result<DenseConfig, String> {
         Family::Llama => crate::llama::dense_config(&root()?, Path::new(dir)),
         Family::Granite => crate::granite::dense_config(&root()?, Path::new(dir)),
         Family::Gemma => crate::gemma::dense_config(&root()?, Path::new(dir)),
+        Family::Mistral => crate::mistral::dense_config(&root()?, Path::new(dir)),
+        Family::Phi3 => crate::phi3::dense_config(&root()?, Path::new(dir)),
+        Family::Olmo2 => crate::olmo2::dense_config(&root()?, Path::new(dir)),
+        Family::SmolLM3 => crate::smollm3::dense_config(&root()?, Path::new(dir)),
+        Family::Glm4 => crate::glm4::dense_config(&root()?, Path::new(dir)),
+        Family::StableLm => crate::stablelm::dense_config(&root()?, Path::new(dir)),
+        Family::Cohere2 => crate::cohere2::dense_config(&root()?, Path::new(dir)),
+        Family::Starcoder2 => crate::starcoder2::dense_config(&root()?, Path::new(dir)),
     }
 }
 
 /// How a rendered chat string is tokenized: `Tokenizer::encode` when the template text already holds the BOS text
-/// (Llama 3 `<|begin_of_text|>`, Gemma `<bos>`) or the model has no BOS (ChatML), as HF `apply_chat_template` does
-/// (`add_special_tokens=False`).
+/// (Llama 3 `<|begin_of_text|>`, Gemma `<bos>`, Mistral `<s>`, OLMo 2 `<|endoftext|>`) or the model has no BOS
+/// (ChatML), as HF `apply_chat_template` does (`add_special_tokens=False`). `add_bos`: the template writes no BOS but
+/// mlx_lm `generate` adds the post-processor one (Cohere2 `<BOS_TOKEN>`): `Tokenizer::encode_with_special`.
 pub struct ChatText {
     pub text: String,
     /// template name, for logs
     pub template: String,
+    /// encode with the tokenizer's post-processor specials (`encode_with_special`) instead of `encode`
+    pub add_bos: bool,
 }
 
 /// Name of the chat template a folder's family renders, or why `--chat` is refused for it.
@@ -99,29 +111,23 @@ pub fn template_name(dir: &str, d: &Detected) -> Result<String, String> {
         Family::Granite => Err("chat template: Granite template without <|im_start|> (older <|start_of_role|> form): not ported".into()),
         Family::Gemma if has("<start_of_turn>") => Ok("gemma turns".into()),
         Family::Gemma => Err("chat template: Gemma folder without a <start_of_turn> template (base model?): not ported".into()),
+        Family::Mistral => Ok(crate::mistral::template_kind(Path::new(dir))?.name().to_string()),
+        Family::Phi3 => Ok(crate::phi3::template_kind(Path::new(dir))?.name().to_string()),
+        Family::Olmo2 => Ok(crate::olmo2::template_kind(Path::new(dir))?.to_string()),
+        Family::SmolLM3 => Ok(crate::smollm3::template_kind(Path::new(dir))?.to_string()),
+        Family::Glm4 => Ok(crate::glm4::template_kind(Path::new(dir))?.name().to_string()),
+        Family::StableLm => Ok(crate::stablelm::template_kind(Path::new(dir))?.name().to_string()),
+        Family::Cohere2 => crate::cohere2::chat::template_check_dir(Path::new(dir)).map(|_| "command-r7b".to_string()),
+        Family::Starcoder2 => crate::starcoder2::chat_prompt_dir(Path::new(dir), &[], true).map(|_| String::new()),
     }
 }
 
-/// Today's date as "%d %b %Y" (local time is not known without libc tz; UTC), what transformers' `strftime_now`
-/// writes into the Llama 3.1 / 3.2 system block.
-fn today_dmy() -> String {
-    let days = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86400).unwrap_or(0) as i64;
-    // civil_from_days (H. Hinnant)
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
-    const M: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    format!("{:02} {} {}", day, M[(month - 1) as usize], year)
-}
+/// Today's LOCAL date as "%d %b %Y", what transformers' `strftime_now` (local time) writes into the Llama 3.1 / 3.2
+/// system block.
+fn today_dmy() -> String { crate::localdate::today_local_short() }
 
 /// One user message in the folder's chat template, with the generation prompt. Encode `text` with
-/// `Tokenizer::encode` (no post-processor BOS).
+/// `Tokenizer::encode` (no post-processor BOS), or `encode_with_special` when `add_bos`.
 pub fn chat_text(dir: &str, d: &Detected, user: &str) -> Result<ChatText, String> {
     let template = template_name(dir, d)?;
     let msgs = vec![("user".to_string(), user.to_string())];
@@ -134,8 +140,19 @@ pub fn chat_text(dir: &str, d: &Detected, user: &str) -> Result<ChatText, String
         },
         Family::Granite => crate::granite::chat_prompt(&msgs, true)?,
         Family::Gemma => crate::gemma::chat_prompt(&msgs, true)?,
+        Family::Mistral => crate::mistral::chat_prompt_dir(Path::new(dir), &msgs, true)?,
+        Family::Phi3 => crate::phi3::chat_prompt_dir(Path::new(dir), &msgs, true)?,
+        Family::Olmo2 => crate::olmo2::chat_prompt(&msgs, true)?,
+        Family::SmolLM3 => crate::smollm3::chat_prompt(&msgs, true)?,
+        Family::Glm4 => crate::glm4::chat_prompt_dir(Path::new(dir), &msgs, true)?,
+        Family::StableLm => crate::stablelm::chat_prompt_dir(Path::new(dir), &msgs, true)?,
+        Family::Cohere2 => crate::cohere2::chat_prompt_dir(Path::new(dir), &msgs, true)?,
+        Family::Starcoder2 => crate::starcoder2::chat_prompt_dir(Path::new(dir), &msgs, true)?,
     };
-    Ok(ChatText { text, template })
+    // Cohere2: the template writes no <BOS_TOKEN>; mlx_lm encodes with add_special_tokens=True (prompt does not start
+    // with the BOS text), so its prompt starts with <BOS_TOKEN>
+    let add_bos = d.entry.family == Family::Cohere2;
+    Ok(ChatText { text, template, add_bos })
 }
 
 /// What stops a text prompt from reaching this family's engine, before any weight is read. The family's own reasons
@@ -143,7 +160,8 @@ pub fn chat_text(dir: &str, d: &Detected, user: &str) -> Result<ChatText, String
 pub fn check_text_run(dir: &str, d: &Detected) -> Result<(), String> {
     match d.entry.family {
         Family::Qwen => Ok(()),
-        Family::Llama | Family::Granite | Family::Gemma => dense_config(dir, d).map(|_| ()),
+        Family::Llama | Family::Granite | Family::Gemma | Family::Mistral | Family::Phi3 | Family::Olmo2 | Family::SmolLM3
+        | Family::Glm4 | Family::StableLm | Family::Cohere2 | Family::Starcoder2 => dense_config(dir, d).map(|_| ()),
     }
 }
 
@@ -155,7 +173,8 @@ impl Model {
         let dense = EngineOptions { max_ctx: o.max_ctx, ..Default::default() };
         let eng = match (detected.entry.family, detected.entry.engine) {
             (Family::Qwen, EngineKind::DenseEngine) => Loaded::DenseEngine(Engine::load(dir, dense)?),
-            (Family::Llama | Family::Granite | Family::Gemma, EngineKind::DenseEngine) => {
+            (Family::Llama | Family::Granite | Family::Gemma | Family::Mistral | Family::Phi3 | Family::Olmo2 | Family::SmolLM3
+             | Family::Glm4 | Family::StableLm | Family::Cohere2 | Family::Starcoder2, EngineKind::DenseEngine) => {
                 let cfg = dense_config(dir, &detected)?;
                 Loaded::DenseEngine(Engine::from_source(cfg, &SafeSource::open(dir)?, dense)?)
             }
@@ -211,5 +230,18 @@ mod tests {
         };
         let shape = r#""hidden_size": 512, "intermediate_size": 1024, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 128, "vocab_size": 256, "bos_token_id": 0, "eos_token_id": 1"#;
         assert!(check("qwen", &format!(r#"{{"model_type": "qwen3", {}}}"#, shape)).is_ok());
+    }
+
+    /// The Llama 3.1 / 3.2 "Today Date" is the local date as "%d %b %Y" (HF `strftime_now` is local time).
+    #[test]
+    fn llama_date_is_local_dmy() {
+        let d = today_dmy();
+        let now = crate::localdate::now_secs();
+        let local = crate::localdate::local_days_at(now);
+        let around: Vec<String> = [-1i64, 0].iter()
+            .map(|k| crate::localdate::date_from_days_short(local + k)).collect();
+        assert!(around.contains(&d), "{} not in {:?}", d, around);
+        let p: Vec<&str> = d.split(' ').collect();
+        assert!(p.len() == 3 && p[0].len() == 2 && p[1].len() == 3 && p[2].len() == 4, "format {:?}", d);
     }
 }

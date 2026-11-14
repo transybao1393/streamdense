@@ -20,7 +20,7 @@
 //!
 //! | field | meaning (default = Qwen) |
 //! |---|---|
-//! | `head_dim` | 64, 128 or 256 |
+//! | `head_dim` | 64, 96, 128, 160 or 256 |
 //! | `attn_scale` | `None` = head_dim^-0.5; Granite `attention_multiplier`; Gemma `query_pre_attn_scalar`^-0.5 |
 //! | `attn_softcap` / `final_softcap` | `None`; Gemma 2: scores / logits = cap * tanh(x / cap) |
 //! | `activation` | `Silu` (SwiGLU) or `GeluTanh` (GeGLU, gelu_pytorch_tanh) |
@@ -35,13 +35,23 @@
 //! | `rope_scale` | `RopeScaling::None`, `Linear`, `Llama3`; anything else goes to `rope_scaling` (reported unsupported) |
 //! | `attention_bias` / `o_bias` / `mlp_bias` | q/k/v bias (Qwen2 true) / o_proj bias / gate, up, down bias (Llama `attention_bias` sets both of the first two) |
 //! | `tie_word_embeddings` | lm_head = embed_tokens |
+//! | `norm` | `NormKind::Rms`; `LayerNorm { bias }` (StableLM, StarCoder2 with bias; Cohere2 without) for every hidden-size norm |
+//! | `block` | `Block::Sequential` (pre-norm, 2 or `four_norms` norms); `Parallel` / `ParallelBranchesFirst` (one input norm, attn and mlp from it); `PostNorm` (OLMo 2) |
+//! | `qk_norm_kind` | with `qk_norm`: `HeadRms` (Qwen3, Gemma 3); `FullRms` over the whole q / k projection (OLMo 2); `HeadLayerNorm` per-head weights (StableLM) |
+//! | `mlp` | `Mlp::Gated` (act(gate) * up); `Plain` down(act(up x)) (StarCoder2 c_fc / c_proj) |
+//! | `rope_traditional` | false: rotate-half pairs (i, i + rdims/2); true: interleaved pairs (2i, 2i + 1) (GLM-4, Cohere2) |
+//! | `no_rope_layers` | empty = RoPE on every layer; else per layer, true = no RoPE (SmolLM3, Cohere2 full layers) |
+//! | `rope_su` | `None`; Phi-3 LongRoPE / su: inverse freqs / long_factor, q / k scaled by mscale before RoPE |
+//! | `names` | tensor names (`TensorNames`): per-layer module names, fused qkv / gate_up |
+//!
+//! Field spec for family adapters: see the SPEC.md the adapters read (mirrored in these doc comments).
 use serde_json::Value;
 
 /// Head dims the attention kernels are built for.
-pub const HEAD_DIMS: [usize; 3] = [64, 128, 256];
+pub const HEAD_DIMS: [usize; 5] = [64, 96, 128, 160, 256];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Family { Qwen2, Qwen3, Llama, Granite, Gemma, Gemma2, Gemma3 }
+pub enum Family { Qwen2, Qwen3, Llama, Granite, Gemma, Gemma2, Gemma3, Mistral, Phi3, Olmo2, SmolLM3, Glm4, StableLm, Cohere2, Starcoder2 }
 
 impl Family {
     pub fn is_qwen(self) -> bool { matches!(self, Family::Qwen2 | Family::Qwen3) }
@@ -57,6 +67,9 @@ pub enum Activation {
     Silu,
     /// tanh-approximated GELU (GeGLU): HF `gelu_pytorch_tanh` / `gelu_new`, mlx `gelu_approx`
     GeluTanh,
+    /// exact-erf GELU, mlx `nn.gelu` (bf16 chain: x * bf(1 + erf(x / sqrt 2)) / 2). Not produced by `from_hf`: a family
+    /// sets it where mlx_lm calls nn.gelu (StarCoder2, whatever its hidden_act says).
+    GeluErf,
     /// anything else (named by `unsupported()`), e.g. exact-erf "gelu"
     Other(String),
 }
@@ -80,6 +93,113 @@ pub enum RopeScaling {
     Linear { factor: f64 },
     /// HF / mlx_lm "llama3" frequency smoothing
     Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max_pos: usize },
+}
+
+/// Hidden-size norm (input / post-attention / pre- and post-feedforward / final). QK norms: `QkNorm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NormKind {
+    /// mx.fast.rms_norm with weight
+    Rms,
+    /// mx.fast.layer_norm with weight, and `.bias` when `bias` (nn.LayerNorm(bias = ...))
+    LayerNorm { bias: bool },
+}
+
+/// Decoder layer structure. Norm names refer to `TensorNames` roles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Block {
+    /// h += attn(input_norm(h)); h += mlp(post_attn_norm(h)); with `four_norms` (Gemma 2 / 3, GLM-4):
+    /// h += post_attn_norm(attn(input_norm(h))); h += post_ffn_norm(mlp(pre_ffn_norm(h))).
+    Sequential,
+    /// x = input_norm(h); h = (h + attn(x)) + mlp(x) (StableLM use_parallel_residual: `x + r + mlp(h)`).
+    Parallel,
+    /// x = input_norm(h); h = (attn(x) + mlp(x)) + h (Cohere2: `attn_h + ff_h + x`).
+    ParallelBranchesFirst,
+    /// OLMo 2: h += post_attn_norm(attn(h)); h += post_ffn_norm(mlp(h)) (no input norms).
+    PostNorm,
+}
+
+/// QK-norm form (only read when `qk_norm`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QkNorm {
+    /// RMSNorm per head, one weight [head_dim] shared by all heads (Qwen3, Gemma 3)
+    HeadRms,
+    /// RMSNorm over the whole q projection [heads * head_dim] and k projection [kv_heads * head_dim] (OLMo 2)
+    FullRms,
+    /// LayerNorm (no bias) per head with a weight per head: `{q_norm}.norms.{h}.weight` [head_dim] (StableLM qk_layernorm)
+    HeadLayerNorm,
+}
+
+/// FFN form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mlp {
+    /// down(act(gate x) * up x)
+    Gated,
+    /// down(act(up x)) (StarCoder2: up = c_fc, down = c_proj; no gate tensor)
+    Plain,
+}
+
+/// Phi-3 LongRoPE / "su" scaling as mlx_lm SuScaledRoPE: RoPE periods theta^(2i/d) * long_factor[i] (mlx_lm always
+/// uses the long factors), and q / k (first rope_dims dims) multiplied by `mscale` (bf16) before the rotation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SuRope {
+    /// [rope_dims / 2]
+    pub long_factor: Vec<f64>,
+    pub mscale: f64,
+}
+
+impl SuRope {
+    /// mlx_lm SuScaledRoPE: factor = max_pos / original_max_pos; mscale = long_mscale (when Some and != 0), else 1 when
+    /// factor <= 1, else sqrt(1 + ln(factor) / ln(original_max_pos)).
+    pub fn new(long_factor: Vec<f64>, max_pos: usize, original_max_pos: usize, long_mscale: Option<f64>) -> SuRope {
+        let factor = max_pos as f64 / original_max_pos as f64;
+        let mscale = match long_mscale {
+            Some(m) if m != 0.0 => m,
+            _ if factor <= 1.0 => 1.0,
+            _ => (1.0 + factor.ln() / (original_max_pos as f64).ln()).sqrt(),
+        };
+        SuRope { long_factor, mscale }
+    }
+}
+
+/// Safetensors tensor names (module prefixes, without `.weight` / `.scales` / `.biases` / `.bias`). Per-layer names are
+/// relative to `{layer_prefix}.{i}.`. Defaults = Llama / Qwen names (`TensorNames::default()`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorNames {
+    pub embed: String,
+    pub final_norm: String,
+    pub lm_head: String,
+    pub layer_prefix: String,
+    pub q: String,
+    pub k: String,
+    pub v: String,
+    /// fused q | k | v rows (Phi-3 `self_attn.qkv_proj`); when Some, `q` / `k` / `v` are not read
+    pub qkv: Option<String>,
+    pub o: String,
+    pub gate: String,
+    pub up: String,
+    /// fused gate | up rows (first `inter` rows gate; Phi-3, GLM-4 `mlp.gate_up_proj`); when Some, `gate` / `up` are not read
+    pub gate_up: Option<String>,
+    pub down: String,
+    pub input_norm: String,
+    pub post_attn_norm: String,
+    pub pre_ffn_norm: String,
+    pub post_ffn_norm: String,
+    pub q_norm: String,
+    pub k_norm: String,
+}
+
+impl Default for TensorNames {
+    fn default() -> TensorNames {
+        let s = |x: &str| x.to_string();
+        TensorNames {
+            embed: s("model.embed_tokens"), final_norm: s("model.norm"), lm_head: s("lm_head"), layer_prefix: s("model.layers"),
+            q: s("self_attn.q_proj"), k: s("self_attn.k_proj"), v: s("self_attn.v_proj"), qkv: None, o: s("self_attn.o_proj"),
+            gate: s("mlp.gate_proj"), up: s("mlp.up_proj"), gate_up: None, down: s("mlp.down_proj"),
+            input_norm: s("input_layernorm"), post_attn_norm: s("post_attention_layernorm"),
+            pre_ffn_norm: s("pre_feedforward_layernorm"), post_ffn_norm: s("post_feedforward_layernorm"),
+            q_norm: s("self_attn.q_norm"), k_norm: s("self_attn.k_norm"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +260,22 @@ pub struct DenseConfig {
     /// MLX `quantization` (or `quantization_config`) block: (group_size, bits). None = not an MLX-quantized config
     /// (the HF originals); the weight loader then refuses the model, `validate()` does not.
     pub quant: Option<(usize, usize)>,
+    /// Hidden-size norm kind (every norm except QK-norm). Default `Rms`.
+    pub norm: NormKind,
+    /// Layer structure. Default `Sequential`.
+    pub block: Block,
+    /// QK-norm form when `qk_norm`. Default `HeadRms`.
+    pub qk_norm_kind: QkNorm,
+    /// FFN form. Default `Gated`.
+    pub mlp: Mlp,
+    /// Interleaved RoPE pairs (mlx `traditional=True`). Default false.
+    pub rope_traditional: bool,
+    /// Empty = RoPE on every layer; else `layers` entries, true = the layer applies no RoPE. Default empty.
+    pub no_rope_layers: Vec<bool>,
+    /// LongRoPE / su scaling (replaces `rope_scale`, which must stay `None`). Default None.
+    pub rope_su: Option<SuRope>,
+    /// Tensor names. Default `TensorNames::default()`.
+    pub names: TensorNames,
 }
 
 /// Token ids from a scalar or an array field.
@@ -197,6 +333,12 @@ pub fn rope_inv_freq(rdims: usize, theta: f64, scale: RopeScaling) -> Vec<f32> {
         };
         (1.0 / p) as f32
     }).collect()
+}
+
+/// LongRoPE / su inverse frequencies (f32, rdims / 2): 1 / (theta^(2i / rdims) * long_factor[i]) in f64 (mlx_lm
+/// SuScaledRoPE `freqs = long_factor * base ** (arange(0, dims, 2) / dims)`, mx.fast.rope takes 1 / freqs).
+pub fn su_inv_freq(rdims: usize, theta: f64, su: &SuRope) -> Vec<f32> {
+    (0..rdims / 2).map(|i| (1.0 / (theta.powf((2 * i) as f64 / rdims as f64) * su.long_factor[i])) as f32).collect()
 }
 
 /// True for a hybrid (linear-attention) Qwen config: any `linear_attention` layer, any `linear_*` field, or
@@ -347,6 +489,14 @@ impl DenseConfig {
             bos: c["bos_token_id"].as_u64().map(|v| v as u32),
             eos,
             quant,
+            norm: NormKind::Rms,
+            block: Block::Sequential,
+            qk_norm_kind: QkNorm::HeadRms,
+            mlp: Mlp::Gated,
+            rope_traditional: false,
+            no_rope_layers: vec![],
+            rope_su: None,
+            names: TensorNames::default(),
         })
     }
 
@@ -363,6 +513,8 @@ impl DenseConfig {
             sliding_window: None, hidden_act: "silu".into(), activation: Activation::Silu, attn_scale: None,
             attn_softcap: None, final_softcap: None, norm_plus_one: false, four_norms: false, embed_scale: 1.0,
             residual_multiplier: 1.0, logits_scaling: 1.0, bos: None, eos: vec![], quant: Some((64, 4)),
+            norm: NormKind::Rms, block: Block::Sequential, qk_norm_kind: QkNorm::HeadRms, mlp: Mlp::Gated,
+            rope_traditional: false, no_rope_layers: vec![], rope_su: None, names: TensorNames::default(),
         }
     }
 
@@ -371,14 +523,19 @@ impl DenseConfig {
         self.attn_scale.unwrap_or((self.head_dim as f64).powf(-0.5)) as f32
     }
     pub fn n_sliding(&self) -> usize { self.kinds.iter().filter(|k| **k == LayerKind::Sliding).count() }
+    /// Layer `l` applies RoPE (`no_rope_layers` empty or false at l).
+    pub fn rope_on(&self, l: usize) -> bool { !self.no_rope_layers.get(l).copied().unwrap_or(false) }
 
-    /// Every feature the dense path (attention kernels at head dim 64 / 128 / 256 + the engine's 4-bit FFN / head)
+    /// Every feature the dense path (attention kernels at head dim 64 / 96 / 128 / 160 / 256 + the engine's 4-bit FFN / head)
     /// does not support, by name. Empty = supported.
     pub fn unsupported(&self) -> Vec<String> {
         let mut errs: Vec<String> = vec![];
-        if !HEAD_DIMS.contains(&self.head_dim) { errs.push(format!("head_dim must be 64, 128 or 256 (got {})", self.head_dim)); }
-        if self.rope_dims != self.head_dim {
-            errs.push(format!("partial rotary: rope dims {} != head_dim {} (the prep kernel takes rdims but only full rotary is tested)", self.rope_dims, self.head_dim));
+        if !HEAD_DIMS.contains(&self.head_dim) { errs.push(format!("head_dim must be 64, 96, 128, 160 or 256 (got {})", self.head_dim)); }
+        if self.rope_dims != self.head_dim && self.family.is_qwen() {
+            // mlx_lm qwen2 / qwen3 rotate the full head dim whatever partial_rotary_factor says: not mirrored
+            errs.push(format!("partial rotary: rope dims {} != head_dim {} (Qwen dense: mlx_lm rotates the full head dim)", self.rope_dims, self.head_dim));
+        } else if self.rope_dims == 0 || self.rope_dims % 2 != 0 || self.rope_dims > self.head_dim {
+            errs.push(format!("partial rotary: rope dims {} must be even, > 0 and <= head_dim {}", self.rope_dims, self.head_dim));
         }
         if let Some(s) = &self.rope_scaling {
             errs.push(format!("rope_scaling {} (implemented: plain RoPE, linear, llama3; YaRN, dynamic etc. not yet)", s));
@@ -425,6 +582,26 @@ impl DenseConfig {
             if !x.is_finite() || x == 0.0 { errs.push(format!("{} {} must be finite and != 0", name, x)); }
         }
         if self.kinds.len() != self.layers { errs.push(format!("kinds has {} entries, layers = {}", self.kinds.len(), self.layers)); }
+        if self.four_norms && self.block != Block::Sequential {
+            errs.push(format!("four_norms only with Block::Sequential (block {:?})", self.block));
+        }
+        if !self.no_rope_layers.is_empty() && self.no_rope_layers.len() != self.layers {
+            errs.push(format!("no_rope_layers has {} entries, layers = {}", self.no_rope_layers.len(), self.layers));
+        }
+        if let Some(su) = &self.rope_su {
+            if su.long_factor.len() != self.rope_dims / 2 {
+                errs.push(format!("rope_su long_factor has {} entries, want rope_dims / 2 = {}", su.long_factor.len(), self.rope_dims / 2));
+            }
+            if !su.long_factor.iter().all(|f| pos_f(*f)) || !pos_f(su.mscale) {
+                errs.push(format!("rope_su factors / mscale {} must be finite and > 0", su.mscale));
+            }
+            if self.rope_scale != RopeScaling::None || self.rope_local_theta.is_some() {
+                errs.push("rope_su together with rope_scale / rope_local_theta".into());
+            }
+        }
+        if self.mlp == Mlp::Plain && self.names.gate_up.is_some() {
+            errs.push("Mlp::Plain with a fused gate_up tensor".into());
+        }
         for (name, d) in [("hidden_size", self.hidden), ("intermediate_size", self.inter), ("q dim (heads x head_dim)", self.q_dim()),
                           ("kv dim (kv_heads x head_dim)", self.kv_dim())] {
             if d % 64 != 0 { errs.push(format!("{} = {} must be a multiple of 64 (4-bit group size)", name, d)); }
@@ -537,9 +714,15 @@ mod tests {
         // head dim 64 (896 / 14): supported since the head-dim-64 kernels (bias and tied embeddings too)
         c.validate().unwrap();
         let mut c2 = c.clone();
-        c2.head_dim = 96;
-        c2.rope_dims = 96;
-        assert!(c2.validate().unwrap_err().contains("head_dim must be 64, 128 or 256 (got 96)"));
+        c2.head_dim = 80;
+        c2.rope_dims = 80;
+        assert!(c2.validate().unwrap_err().contains("head_dim must be 64, 96, 128, 160 or 256 (got 80)"));
+        // head dims 96 (Phi-3 / Phi-3.5-mini) and 160 (stablelm-2-12b): q / kv dims stay multiples of 64
+        for hd in [96, 160] {
+            c2.head_dim = hd;
+            c2.rope_dims = hd;
+            c2.validate().unwrap();
+        }
     }
 
     #[test]
@@ -591,7 +774,7 @@ mod tests {
         assert!(e.contains("hidden_act must be silu or gelu_pytorch_tanh (got gelu)") && e.contains("attn_softcap 0")
                 && e.contains("residual_multiplier NaN"), "{}", e);
         let mut g = DenseConfig::base("llama", Family::Llama, 2048, 8192, 16, 64, 1, 32, 128256);
-        assert!(g.validate().unwrap_err().contains("head_dim must be 64, 128 or 256 (got 32)"));
+        assert!(g.validate().unwrap_err().contains("head_dim must be 64, 96, 128, 160 or 256 (got 32)"));
         g.head_dim = 64;
         g.rope_dims = 64;
         assert!(g.validate().unwrap_err().contains("GQA group 64 > 32"));

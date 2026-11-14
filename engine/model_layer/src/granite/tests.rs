@@ -116,7 +116,7 @@ fn head_dim_key() {
     // head dim 80 parses, validate() names it
     let v = with(with(granite_4_2_3b(), "num_attention_heads", json!(32)), "num_key_value_heads", json!(8));
     let e = dense_config(&v, no_dir()).unwrap_err();
-    assert!(e.contains("head_dim must be 64, 128 or 256 (got 80)"), "{}", e);
+    assert!(e.contains("head_dim must be 64, 96, 128, 160 or 256 (got 80)"), "{}", e);
     assert!(has(&blockers(&v), "got 80"));
 }
 

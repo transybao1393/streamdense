@@ -1,5 +1,6 @@
 //! dense-engine: a minimal engine for ordinary dense decoder models (Qwen2 / 2.5 / 3 parsed here; Llama, Granite, Gemma
-//! 1 / 2 / 3-text through config fields: head dim 64 / 128 / 256, GQA or MHA, MLX 4-bit weights) on the streamdense
+//! 1 / 2 / 3-text, Mistral, Phi-3, OLMo 2, SmolLM3, GLM-4, StableLM, Cohere2, StarCoder2 through config fields: head dim
+//! 64 / 96 / 128 / 160 / 256, GQA or MHA, MLX 4-bit weights) on the streamdense
 //! Metal kernels. Not wired into the engine workspace (see README.md).
 //! - `config`: config.json reader + validator (`DenseConfig`).
 //! - `gpu`: a minimal Metal harness (device, library from sources, pipelines, one arena buffer, encoder).
@@ -17,7 +18,7 @@ pub mod weights;
 pub use engine::{Engine, EngineOptions, GenStats};
 pub use streamdense_tokenizer::{StreamDecoder, Tokenizer};
 
-/// Library source for the attention kernels (head dim 64 / 128 / 256): the engine's common_bf16.metal (bf, to_bf, SdCtrl; read,
+/// Library source for the attention kernels (head dim 64 / 96 / 128 / 160 / 256): the engine's common_bf16.metal (bf, to_bf, SdCtrl; read,
 /// not modified) followed by shaders/attn_hd128.metal (split-K, prep), attn_hd128_flash.metal (prefill flash) and
 /// attn_hd128_sdpa.metal (MLX decode mirror).
 pub const SHADER_SOURCE: [&str; 4] = [

@@ -7,8 +7,9 @@ no inference code of its own; it calls the existing engines.
 
 The gateway (`streamdense up` / `streamdense gateway`: Anthropic Messages API, MTP speculative decoding, the 12 GB mode)
 is built for Qwen3.8-27B. Every other supported model runs here, as plain greedy decoding. Besides Qwen, the Llama,
-Granite and Gemma families run on [`engine/dense-engine`](../dense-engine/README.md): each family's folder in `src/` maps
-its `config.json` to the engine's `DenseConfig` and renders its chat template.
+Granite, Gemma, Mistral, Phi-3, OLMo 2, SmolLM3, GLM-4, StableLM, Cohere2 and StarCoder2 families run on
+[`engine/dense-engine`](../dense-engine/README.md): each family's folder in `src/` maps its `config.json` to the
+engine's `DenseConfig` and renders its chat template.
 
 ## Supported families
 
@@ -24,18 +25,28 @@ Only families that were run on real models are listed. Anything else is refused 
 | Gemma 1 | `gemma` | google/gemma-1.1-2b-it | [`engine/dense-engine`](../dense-engine/README.md) | gemma-1.1-2b-it vs MLX (below) |
 | Gemma 2 | `gemma2` | google/gemma-2-2b-it | [`engine/dense-engine`](../dense-engine/README.md) | gemma-2-2b-it vs MLX (below) |
 | Gemma 3 (text) | `gemma3_text` | google/gemma-3-270m-it | [`engine/dense-engine`](../dense-engine/README.md) | gemma-3-270m-it vs MLX (below) |
+| Mistral | `mistral` | mistralai/Mistral-7B-Instruct-v0.3, Mistral-Nemo-Instruct-2407, Ministral-8B-Instruct-2410 | [`engine/dense-engine`](../dense-engine/README.md) | Mistral-7B-Instruct-v0.3 vs MLX (below) |
+| Phi-3 / Phi-3.5 / Phi-4-mini | `phi3` | microsoft/Phi-4-mini-instruct, microsoft/Phi-3.5-mini-instruct | [`engine/dense-engine`](../dense-engine/README.md) | Phi-4-mini-instruct and Phi-3.5-mini-instruct (hd 96, LongRoPE) vs MLX (below) |
+| OLMo 2 | `olmo2` | allenai/OLMo-2-1124-7B-Instruct | [`engine/dense-engine`](../dense-engine/README.md) | OLMo-2-1124-7B-Instruct vs MLX (below) |
+| SmolLM3 | `smollm3` | HuggingFaceTB/SmolLM3-3B | [`engine/dense-engine`](../dense-engine/README.md) | SmolLM3-3B vs MLX (below) |
+| GLM-4 (0414) | `glm4` | THUDM/GLM-4-9B-0414 | [`engine/dense-engine`](../dense-engine/README.md) | GLM-4-9B-0414 vs MLX (below) |
+| StableLM 2 | `stablelm` | stabilityai/stablelm-2-1_6b-chat | [`engine/dense-engine`](../dense-engine/README.md) | stablelm-2-1_6b-chat vs MLX (below) |
+| Command R7B | `cohere2` | CohereForAI/c4ai-command-r7b-12-2024 | [`engine/dense-engine`](../dense-engine/README.md) | c4ai-command-r7b-12-2024 vs MLX (below) |
+| StarCoder2 (base) | `starcoder2` | bigcode/starcoder2-3b | [`engine/dense-engine`](../dense-engine/README.md) | starcoder2-3b vs MLX (below), `--prompt` only |
 
 Gemma 1 and Gemma 2 are verified on real models (2026-11-14, below): gemma-1.1-2b-it (F16 embedding) chat 9 / 9
 tokens to EOS, 685-token prompt 32 / 32; gemma-2-2b-it short and 685-token prompts 32 / 32 (teacher-forced 32 / 32
-both), chat string equal to HF. Gemma 2 past its 4096-token window is not verified (mlx_lm 0.32.2 `gemma2.py` has no
-sliding window, so there is no valid reference). A multimodal `gemma3` folder whose weights are the text model only is
+both), chat string equal to HF. Gemma 2 past its 4096-token window (2026-11-15): 16 / 16 at 4331 prompt tokens
+against a correctly windowed reference (mlx_lm with per-layer sliding masks; mlx_lm 0.32.2's own `gemma2.py` has no
+sliding window and gives 1 / 16 there, so it is not a valid reference). A multimodal `gemma3` folder whose weights are the text model only is
 routed but was not run on a real checkpoint. Gemma 1 GELU: this layer follows the model config (`hidden_activation`
 `gelu_pytorch_tanh`, tanh GELU, as transformers); mlx_lm's `gemma.py` uses exact-erf GELU, yet the greedy tokens
 matched on gemma-1.1-2b-it.
 
 Qwen dense models take head dim 64 or 128 (Qwen2.5-0.5B has head dim 64 and runs: 2026-11-14 short prompt 32 / 32 vs
-MLX, long prompt first divergence at a near-tie, gap 0.047). Llama / Granite / Gemma take head dim 64, 128 or 256. Weights must be MLX 4-bit,
-group size 64.
+MLX, long prompt first divergence at a near-tie, gap 0.047). The other families take head dim 64, 96, 128, 160 or 256
+(96: Phi-3 / Phi-3.5-mini, checked on a real model; 160: e.g. stablelm-2-12b, synthetic-tested only). Weights must be
+MLX 4-bit, group size 64.
 
 Verification: `engine/dense-engine` was checked against MLX (mlx 0.32.4 / mlx_lm 0.32.2) on Qwen/Qwen3-1.7B and
 Qwen/Qwen2.5-1.5B-Instruct, 6 prompts x 128 greedy tokens: correct text from the first token, teacher-forced agreement
@@ -87,15 +98,38 @@ the whole answer up to the end-of-turn token):
 
 Gemma 3 past its 512-token window, against mlx_lm's no-cache windowed one-shot reference (mlx_lm's cached greedy is
 not a valid reference there): prompts of 490 / 600 / 650 tokens 32 / 32, 500 / 530 tokens 31 / 32, 686 tokens 29 / 32
-(1 near-tie, 2 misses of ~1.1 logit, unexplained). Open, low priority.
+(1 near-tie, 2 misses of ~1.1 logit). A layer-by-layer check (2026-11-15) found no bug: the misses are bf16 near-ties.
 
 ~690-token prompt prefill: SmolLM 0.048 s, Llama-3.2-1B 0.298 s (2,315 tok/s), granite 1.002 s (688 tok/s), Gemma 3
 0.081 s. Tokenizers: the four `tokenizer.json` files encode 10-11 test strings (digits, Unicode, control bytes, special
 tokens) to the same ids as HF `tokenizers`, with and without the post-processor BOS.
 
+### More families vs MLX (2026-11-15)
+
+Same method as above: greedy, 32 new tokens, quantized mlx_lm 0.32.2 on identical prompt ids; a short prompt and a
+long one (~690-707 tokens). "chat = HF": the `--chat` string equals `apply_chat_template`. Where a run diverges, the
+gap is mlx_lm's own top-1 - top-2 logit gap at the first divergence, and "teacher-forced" is our pick == MLX's token
+when both are fed MLX's history. tok/s: decode, short / long prompt; peak RAM: peak phys_footprint. M4 Pro, one
+process at a time.
+
+| family | model (MLX 4-bit, group 64) | short | long (~690-707 tokens) | notes | tok/s | peak RAM |
+|---|---|---|---|---|---|---|
+| mistral | Mistral-7B-Instruct-v0.3-4bit | 32 / 32 | 32 / 32 | chat = HF | 51 / 50 | 4.32 GB |
+| phi3 | Phi-4-mini-instruct-4bit | 6 / 32 (near-tie, gap 0.125; teacher-forced 29 / 32, every miss is MLX's #2) | 32 / 32 | chat = HF | 81 / 77 | 2.41 GB |
+| phi3 | Phi-3.5-mini-instruct-4bit (hd 96, LongRoPE) | 32 / 32 | 32 / 32 | chat = HF; prompts > 4096 tokens not exercised | 86 / 79 | 2.59 GB |
+| olmo2 | OLMo-2-1124-7B-Instruct-4bit | 32 / 32 | 30 / 32 (near-tie, gap 0.023; teacher-forced 32 / 32) | chat = HF; no MLX 4-bit 1B exists | 50 / 47 | 4.67 GB |
+| smollm3 | SmolLM3-3B-4bit | 32 / 32 | 32 / 32 | chat = HF (local date) | 85 / 79 | 2.01 GB |
+| glm4 | GLM-4-9B-0414-4bit | 32 / 32 | 32 / 32 | chat = HF | 42 / 40 | 5.54 GB |
+| stablelm | stablelm-2-1_6b-chat-4bit | 13 / 32 (gap 0.031) | 30 / 32 (gap 0.109) | chat = HF; F16 norms computed in f16 by mlx, in bf16 here; teacher-forced 30 / 32, 31 / 32 | 169 / 155 | 1.90 GB |
+| cohere2 | c4ai-command-r7b-12-2024-4bit | 20 / 20 to EOS | 32 / 32 | chat text = HF; BOS added as mlx_lm's Python `generate()` does (the CLI and HF add none) | 43 / 45 | 4.82 GB |
+| starcoder2 | starcoder2-3b-4bit (base, `--prompt` only) | 32 / 32 | 32 / 32 | no chat template | 87 / 83 | 2.40 GB |
+
+Head dims now 64 / 96 / 128 / 160 / 256; head dim 160 (e.g. stablelm-2-12b) is synthetic-tested only.
+
 ## Known limits
 
 - Greedy decoding only: no sampling, temperature or top-p.
+- Weights: MLX 4-bit, group size 64 only.
 - `--prompt`: the text as given, no chat template. Qwen: no BOS (as before). Llama / Granite / Gemma: the tokenizer's
   own BOS when it adds one (Llama 3 `<|begin_of_text|>`, Gemma `<bos>`; SmolLM and Granite add none), as HF / mlx_lm.
 - `--chat`: one user message in the family's chat template with the generation prompt, template defaults. Qwen
@@ -103,11 +137,13 @@ tokens) to the same ids as HF `tokenizers`, with and without the post-processor 
   thinking on (nothing after `<|im_start|>assistant\n`), Qwen3.8 via the gateway's renderer (thinking on, effort xhigh,
   `<think>\n`). No system message, no history, no tools from the command line.
 - Mixture-of-experts models (`qwen2_moe`, `qwen3_moe`, any config with expert keys) are rejected: dense models only.
-- `rope_scaling` other than linear / llama3 (YaRN, dynamic, longrope) is refused by name; Qwen's own sliding window is
-  refused (Gemma 2 / 3 sliding layers are supported).
+- `rope_scaling` other than linear / llama3 (YaRN, dynamic) is refused by name; Phi-3 LongRoPE / su runs as mlx_lm
+  does (always the long factors), prompts over 4096 tokens are untested. Qwen's own sliding window is refused (Gemma 2 /
+  3, Mistral `layer_types` and Cohere2 sliding layers are supported).
+- Head dim 160 (e.g. stablelm-2-12b) is synthetic-tested only, not on a real model.
 - Per family:
-  - Llama: `mistral` is not routed (its sliding window and `[INST]` template are not ported). Chat templates: Llama 3
-    header, Llama 3.1 / 3.2 dated system block (today's date, UTC, as transformers' `strftime_now`), ChatML
+  - Llama: chat templates: Llama 3
+    header, Llama 3.1 / 3.2 dated system block (today's local date, as transformers' `strftime_now`), ChatML
     (SmolLM / SmolLM2). Llama 2 / Mistral `[INST]`, Zephyr `<|user|>` (TinyLlama-Chat), ChatML with tools and
     folders without a template are refused for `--chat` by name (`--prompt` still works).
   - Granite: dense `granite` only. `granitemoe`, `granitemoeshared` and `granitemoehybrid` with experts: "dense models
@@ -119,8 +155,13 @@ tokens) to the same ids as HF `tokenizers`, with and without the post-processor 
   - Gemma: exact-erf GELU (`hidden_activation` "gelu") refused; a multimodal `gemma3` folder is taken only when its
     weights are the text model alone (`model.*`), a `language_model.*` / vision checkpoint is refused by name.
     `--chat` renders the Gemma turn template (a system message is merged into the first user turn). Gemma 2 past its
-    4096-token window: not verified (no valid mlx_lm reference). Gemma 3 past its 512-token window: near-match only
-    (686-token prompt 29 / 32 vs the windowed reference), open.
+    4096-token window: 16 / 16 at 4331 tokens vs a correctly windowed reference. Gemma 3 past its 512-token window:
+    686-token prompt 29 / 32 vs the windowed reference, the misses are bf16 near-ties (no bug found).
+  - Mistral: `[INST]` templates (v0.3, Nemo, Tekken); tools refused. Ministral 3 / Mistral Small 3.x (`mistral3`) and
+    Mixtral (MoE) are refused by name.
+  - Phi-3: MoE (`phimoe`) and multimodal (`phi3_v`, `phi4mm`) refused. LongRoPE past 4096 tokens untested.
+  - Cohere2: the BOS is added as mlx_lm's Python `generate()` does (its CLI and HF add none).
+  - StarCoder2: base model, no chat template: `--chat` is refused, use `--prompt`.
 - MTP, drafters, the 12 GB mode and the other gateway options are not used by `run`. In `inspect`, "available" means
   the engine has the feature and its files are present, not that `run` uses it.
 - The main (hybrid) engine needs `model.safetensors.index.json`; it has no single-file path.
@@ -321,7 +362,9 @@ let g = m.generate(&prompt_ids, 64, &mut |tok| { /* stream */ })?;   // g.tokens
 - `src/engine.rs`: `Model::load` + `Model::generate` (greedy, token ids) over `dense_engine::Engine` or `QwenEngine`.
 - `src/report.rs`: the `inspect` report: family, engine, quantization, what the engine's config check refuses, files
   present, the state of each existing optimization.
-- `src/llama/`, `src/granite/`, `src/gemma/`: one folder per non-Qwen family (below).
+- `src/llama/`, `src/granite/`, `src/gemma/`, `src/mistral/`, `src/phi3/`, `src/olmo2/`, `src/smollm3/`, `src/glm4/`,
+  `src/stablelm/`, `src/cohere2/`, `src/starcoder2/`: one folder per non-Qwen family (below).
+- `src/localdate.rs`: local calendar date for the dated chat templates (Llama 3.1 / 3.2, SmolLM3).
 - `src/main.rs`: the `sd-model-layer` CLI.
 
 Tests: `cargo test` (config fixtures in a temp folder; no weights, no GPU).
