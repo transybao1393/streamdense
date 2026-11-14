@@ -55,3 +55,17 @@ engine/target-*/
 # History index and snapshot tier index (local state)
 *.sdh
 tiers.json
+
+# Stray model weights outside models/ (test vectors and reference dumps stay tracked)
+*.safetensors
+*.gguf
+*.npz
+*.npy
+!engine/refs/**/*.safetensors
+!engine/refs/**/*.npz
+!engine/testdata/**/*.safetensors
+!engine/testdata/**/*.npz
+
+# sd-fetch partial downloads and resume sidecars
+*.sdfetch
+*.tmp
