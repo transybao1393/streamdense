@@ -18,19 +18,21 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
 
 - MTP and fused verify are lossless: every policy produces the same tokens as plain greedy decoding. Checked per
   position on the 27B (2026-11-15): at draft depths 2, 4, 7 and auto, on prose, code, arithmetic and repetitive prompts,
-  with fused verify off and on, all 1,504 verified positions had f32 logits bit-identical to plain one-token decode,
-  including positions where the top-2 logit gap was 0.04
+  in four engine setups (default; fused verify matmuls; batched verify attention, once on its short-context path and
+  once with its batched two-pass kernels forced on), all 3,008 verified positions had f32 logits bit-identical to
+  plain one-token decode, including positions where the top-2 logit gap was 0.04
   ([`mtp_exact_27b.rs`](engine/crates/streamdense-model/tests/mtp_exact_27b.rs)).
 
-  | Prompt | Logits bit-identical | MTP acceptance, depth 2 / 4 / 7 / auto |
+  | Prompt | Logits bit-identical (4 setups) | MTP acceptance, depth 2 / 4 / 7 / auto |
   |---|---|---|
-  | Prose | 376 / 376 | 0.48 / 0.30 / 0.18 / 0.32 |
-  | Code | 376 / 376 | 1.00 / 0.91 / 0.84 / 0.75 |
-  | Arithmetic | 376 / 376 | 0.88 / 0.86 / 0.64 / 0.51 |
-  | Repetitive | 376 / 376 | 1.00 / 1.00 / 1.00 / 0.86 |
+  | Prose | 752 / 752 | 0.48 / 0.30 / 0.18 / 0.32 |
+  | Code | 752 / 752 | 1.00 / 0.91 / 0.84 / 0.75 |
+  | Arithmetic | 752 / 752 | 0.88 / 0.86 / 0.64 / 0.51 |
+  | Repetitive | 752 / 752 | 1.00 / 1.00 / 1.00 / 0.86 |
 
-  47 positions per run, 4 depths, fused verify off and on. Acceptance with fused verify off. Peak RAM 15.4 GB,
-  about 1 minute per run including the 8 s model load.
+  47 positions per run, 4 depths, 4 setups. Acceptance is for the default setup (forcing the two-pass kernels changes
+  attention rounding for plain and MTP decode alike, so the prose reply and its acceptance differ there). Peak RAM
+  15.4 GB, about 1 minute per run including the model load.
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code
   session start in 0.4–1.5 s, and a new session that restores a snapshot of the shared system prompt starts in 0.66 s.
 - Decode is memory-bandwidth bound: a full-model pass reads about 15 GB of weights, two thirds of it FFN.
