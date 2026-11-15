@@ -11,6 +11,12 @@
 //! / SD_VERIFY_MIXERS=1 force those options at open (QwenEngine::open) for a second run.
 //! Run (under sd-watchdog): mtp_exact_27b-<hash> --ignored --nocapture --test-threads 1
 //! Env: SD_EXACT_MODEL (model dir), SD_EXACT_ORACLE=1 (oracle drafts, harness check), SD_EXACT_N (tokens per run, default 48), SD_EXACT_DIR (scratch dir for the plain logits rows + draft table).
+//! Long contexts: SD_EXACT_PROMPT_FILE = a file of u32 token ids (whitespace separated, chat-templated) used instead
+//! of the built-in prompts, SD_EXACT_MAX_CTX = max_ctx (default 2048). With a prompt file the prompt minus its last
+//! `SNAP_TAIL` tokens is prefilled ONCE (MTP engine: main + MTP KV) and saved as a snapshot in SD_EXACT_DIR; every run
+//! (plain and each depth) restores it and feeds the tail, so an 8K prompt is not re-prefilled per depth. Each table
+//! line counts the compared decode positions by attention path of their kv length N (N < SDPA_TWO_PASS_MIN single
+//! pass, up to SDPA_VEC_MAX_N MLX two-pass mirror, above it split-K `attn_partial` + `attn_reduce_gate`).
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
@@ -19,6 +25,8 @@ use streamdense_model::spec_deep::SpecMode;
 use streamdense_model::{QwenEngine, QwenOptions};
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+/// Prompt-file mode: tokens fed after the snapshot restore (the chat-template tail and a bit of body).
+const SNAP_TAIL: usize = 16;
 
 // chat-templated prompts (user turn + "<think>\n\n</think>\n\n"), tokenized with the model's tokenizer.json
 const PROMPTS: [(&str, &[u32]); 4] = [
@@ -65,9 +73,20 @@ fn mtp_exact_27b_per_position() {
     let n: usize = std::env::var("SD_EXACT_N").ok().and_then(|s| s.parse().ok()).unwrap_or(48);
     let sdir = std::path::PathBuf::from(std::env::var("SD_EXACT_DIR").unwrap_or_else(|_| std::env::temp_dir().join("sd_mtp_exact").display().to_string()));
     std::fs::create_dir_all(&sdir).unwrap();
+    let max_ctx: usize = std::env::var("SD_EXACT_MAX_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+    let pfile = std::env::var("SD_EXACT_PROMPT_FILE").ok();
+    let prompts: Vec<(String, Vec<u32>)> = match &pfile {
+        Some(p) => {
+            let ids: Vec<u32> = std::fs::read_to_string(p).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+            assert!(ids.len() > SNAP_TAIL, "{}: too few tokens", p);
+            let name = std::path::Path::new(p).file_stem().unwrap().to_string_lossy().into_owned();
+            vec![(name, ids)]
+        }
+        None => PROMPTS.iter().map(|(n, ids)| (n.to_string(), ids.to_vec())).collect(),
+    };
     let vk = format!("{}/draft_vocab.keep", d);
     let opt = QwenOptions {
-        max_ctx: 2048, mtp: true, spec_depth: 7, spec_auto: true, activity: true, activity_batch: true, read_mask: true,
+        max_ctx, mtp: true, spec_depth: 7, spec_auto: true, activity: true, activity_batch: true, read_mask: true,
         draft_vocab: std::path::Path::new(&vk).exists().then(|| vk.clone().into()),
         draft_table: Some(sdir.join("draft_table")),
         ..Default::default()
@@ -81,17 +100,40 @@ fn mtp_exact_27b_per_position() {
     let modes = [SpecMode::Fixed(2), SpecMode::Fixed(4), SpecMode::Fixed(7), SpecMode::Auto { max: 7 }];
     let mut table: Vec<String> = vec![];
     let mut bad = 0usize;
-    for (name, ids) in PROMPTS {
+    let (tp_min, vec_max) = (streamdense_model::qwen_layers::sdpa_two_pass_min(), streamdense_model::qwen_layers::sdpa_vec_max_n());
+    eprintln!("max_ctx {}; attention paths: single pass N < {}, two-pass {}..={}, split-K N > {}", max_ctx, tp_min, tp_min, vec_max, vec_max);
+    for (name, ids) in &prompts {
         let ids: Vec<u32> = ids.iter().map(|&x| x % e.cfg.vocab as u32).collect();
         let ids = &ids[..];
         let pl = ids.len();
+        // prompt-file mode: prefill the prefix once, snapshot; each run restores it and feeds only the tail
+        let snap = pfile.as_ref().map(|_| {
+            let sp = sdir.join(format!("prefix_{}.sdsnap", name));
+            let pre = &ids[..pl - SNAP_TAIL];
+            e.reset();
+            let t = Instant::now();
+            e.feed_stream_mtp(pre, 1, &[], &mut |_| true).unwrap();
+            assert_eq!(e.pos(), pre.len());
+            e.save_snapshot(&sp, pre).unwrap();
+            eprintln!("{}: prompt {} tokens; prefix {} prefilled + snapshot in {:.1} s ({:.2} GB file)", name, pl, pre.len(),
+                      t.elapsed().as_secs_f64(), std::fs::metadata(&sp).unwrap().len() as f64 / 1e9);
+            sp
+        });
+        // fresh state for a run → the ids to feed
+        let start = || -> &[u32] {
+            e.reset();
+            match &snap {
+                Some(sp) => { assert_eq!(e.restore_snapshot(sp).unwrap().len(), pl - SNAP_TAIL); &ids[pl - SNAP_TAIL..] }
+                None => ids,
+            }
+        };
         // ---- (a) plain greedy
         let path = sdir.join(format!("plain_{}.f32", name));
         let mut f = std::fs::File::create(&path).unwrap();
         let mut plain: Vec<Rec> = vec![];
-        e.reset();
+        let feed = start();
         let tp = Instant::now();
-        e.feed_stream(ids, n, &[], &mut |t| {
+        e.feed_stream(feed, n, &[], &mut |t| {
             let (l, h) = rows(&e, 0);
             let (am, mg) = top2(l);
             let lb = unsafe { std::slice::from_raw_parts(l.as_ptr() as *const u8, v * 4) };
@@ -115,9 +157,9 @@ fn mtp_exact_27b_per_position() {
             let ov = if std::env::var("SD_EXACT_ORACLE").is_ok() {
                 DraftOverride::Oracle { seq: ids.iter().copied().chain(plain.iter().map(|r| r.tok)).collect(), p: 0.8, seed: 7 }
             } else { DraftOverride::None };
-            e.reset();
+            let feed = start();
             let ts = Instant::now();
-            let (st, r) = e.feed_stream_spec_mode(ids, n, &[], &mut |t| {
+            let (st, r) = e.feed_stream_spec_mode(feed, n, &[], &mut |t| {
                 let k = cnt;
                 cnt += 1;
                 if k == 0 { got.push((t, true, true, usize::MAX, 0.0)); return true; }
@@ -145,23 +187,31 @@ fn mtp_exact_27b_per_position() {
             let lsame = (1..cmp).filter(|&i| got[i].1).count();
             let hsame = (1..cmp).filter(|&i| got[i].2).count();
             let rowhist = { let mut h = [0usize; 8]; for g in &got[1..] { if g.3 < 8 { h[g.3] += 1; } } h };
+            // decode position k was produced by the pass row feeding position pl + k - 1: kv length N = pl + k
+            let paths = (1..cmp).fold([0usize; 3], |mut a, k| {
+                let nk = pl + k;
+                a[if nk < tp_min { 0 } else if nk <= vec_max { 1 } else { 2 }] += 1;
+                a
+            });
             let first = (0..cmp).find(|&i| got[i].0 != plain[i].tok || !got[i].1 || !got[i].2);
             let fm = match first {
-                Some(i) => format!("pos {} (row {}): tok {} vs {}, logits {}, hf {}, max|diff| {:e}, plain margin {:.4}", i, got[i].3,
+                Some(i) => format!("pos {} (N {}, row {}): tok {} vs {}, logits {}, hf {}, max|diff| {:e}, plain margin {:.4}", i, pl + i, got[i].3,
                                    got[i].0, plain[i].tok, got[i].1, got[i].2, got[i].4, plain[i].margin),
                 None => "none".into(),
             };
             if first.is_some() || got.len() != plain.len() { bad += 1; }
-            let line = format!("| {} | {} | {} | {}/{} | {}/{} | {}/{} | {:.3} ({} / {} drafts, {} passes) | rows {:?} | {} | {:.1} s ({}) |",
-                               name, m.name(), cmp - 1, lsame, cmp - 1, hsame, cmp - 1, tok_same, cmp, r.accepted as f64 / (r.drafts_mtp + r.drafts_table + r.drafts_pad).max(1) as f64, r.accepted,
+            let minm = plain.iter().take(cmp).skip(1).map(|r| r.margin).fold(f32::INFINITY, f32::min);
+            let line = format!("| {} | {} | {} | {} / {} / {} | {:.4} | {}/{} | {}/{} | {}/{} | {:.3} ({} / {} drafts, {} passes) | rows {:?} | {} | {:.1} s ({}) |",
+                               name, m.name(), cmp - 1, paths[0], paths[1], paths[2], minm, lsame, cmp - 1, hsame, cmp - 1, tok_same, cmp, r.accepted as f64 / (r.drafts_mtp + r.drafts_table + r.drafts_pad).max(1) as f64, r.accepted,
                                r.drafts_mtp + r.drafts_table + r.drafts_pad, r.passes, rowhist, fm, wall, st.stop_reason);
             eprintln!("{}", line);
             table.push(line);
         }
         let _ = std::fs::remove_file(&path);
+        if let Some(sp) = &snap { let _ = std::fs::remove_file(sp); }
     }
-    println!("\n| prompt | depth | positions | logits bit-identical | hf bit-identical | tokens identical | acceptance | verify rows used (row 0..7) | first mismatch | time |");
-    println!("|---|---|---|---|---|---|---|---|---|---|");
+    println!("\n| prompt | depth | positions | N paths (single / two-pass / split-K) | min plain margin | logits bit-identical | hf bit-identical | tokens identical | acceptance | verify rows used (row 0..7) | first mismatch | time |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for l in &table { println!("{}", l); }
     println!("peak footprint {:.2} GB", e.peak() as f64 / 1e9);
     assert_eq!(bad, 0, "{} prompt x depth runs not bit-identical to plain greedy", bad);

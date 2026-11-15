@@ -33,6 +33,17 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   47 positions per run, 4 depths, 4 setups. Acceptance is for the default setup (forcing the two-pass kernels changes
   attention rounding for plain and MTP decode alike, so the prose reply and its acceptance differ there). Peak RAM
   15.4 GB, about 1 minute per run including the model load.
+
+  Long contexts, where decode crosses the 1,024-key switch to two-pass attention and the 8,192-key switch to the
+  split-K path (prompts built from this repo's source; 47 decode positions x 4 depths per run and setup):
+
+  | Prompt tokens | Setups | Keys at decode: <1,024 / 1,024–8,192 / >8,192 | Logits bit-identical | Smallest top-2 gap |
+  |---|---|---|---|---|
+  | ~1,000 | default, batched verify attention | 23 / 24 / 0 | 376 / 376 | 0.034 |
+  | ~4,000 | default | 0 / 47 / 0 | 188 / 188 | 0.0099 |
+  | ~8,170 | default, batched verify attention, fused verify | 0 / 22 / 25 | 564 / 564 | 0.34 |
+
+  In total 4,136 verified positions, short and long contexts, zero mismatches. Peak RAM 15.9 GB at 8K context.
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code
   session start in 0.4–1.5 s, and a new session that restores a snapshot of the shared system prompt starts in 0.66 s.
 - Decode is memory-bandwidth bound: a full-model pass reads about 15 GB of weights, two thirds of it FFN.
