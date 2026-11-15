@@ -531,29 +531,35 @@ const AT_NH: usize = 24;
 const AT_NKV: usize = 4;
 const AT_HD: usize = 256;
 
-struct AttnRig { g: Gpu, a: Arena, b: crate::qwen_layers::VaBufs, sc: usize, ao2: usize, max_ctx: usize }
+struct AttnRig { g: Gpu, a: Arena, b: crate::qwen_layers::VaBufs, sc: usize, ao2: usize, max_ctx: usize, po: usize, pml: usize, bytes: usize }
 
 fn attn_rig(max_ctx: usize, seed: u64) -> Result<AttnRig, String> {
     use crate::qwen_layers::{va_scratch_bytes, vm_pipelines, VaBufs};
     let mut g = Gpu::from_shader_files(&["common_bf16", "deltanet", "attn_gated", "verify_mixers"])?;
     g.pipeline("attn_sdpa_vec_b16")?;
     for p in vm_pipelines() { g.pipeline(&p)?; }
+    for t in 1..=8 { g.pipeline(crate::qwen_layers::partial_name(t, false))?; }
+    g.pipeline("attn_reduce_gate")?;
     let kvb = AT_NKV * max_ctx * AT_HD * 2;
     let prow = AT_NH * 2 * AT_HD + 2 * AT_NKV * AT_HD;
     let cfg_sc = 8 * AT_NH * crate::qwen_layers::VA_BMAX * (AT_HD * 2 + 8);
     let _ = va_scratch_bytes;
-    let len = 2 * kvb + 8 * prow * 2 + 3 * 8 * AT_NH * AT_HD * 2 + cfg_sc + (4 << 20);
+    // split-K partials for 8 rows over every chunk of max_ctx: po f32 [8][nh][nch][hd], pml f32x2 [8][nh][nch]
+    let nch = max_ctx.div_ceil(crate::qwen_engine::ATTN_CHUNK);
+    let (pob, pmlb) = (8 * AT_NH * nch * AT_HD * 4, 8 * AT_NH * nch * 8);
+    let len = 2 * kvb + 8 * prow * 2 + 3 * 8 * AT_NH * AT_HD * 2 + cfg_sc + pob + pmlb + (4 << 20);
     let mut a = Arena::new(&g, len)?;
     let (k, v) = (a.alloc(kvb)?, a.alloc(kvb)?);
     let (qr, p, ao, ao2) = (a.alloc(8 * AT_NH * AT_HD * 2)?, a.alloc(8 * prow * 2)?, a.alloc(8 * AT_NH * AT_HD * 2)?, a.alloc(8 * AT_NH * AT_HD * 2)?);
     let ctrl = a.alloc(std::mem::size_of::<streamdense_metal::SdCtrl>())?;
     let sc = a.alloc(cfg_sc)?;
+    let (po, pml) = (a.alloc(pob)?, a.alloc(pmlb)?);
     let mut rng = Rng(seed);
     // keys / queries ~N(0, 1) with a few large values: peaked softmaxes and wide exponents in the partial sums
     for o in [k, v] { for x in a.sl::<u16>(o, kvb / 2) { *x = to_bf(if rng.f() < 0.02 { 6.0 * rng.n() } else { rng.n() }); } }
     for x in a.sl::<u16>(qr, 8 * AT_NH * AT_HD) { *x = to_bf(2.0 * rng.n()); }
     for x in a.sl::<u16>(p, 8 * prow) { *x = to_bf(3.0 * rng.n()); }
-    Ok(AttnRig { g, a, b: VaBufs { qr, k, v, p, ao, ctrl }, sc, ao2, max_ctx })
+    Ok(AttnRig { g, a, b: VaBufs { qr, k, v, p, ao, ctrl }, sc, ao2, max_ctx, po, pml, bytes: len })
 }
 
 impl AttnRig {
@@ -594,12 +600,61 @@ impl AttnRig {
     }
 }
 
+impl AttnRig {
+    /// `t` rows of the engine's attention (`attn_sdpa_rows`: split-K for rows with N > lim, then the verify mirror
+    /// for rows with N <= lim) at ctrl.pos = `pos`, reading qr / p rows `row0..row0 + t`, writing ao rows from `ao`.
+    fn pass(&self, e: &Enc, pos: usize, t: usize, row0: usize, ao: usize, nch: usize) {
+        let prow = AT_NH * 2 * AT_HD + 2 * AT_NKV * AT_HD;
+        let rb = AT_NH * AT_HD * 2;
+        let b = crate::qwen_layers::VaBufs { qr: self.b.qr + row0 * rb, p: self.b.p + row0 * prow * 2, ao, ..self.b };
+        let kv = crate::qwen_layers::KvRef { k: self.b.k, v: self.b.v, ksb: self.b.k, vsb: self.b.v, q8: false, max_ctx: self.max_ctx };
+        crate::qwen_layers::attn_sdpa_rows(e, &kv, &b, self.po, self.pml, pos, t, nch, AT_NH, AT_NKV, AT_HD, prow, Some(self.sc));
+    }
+    /// K-invariance of the whole attention path at long contexts: a t-row pass at `pos` (chunks just covering
+    /// pos + t, and again with every chunk of max_ctx dispatched) == t one-row passes at pos + i (each with its own
+    /// minimal chunk count), bit for bit over all t rows. Returns (failures, max |diff| over mismatching outputs).
+    fn check_rows(&self, pos: usize, t: usize) -> Result<(Vec<String>, f32), String> {
+        use crate::qwen_engine::ATTN_CHUNK;
+        let rb = AT_NH * AT_HD * 2;
+        let n = t * AT_NH * AT_HD;
+        // reference: one row per command buffer (ctrl.pos changes between rows); sentinel differs from the pass
+        // buffer's so a row left unwritten on either side shows up as a mismatch
+        self.a.sl::<u8>(self.ao2, 2 * n).fill(0x5a);
+        for i in 0..t {
+            self.set_pos(pos + i);
+            run(&self.g, &self.a, &|e| self.pass(e, pos + i, 1, i, self.ao2 + i * rb, (pos + i + 1).div_ceil(ATTN_CHUNK)))?;
+        }
+        let mut bad = vec![];
+        let mut worst = 0f32;
+        self.set_pos(pos);
+        for nch in [(pos + t).div_ceil(ATTN_CHUNK), self.max_ctx.div_ceil(ATTN_CHUNK)] {
+            self.a.sl::<u8>(self.b.ao, 2 * n).fill(0xa5);
+            run(&self.g, &self.a, &|e| self.pass(e, pos, t, 0, self.b.ao, nch))?;
+            let (x, y) = (self.a.sl::<u16>(self.b.ao, n), self.a.sl::<u16>(self.ao2, n));
+            let mut rows = vec![];
+            for (i, (u, v)) in x.iter().zip(y.iter()).enumerate() {
+                if u != v {
+                    worst = worst.max((bf(*u) - bf(*v)).abs());
+                    let r = i / (AT_NH * AT_HD);
+                    if !rows.contains(&r) { rows.push(r); }
+                }
+            }
+            let d = x.iter().zip(y.iter()).filter(|(u, v)| u != v).count();
+            if d > 0 { bad.push(format!("attn rows pos {} T {} nch {}: {} / {} outputs differ (rows {:?})", pos, t, nch, d, n, rows)); }
+        }
+        Ok((bad, worst))
+    }
+}
+
 /// Bit identity + GPU µs of the verify attention vs attn_sdpa_vec_b16 (one layer: 24 q heads, 4 kv heads, hd 256).
 fn attn_cli(poss: &[usize], ks: &[usize], reps: usize) -> Result<(), String> {
     let max_ctx = poss.iter().max().copied().unwrap_or(1024) + 16;
     let rig = attn_rig(max_ctx, 11)?;
     let mut bad = vec![];
-    for &pos in poss { for &t in ks.iter().filter(|&&t| (1..=8).contains(&t)) { bad.extend(rig.check(pos, t)?); } }
+    println!("verify attention rig: arena {:.1} MB, max_ctx {}", rig.bytes as f64 / 1e6, max_ctx);
+    for &pos in poss {
+        for &t in ks.iter().filter(|&&t| (1..=8).contains(&t)) { bad.extend(rig.check(pos, t)?); bad.extend(rig.check_rows(pos, t)?.0); }
+    }
     println!("verify attention bit identity (pos {:?}, K {:?}, R {:?}): {}", poss, ks, crate::qwen_layers::VA_RS,
              if bad.is_empty() { "ALL OK".into() } else { format!("FAIL\n  {}", bad.join("\n  ")) });
     println!("| pos | K | attn_sdpa_vec_b16 µs | {} |", crate::qwen_layers::VA_RS.iter().map(|r| format!("va R{} µs", r)).collect::<Vec<_>>().join(" | "));
@@ -721,5 +776,31 @@ mod tests {
             for t in 1..=8 { if pos + t <= 8200 { bad.extend(rig.check(pos, t).unwrap()); } }
         }
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// Long contexts up to 32768 keys: the full attention path (split-K above lim = 8192, verify mirror below, both
+    /// in a straddling pass) of a K-row pass == K one-row passes, bit for bit, K = 1..8. Positions straddle lim, cross
+    /// the 256-key chunk edges (N = 256 c, 256 c + 1), sit mid range and reach N = 32768.
+    #[test]
+    fn verify_attn_long_bit_identical() {
+        const MAX: usize = 32768;
+        let rig = attn_rig(MAX, 7).expect("rig");
+        println!("verify_attn_long: rig arena {:.1} MB (KV {:.1} MB)", rig.bytes as f64 / 1e6, (2 * AT_NKV * MAX * AT_HD * 2) as f64 / 1e6);
+        let mut bad = vec![];
+        let mut worst = 0f32;
+        let mut checked = 0;
+        for pos in [37usize, 1023, 8183, 8185, 8188, 8191, 8192, 8193, 8200, 8447, 8448, 8449, 8703, 8704, 12287, 12288, 12345,
+                    16383, 16384, 16385, 20000, 24575, 24576, 24577, 32511, 32512, 32760, 32764, 32767] {
+            for t in 1..=8 {
+                if pos + t <= MAX {
+                    let (b, w) = rig.check_rows(pos, t).unwrap();
+                    bad.extend(b);
+                    worst = worst.max(w);
+                    checked += 1;
+                }
+            }
+        }
+        println!("verify_attn_long: {} (pos, T) passes checked, {} failures, max |diff| {}", checked, bad.len(), worst);
+        assert!(bad.is_empty(), "max |diff| {}\n{}", worst, bad.join("\n"));
     }
 }

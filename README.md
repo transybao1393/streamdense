@@ -42,8 +42,22 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   | ~1,000 | default, batched verify attention | 23 / 24 / 0 | 376 / 376 | 0.034 |
   | ~4,000 | default | 0 / 47 / 0 | 188 / 188 | 0.0099 |
   | ~8,170 | default, batched verify attention, fused verify | 0 / 22 / 25 | 564 / 564 | 0.34 |
+  | ~12,200 | default | 0 / 0 / 47 | 188 / 188 | 0.13 |
+  | ~32,560 | default | 0 / 0 / 47 | 188 / 188 | 0.16 |
 
-  In total 4,136 verified positions, short and long contexts, zero mismatches. Peak RAM 15.9 GB at 8K context.
+  In total 4,512 verified positions, short and long contexts, zero mismatches. The attention kernels are also checked
+  on their own (no model, 0.26 GB): verify passes of 1–8 rows are bit-identical to one-row passes at 221 positions up
+  to 32,768 keys, including the split-K chunk edges (`verify_attn_long_bit_identical` in `verify_bench.rs`).
+
+  Decode speed by context (128 tokens, timed without the checks; 2026-11-16, machine shared with other work):
+
+  | Context | Plain | MTP auto | MTP acceptance | Peak RAM | Prompt reading |
+  |---|---|---|---|---|---|
+  | ~12,200 | 11.97 tok/s | 13.13 tok/s | 0.34 | 16.14 GB | ~79 tok/s |
+  | ~32,560 | 10.33 tok/s | 9.94 tok/s | 0.37 | 17.55 GB | ~72 tok/s |
+
+  At 32K, MTP is no faster than plain decode on this task: each verify row reads the whole context in attention,
+  and too few drafts are accepted to pay for that. 32K needs a RAM cap of about 18 GB (KV 2.15 GB + MTP KV 0.13 GB).
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code
   session start in 0.4–1.5 s, and a new session that restores a snapshot of the shared system prompt starts in 0.66 s.
 - Decode is memory-bandwidth bound: a full-model pass reads about 15 GB of weights, two thirds of it FFN.

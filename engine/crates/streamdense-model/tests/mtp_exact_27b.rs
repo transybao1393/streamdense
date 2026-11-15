@@ -10,9 +10,10 @@
 //! the scratch dir, activity + read mask hooks on, verify_fused / verify_mixers / decode_fused off). SD_VERIFY_FUSED=1
 //! / SD_VERIFY_MIXERS=1 force those options at open (QwenEngine::open) for a second run.
 //! Run (under sd-watchdog): mtp_exact_27b-<hash> --ignored --nocapture --test-threads 1
+//! SD_EXACT_BENCH=1: speed run instead (plain greedy + MTP auto, token ids only, decode tok/s, acceptance, tokens equal).
 //! Env: SD_EXACT_MODEL (model dir), SD_EXACT_ORACLE=1 (oracle drafts, harness check), SD_EXACT_N (tokens per run, default 48), SD_EXACT_DIR (scratch dir for the plain logits rows + draft table).
 //! Long contexts: SD_EXACT_PROMPT_FILE = a file of u32 token ids (whitespace separated, chat-templated) used instead
-//! of the built-in prompts, SD_EXACT_MAX_CTX = max_ctx (default 2048). With a prompt file the prompt minus its last
+//! of the built-in prompts, SD_EXACT_MAX_CTX = max_ctx (default 2048), SD_EXACT_CAP_GB = engine RAM budget cap (default 17). With a prompt file the prompt minus its last
 //! `SNAP_TAIL` tokens is prefilled ONCE (MTP engine: main + MTP KV) and saved as a snapshot in SD_EXACT_DIR; every run
 //! (plain and each depth) restores it and feeds the tail, so an 8K prompt is not re-prefilled per depth. Each table
 //! line counts the compared decode positions by attention path of their kv length N (N < SDPA_TWO_PASS_MIN single
@@ -74,7 +75,11 @@ fn mtp_exact_27b_per_position() {
     let sdir = std::path::PathBuf::from(std::env::var("SD_EXACT_DIR").unwrap_or_else(|_| std::env::temp_dir().join("sd_mtp_exact").display().to_string()));
     std::fs::create_dir_all(&sdir).unwrap();
     let max_ctx: usize = std::env::var("SD_EXACT_MAX_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
+    // engine budget cap in GB (default: QwenOptions default, 17 GB); keep it at or under the sd-watchdog cap
+    let cap_gb: Option<f64> = std::env::var("SD_EXACT_CAP_GB").ok().and_then(|s| s.parse().ok());
     let pfile = std::env::var("SD_EXACT_PROMPT_FILE").ok();
+    // SD_EXACT_BENCH=1: speed run (plain + MTP auto only, no logits rows written / read / compared)
+    let bench = std::env::var("SD_EXACT_BENCH").is_ok_and(|s| s == "1");
     let prompts: Vec<(String, Vec<u32>)> = match &pfile {
         Some(p) => {
             let ids: Vec<u32> = std::fs::read_to_string(p).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
@@ -86,6 +91,7 @@ fn mtp_exact_27b_per_position() {
     };
     let vk = format!("{}/draft_vocab.keep", d);
     let opt = QwenOptions {
+        cap: cap_gb.map_or(QwenOptions::default().cap, |g| (g * 1e9) as u64),
         max_ctx, mtp: true, spec_depth: 7, spec_auto: true, activity: true, activity_batch: true, read_mask: true,
         draft_vocab: std::path::Path::new(&vk).exists().then(|| vk.clone().into()),
         draft_table: Some(sdir.join("draft_table")),
@@ -127,6 +133,48 @@ fn mtp_exact_27b_per_position() {
                 None => ids,
             }
         };
+        if bench {
+            // speed only: plain greedy then MTP auto; on_tok only collects token ids and a timestamp
+            let feed = start();
+            let mut tp: Vec<u32> = vec![];
+            let (mut t0, mut t1) = (None, None);
+            let tw = Instant::now();
+            e.feed_stream(feed, n, &[], &mut |t| {
+                let now = Instant::now();
+                if t0.is_none() { t0 = Some(now); }
+                t1 = Some(now);
+                tp.push(t);
+                true
+            }).unwrap();
+            let wall_p = tw.elapsed().as_secs_f64();
+            let dec_p = t1.unwrap().duration_since(t0.unwrap()).as_secs_f64();
+            let feed = start();
+            let mut tm: Vec<u32> = vec![];
+            let (mut s0, mut s1) = (None, None);
+            let tw = Instant::now();
+            let (st, r) = e.feed_stream_spec_mode(feed, n, &[], &mut |t| {
+                let now = Instant::now();
+                if s0.is_none() { s0 = Some(now); }
+                s1 = Some(now);
+                tm.push(t);
+                true
+            }, SpecMode::Auto { max: 7 }, &DraftOverride::None).unwrap();
+            let wall_m = tw.elapsed().as_secs_f64();
+            e.flush_draft_source();
+            let dec_m = s1.unwrap().duration_since(s0.unwrap()).as_secs_f64();
+            let drafts = r.drafts_mtp + r.drafts_table + r.drafts_pad;
+            let line_p = format!("| {} | plain | {} | {:.2} s | {:.2} tok/s | {:.2} s | {:.2} tok/s | - | - |", name, tp.len(), dec_p,
+                                 (tp.len() - 1) as f64 / dec_p, wall_p, tp.len() as f64 / wall_p);
+            let line_m = format!("| {} | mtp auto | {} | {:.2} s | {:.2} tok/s | {:.2} s | {:.2} tok/s | {:.3} ({} / {}) | {} ({}) |", name, tm.len(), dec_m,
+                                 (tm.len() - 1) as f64 / dec_m, wall_m, tm.len() as f64 / wall_m,
+                                 r.accepted as f64 / drafts.max(1) as f64, r.accepted, drafts, r.passes, st.stop_reason);
+            eprintln!("{}\n{}\ntokens equal plain vs mtp: {} ({} vs {} tokens)", line_p, line_m, tp == tm, tp.len(), tm.len());
+            table.push(line_p);
+            table.push(line_m);
+            if tp != tm { bad += 1; }
+            if let Some(sp) = &snap { let _ = std::fs::remove_file(sp); }
+            continue;
+        }
         // ---- (a) plain greedy
         let path = sdir.join(format!("plain_{}.f32", name));
         let mut f = std::fs::File::create(&path).unwrap();
@@ -209,6 +257,14 @@ fn mtp_exact_27b_per_position() {
         }
         let _ = std::fs::remove_file(&path);
         if let Some(sp) = &snap { let _ = std::fs::remove_file(sp); }
+    }
+    if bench {
+        println!("\n| prompt | mode | tokens | decode s (first to last token) | decode tok/s (tokens - 1) | wall s incl. {} tail | wall tok/s | acceptance (accepted / drafts) | passes (stop) |", SNAP_TAIL);
+        println!("|---|---|---|---|---|---|---|---|---|");
+        for l in &table { println!("{}", l); }
+        println!("peak footprint {:.2} GB", e.peak() as f64 / 1e9);
+        assert_eq!(bad, 0, "{} prompts: MTP tokens differ from plain greedy", bad);
+        return;
     }
     println!("\n| prompt | depth | positions | N paths (single / two-pass / split-K) | min plain margin | logits bit-identical | hf bit-identical | tokens identical | acceptance | verify rows used (row 0..7) | first mismatch | time |");
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|");

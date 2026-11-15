@@ -281,7 +281,7 @@ fn gemv_name(k: usize, mode: u32) -> &'static str {
     n
 }
 fn swiglu_name(k: usize) -> &'static str { gemv_d(k); gemv_tab().swiglu[k] }
-fn partial_name(k: usize, q8: bool) -> &'static str {
+pub(crate) fn partial_name(k: usize, q8: bool) -> &'static str {
     match (k, q8) {
         (1, false) => "attn_partial_k1_b16", (2, false) => "attn_partial_k2_b16",
         (3, false) => "attn_partial_k3_b16", (4, false) => "attn_partial_k4_b16",
@@ -897,6 +897,35 @@ fn encode_attn(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io: &PassIo, d
     Ok(())
 }
 
+/// sdpa + gate of a `k`-row pass at host position `pos` (= ctrl.pos) -> b.ao, as `encode_attn_mix` runs it after
+/// attn_prep. Row t sees N = pos + t + 1 keys. bf16 KV: rows with N <= lim take the MLX single-pass mirror
+/// (bit-exact), longer rows the split-K path (`nch` 256-key chunks, partials in po / pml); a pass that straddles lim
+/// runs split-K first and the mirror overwrites its rows. Each row's arithmetic depends only on its own N, so
+/// K-invariance holds. `vm` = verify-mixer scratch (see `PassIo::vm`); b.k / b.v must equal kv.k / kv.v.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attn_sdpa_rows(e: &Enc, kv: &KvRef, b: &VaBufs, po: usize, pml: usize, pos: usize, k: usize, nch: usize,
+                             nh: usize, nkv: usize, hdim: usize, prow: usize, vm: Option<usize>) {
+    let lim = if kv.q8 { 0 } else { sdpa_vec_max_n().min(8192) }; // 8192: the kernel's blocks <= 128 bound
+    let (n_lo, n_hi) = (pos + 1, pos + k);
+    if n_hi > lim {
+        e.pso(partial_name(k, kv.q8))
+            .b(0, b.qr).b(1, kv.k).b(2, kv.v).b(3, kv.ksb).b(4, kv.vsb).b(5, po).b(6, pml).b(7, b.ctrl)
+            .u(8, kv.max_ctx as u32).u(9, (nh / nkv) as u32)
+            .groups((nch, nh), 128);
+        e.pso("attn_reduce_gate").b(0, po).b(1, pml).b(2, b.p).b(3, b.ao).u(4, nch as u32).u(5, prow as u32)
+            .groups((nh, k), hdim / 4);
+    }
+    if let (true, Some(sc)) = (n_lo <= lim && !kv.q8 && k <= 8, vm.filter(|&o| o != VM_NO_ATTN)) {
+        va_sdpa_enc(e, b, sc, va_r(k), k, nh, nkv, hdim, kv.max_ctx, prow, lim, sdpa_two_pass_min());
+    } else if n_lo <= lim {
+        e.pso("attn_sdpa_vec_b16")
+            .b(0, b.qr).b(1, kv.k).b(2, kv.v).b(3, b.p).b(4, b.ao).b(5, b.ctrl)
+            .u(6, kv.max_ctx as u32).u(7, (nh / nkv) as u32).u(8, prow as u32).u(9, lim as u32)
+            .u(10, sdpa_two_pass_min() as u32)
+            .groups((nh, k), 1024);
+    }
+}
+
 /// The attention token mixer of `encode_attn` between its projections: q/k norm + RoPE, K / V rows at ctrl.pos + t
 /// into `kv`, sdpa per row -> io.ao (gated). Reads io.p rows 0..k (the in_proj output); io.pos = host ctrl.pos.
 fn encode_attn_mix(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io: &PassIo, dump: Option<&Dumper>, l: usize)
@@ -914,29 +943,8 @@ fn encode_attn_mix(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io: &PassI
         .groups((nh + nkv, k), hdim);
     // qr lives in the cv scratch (bf16 [k][nh][hd]; DeltaNet and attention never share a layer)
     cap(dump, e, format!("L{}.attn.q", l), io.cv, DType::BF16, &[k, nh, hdim])?;
-    // Row t sees N = pos + t + 1 keys. bf16 KV: rows with N <= lim take the MLX single-pass mirror (bit-exact),
-    // longer rows the split-K path; a pass that straddles lim runs split-K first and the mirror overwrites its rows.
-    // Each row's arithmetic depends only on its own N, so K-invariance holds.
-    let lim = if kv.q8 { 0 } else { sdpa_vec_max_n().min(8192) }; // 8192: the kernel's blocks <= 128 bound
-    let (n_lo, n_hi) = (io.pos + 1, io.pos + k);
-    if n_hi > lim {
-        e.pso(partial_name(k, kv.q8))
-            .b(0, io.cv).b(1, kv.k).b(2, kv.v).b(3, kv.ksb).b(4, kv.vsb).b(5, io.po).b(6, io.pml).b(7, io.ctrl)
-            .u(8, kv.max_ctx as u32).u(9, (nh / nkv) as u32)
-            .groups((nch, nh), 128);
-        e.pso("attn_reduce_gate").b(0, io.po).b(1, io.pml).b(2, io.p).b(3, io.ao).u(4, nch as u32).u(5, prow as u32)
-            .groups((nh, k), hdim / 4);
-    }
-    if let (true, Some(sc)) = (n_lo <= lim && !kv.q8 && k <= 8, io.vm.filter(|&o| o != VM_NO_ATTN)) {
-        let b = VaBufs { qr: io.cv, k: kv.k, v: kv.v, p: io.p, ao: io.ao, ctrl: io.ctrl };
-        va_sdpa_enc(e, &b, sc, va_r(k), k, nh, nkv, hdim, kv.max_ctx, prow, lim, sdpa_two_pass_min());
-    } else if n_lo <= lim {
-        e.pso("attn_sdpa_vec_b16")
-            .b(0, io.cv).b(1, kv.k).b(2, kv.v).b(3, io.p).b(4, io.ao).b(5, io.ctrl)
-            .u(6, kv.max_ctx as u32).u(7, (nh / nkv) as u32).u(8, prow as u32).u(9, lim as u32)
-            .u(10, sdpa_two_pass_min() as u32)
-            .groups((nh, k), 1024);
-    }
+    attn_sdpa_rows(e, kv, &VaBufs { qr: io.cv, k: kv.k, v: kv.v, p: io.p, ao: io.ao, ctrl: io.ctrl }, io.po, io.pml, io.pos, k, nch,
+                   nh, nkv, hdim, prow, io.vm);
     cap(dump, e, format!("L{}.attn.o", l), io.ao, DType::BF16, &[k, cfg.q_dim()])?;
     Ok(())
 }
