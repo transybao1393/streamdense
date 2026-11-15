@@ -69,3 +69,6 @@ tiers.json
 # sd-fetch partial downloads and resume sidecars
 *.sdfetch
 *.tmp
+
+# Social media posts (kept local)
+/facebook_post/
