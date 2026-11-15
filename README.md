@@ -12,22 +12,19 @@ over the Anthropic Messages API so coding agents (for example Claude Code) and t
 
 Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model process, under `sd-watchdog`.
 
-| Mode | Peak RAM | Decode |
-|---|---|---|
-| Full model (all weights in RAM, hard cap 16 GB) | 14.9 GB plain · 15.4–16.0 GB with MTP | 14.3 tok/s plain · 17.1–25.2 tok/s with MTP (everyday prose to code) · 27.2 tok/s with MTP auto depth + fused verify |
-| 12 GB mode (part of each FFN layer in RAM, chosen per prompt; off by default) | 11.76 GB | 19.7 tok/s plain |
+| Peak RAM | Decode |
+|---|---|
+| 14.9 GB plain · 15.4–16.0 GB with MTP (hard cap 16 GB) | 14.3 tok/s plain · 17.1–25.2 tok/s with MTP (everyday prose to code) · 27.2 tok/s with MTP auto depth + fused verify |
 
 - MTP and fused verify are lossless: every policy produces the same tokens as plain greedy decoding.
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code
   session start in 0.4–1.5 s, and a new session that restores a snapshot of the shared system prompt starts in 0.66 s.
-- 12 GB mode quality on checkable prompts (code run against tests, arithmetic / logic, facts): 96 / 101 vs 100 / 101
-  for the full model; the extra misses are code.
 - Decode is memory-bandwidth bound: a full-model pass reads about 15 GB of weights, two thirds of it FFN.
 
 ## Requirements
 
-- A Mac with Apple Silicon (Metal GPU) and enough unified memory for the chosen mode (16 GB cap for the full model,
-  about 12 GB for the 12 GB mode, plus room for the OS).
+- A Mac with Apple Silicon (Metal GPU) and enough unified memory for the 16 GB cap plus room for the
+  OS.
 - Rust (stable; CI pins 1.97.1). Xcode / Swift for the app (macOS 14+).
 - About 15 GB of disk for the 4-bit model.
 
@@ -37,7 +34,7 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
 cd engine && cargo build --release
 ```
 
-Binaries in `engine/target/release/`: `streamdense` (subcommands include `gateway`, `up`, `config`, `qwen`, `forheader`),
+Binaries in `engine/target/release/`: `streamdense` (subcommands include `gateway`, `up`, `config`, `qwen`),
 `sd-watchdog` (RAM cap guard) and `sd-fetch` (parallel Hugging Face downloader).
 
 ## Get the model
@@ -73,11 +70,11 @@ eval "$(engine/target/release/streamdense gateway --print-env --port 8898)"
 claude --bare
 ```
 
-Options, snapshots, the 12 GB mode and the request log are described in [docs/GATEWAY.md](docs/GATEWAY.md).
+Options, snapshots and the request log are described in [docs/GATEWAY.md](docs/GATEWAY.md).
 
 ## Supported models
 
-The gateway above (MTP speculative decoding, 12 GB mode) is built for Qwen3.8-27B. Other dense models run through
+The gateway above (MTP speculative decoding) is built for Qwen3.8-27B. Other dense models run through
 `sd-model-layer`, plain greedy decoding, raw prompt (`--prompt`) or the model's chat template (`--chat`, every family below
 except the StarCoder2 base model). Head dims 64 / 96 / 128 / 160 / 256.
 Full guide, limits and example output: [engine/model_layer/README.md](engine/model_layer/README.md).
@@ -115,20 +112,11 @@ $B/sd-model-layer run models/<model_dir> --chat "Name three primary colors." --m
 
 `streamdense.toml` at the repo root holds the RAM cap and the run settings for every model run (gateway, `qwen serve`,
 the app): `[ram]` (`cap_gb = 16.0`, `swap_gb = 7`, `margin_gb = 0`, `nice = 10`), `[gateway]` (model, port 8898,
-max_ctx 8192, MTP, speculative depth, matmul family), `[watcher]`, `[forheader]` (12 GB mode, commented out = off),
-`[snapshots]` and `[history]`. The cap is enforced on the real footprint: `sd-watchdog` stops the process and the
+max_ctx 8192, MTP, speculative depth, matmul family), `[watcher]`, `[snapshots]` and `[history]`. The cap is enforced on the real footprint: `sd-watchdog` stops the process and the
 engine aborts itself above it.
 
 `streamdense config` prints the resolved values and where they came from; command-line flags override the file.
 Search order: `$SD_CONFIG`, `./streamdense.toml`, the repo root, `~/.config/streamdense/config.toml`.
-
-## 12 GB mode (Forheader)
-
-Forheader is a memory-limited mode that keeps the most useful part of each FFN layer in RAM for the current prompt and
-reads the prompt itself with the full FFN streamed from the SSD, so the 27B runs in about 12 GB. It is off by default;
-turn it on with `[forheader] mode = "12gb"` in `streamdense.toml` (or `streamdense gateway --forheader 12gb`) after
-installing its score file once with `streamdense forheader install FILE` (the score file is not part of this
-repository). Details: [docs/GATEWAY.md](docs/GATEWAY.md) ("12 GB mode").
 
 ## App
 
@@ -142,19 +130,6 @@ app/run.sh --autoload                   # same, and loads the 27B at startup
 ```
 
 Quitting the app stops the engine and frees its RAM.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `engine/` | Rust workspace: `crates/streamdense-{core,metal,model,tokenizer,gateway,cli,fetch}`, Metal shaders (`shaders/`), kernel test vectors and request fixtures (`testdata/`) |
-| `engine/dense-engine/` | Standalone Metal engine for dense models: Qwen2 / 2.5 / 3, Llama, Granite, Gemma (own Cargo workspace) |
-| `engine/model_layer/` | `sd-model-layer`: picks family + engine from `config.json`; `inspect` / `run` (own Cargo workspace) |
-| `engine/refs/` | Reference outputs (greedy tokens, teacher logits, dumps) read by the engine tests and checks |
-| `app/` | SwiftUI chat app for `qwen serve` (`Sources/StreamdenseChat`, `run.sh`) |
-| `docs/` | [ARCHITECTURE.md](docs/ARCHITECTURE.md), [GATEWAY.md](docs/GATEWAY.md), [SERVE_PROTOCOL.md](docs/SERVE_PROTOCOL.md) |
-| `streamdense.toml` | RAM cap and run settings |
-| `models/` | Model weights, not tracked |
 
 ## Tests
 
