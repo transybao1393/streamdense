@@ -16,7 +16,11 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
 |---|---|
 | 14.9 GB plain · 15.4–16.0 GB with MTP (hard cap 16 GB) | 14.3 tok/s plain · 17.1–25.2 tok/s with MTP (everyday prose to code) · 27.2 tok/s with MTP auto depth + fused verify |
 
-- MTP and fused verify are lossless: every policy produces the same tokens as plain greedy decoding.
+- MTP and fused verify are lossless: every policy produces the same tokens as plain greedy decoding. Checked per
+  position on the 27B (2026-11-15): at draft depths 2, 4, 7 and auto, on prose, code, arithmetic and repetitive prompts,
+  with fused verify off and on, all 1,504 verified positions had f32 logits bit-identical to plain one-token decode,
+  including positions where the top-2 logit gap was 0.04
+  ([`mtp_exact_27b.rs`](engine/crates/streamdense-model/tests/mtp_exact_27b.rs)).
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code
   session start in 0.4–1.5 s, and a new session that restores a snapshot of the shared system prompt starts in 0.66 s.
 - Decode is memory-bandwidth bound: a full-model pass reads about 15 GB of weights, two thirds of it FFN.

@@ -1,0 +1,168 @@
+//! Per-position exactness of MTP speculative decode on the REAL 27B (models/qwen38_27b_mlx4, MLX 4-bit + mtp/).
+//! For each prompt: plain greedy decode (K = 1 passes, `feed_stream`) records per generated position the token, the
+//! f32 logits row (to a scratch file), its f32 argmax / top1-top2 margin, and the bf16 final-hidden (hf) row bits.
+//! Then, from a fresh reset + re-prefill, MTP deep spec decode (`feed_stream_spec_mode`, the gateway's pipelined
+//! loop) at fixed depth 2, 4, 7 and auto: inside `on_tok` every emitted token's verify row (row = position - pass
+//! start; accepted drafts + the correction / bonus row) is read from the verify pass's logits / hf scratch and
+//! compared BIT FOR BIT with the plain row of the same position. Position 0 (the prefill's token) is compared by
+//! token only: its logits row is overwritten by the MTP first draft before `on_tok` sees it.
+//! One engine, gateway-default options (MTP, spec_depth auto = 7, gemv mma, fast prefill, draft vocab, draft table in
+//! the scratch dir, activity + read mask hooks on, verify_fused / verify_mixers / decode_fused off). SD_VERIFY_FUSED=1
+//! / SD_VERIFY_MIXERS=1 force those options at open (QwenEngine::open) for a second run.
+//! Run (under sd-watchdog): mtp_exact_27b-<hash> --ignored --nocapture --test-threads 1
+//! Env: SD_EXACT_MODEL (model dir), SD_EXACT_ORACLE=1 (oracle drafts, harness check), SD_EXACT_N (tokens per run, default 48), SD_EXACT_DIR (scratch dir for the plain logits rows + draft table).
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::Instant;
+
+use streamdense_model::spec::DraftOverride;
+use streamdense_model::spec_deep::SpecMode;
+use streamdense_model::{QwenEngine, QwenOptions};
+
+const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+
+// chat-templated prompts (user turn + "<think>\n\n</think>\n\n"), tokenized with the model's tokenizer.json
+const PROMPTS: [(&str, &[u32]); 4] = [
+    ("prose", &[248045, 846, 198, 7734, 264, 2716, 13901, 883, 264, 11012, 6353, 4088, 539, 264, 21128, 303, 40297, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]),
+    ("code", &[248045, 846, 198, 7734, 264, 12654, 709, 421, 4523, 279, 307, 7324, 76938, 1324, 5199, 7638, 11, 440, 264, 4479, 889, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]),
+    ("arith", &[248045, 846, 198, 44712, 220, 18, 23, 19, 22, 348, 220, 17, 21, 2923, 539, 2923, 11, 1179, 884, 220, 16, 17, 24, 20, 310, 279, 1067, 13, 6712, 1754, 2923, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]),
+    ("repeat", &[248045, 846, 198, 37436, 279, 2614, 1500, 6681, 4097, 2942, 11, 799, 791, 1500, 25, 561, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]),
+];
+
+fn fnv(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &x in b { h ^= x as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+fn top2(row: &[f32]) -> (u32, f32) {
+    let (mut i1, mut v1, mut v2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (i, &v) in row.iter().enumerate() {
+        if v > v1 { v2 = v1; v1 = v; i1 = i; } else if v > v2 { v2 = v; }
+    }
+    (i1 as u32, v1 - v2)
+}
+
+#[derive(Clone, Debug)]
+struct Rec { tok: u32, argmax: u32, margin: f32, hh: u64 }
+
+/// Logits row `r` and hf row `r` of the last pass (f32 [rows][vocab], bf16 [rows][hidden]).
+fn rows(e: &QwenEngine, r: usize) -> (&[f32], &[u8]) {
+    let io = e.io();
+    let v = e.w.lm_head.rows;
+    let hb = e.cfg.hidden * 2;
+    unsafe {
+        let l = std::slice::from_raw_parts(e.arena.base().add(io.logits + r * v * 4) as *const f32, v);
+        let h = std::slice::from_raw_parts(e.arena.base().add(io.hf + r * hb), hb);
+        (l, h)
+    }
+}
+
+#[test]
+#[ignore]
+fn mtp_exact_27b_per_position() {
+    // SD_EXACT_MODEL: another model dir (e.g. models/tiny_qwen35 to check the harness; prompt ids taken mod its vocab)
+    let d = std::env::var("SD_EXACT_MODEL").unwrap_or_else(|_| format!("{}/models/qwen38_27b_mlx4", ROOT));
+    if !std::path::Path::new(&format!("{}/mtp", d)).exists() { eprintln!("SKIP: needs {} (with mtp/)", d); return; }
+    let n: usize = std::env::var("SD_EXACT_N").ok().and_then(|s| s.parse().ok()).unwrap_or(48);
+    let sdir = std::path::PathBuf::from(std::env::var("SD_EXACT_DIR").unwrap_or_else(|_| std::env::temp_dir().join("sd_mtp_exact").display().to_string()));
+    std::fs::create_dir_all(&sdir).unwrap();
+    let vk = format!("{}/draft_vocab.keep", d);
+    let opt = QwenOptions {
+        max_ctx: 2048, mtp: true, spec_depth: 7, spec_auto: true, activity: true, activity_batch: true, read_mask: true,
+        draft_vocab: std::path::Path::new(&vk).exists().then(|| vk.clone().into()),
+        draft_table: Some(sdir.join("draft_table")),
+        ..Default::default()
+    };
+    let t_open = Instant::now();
+    let e = QwenEngine::open(&d, opt).unwrap();
+    eprintln!("open {:.1} s; verify_fused {} verify_mixers {} decode_fused {} gemv {} prefill_exact {} draft_vocab {}",
+              t_open.elapsed().as_secs_f64(), e.opt.verify_fused, e.opt.verify_mixers, e.opt.decode_fused, e.opt.gemv.name(),
+              e.opt.prefill_exact, e.opt.draft_vocab.is_some());
+    let v = e.w.lm_head.rows;
+    let modes = [SpecMode::Fixed(2), SpecMode::Fixed(4), SpecMode::Fixed(7), SpecMode::Auto { max: 7 }];
+    let mut table: Vec<String> = vec![];
+    let mut bad = 0usize;
+    for (name, ids) in PROMPTS {
+        let ids: Vec<u32> = ids.iter().map(|&x| x % e.cfg.vocab as u32).collect();
+        let ids = &ids[..];
+        let pl = ids.len();
+        // ---- (a) plain greedy
+        let path = sdir.join(format!("plain_{}.f32", name));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let mut plain: Vec<Rec> = vec![];
+        e.reset();
+        let tp = Instant::now();
+        e.feed_stream(ids, n, &[], &mut |t| {
+            let (l, h) = rows(&e, 0);
+            let (am, mg) = top2(l);
+            let lb = unsafe { std::slice::from_raw_parts(l.as_ptr() as *const u8, v * 4) };
+            f.write_all(lb).unwrap();
+            plain.push(Rec { tok: t, argmax: am, margin: mg, hh: fnv(h) });
+            true
+        }).unwrap();
+        drop(f);
+        let am_ok = plain.iter().skip(1).filter(|r| r.argmax == r.tok).count();
+        eprintln!("{}: plain {} tokens in {:.1} s; f32 argmax == token at {}/{} decode positions; min margin {:.4}", name, plain.len(),
+                  tp.elapsed().as_secs_f64(), am_ok, plain.len() - 1,
+                  plain.iter().skip(1).map(|r| r.margin).fold(f32::INFINITY, f32::min));
+        let mut f = std::fs::File::open(&path).unwrap();
+        // ---- (b) spec at each depth, (c) compare per position
+        for m in modes {
+            let mut got: Vec<(u32, bool, bool, usize, f32)> = vec![]; // (token, logits bit-identical, hf bit-identical, row, max |diff|)
+            let mut cnt = 0usize;
+            let mut buf = vec![0u8; v * 4];
+            // SD_EXACT_ORACLE=1 (harness check on a model whose MTP drafts are poor): drafts replaced by the plain
+            // continuation with p = 0.8, so the verify passes accept rows 1..7 too
+            let ov = if std::env::var("SD_EXACT_ORACLE").is_ok() {
+                DraftOverride::Oracle { seq: ids.iter().copied().chain(plain.iter().map(|r| r.tok)).collect(), p: 0.8, seed: 7 }
+            } else { DraftOverride::None };
+            e.reset();
+            let ts = Instant::now();
+            let (st, r) = e.feed_stream_spec_mode(ids, n, &[], &mut |t| {
+                let k = cnt;
+                cnt += 1;
+                if k == 0 { got.push((t, true, true, usize::MAX, 0.0)); return true; }
+                let row = pl + k - 1 - e.pos();
+                assert!(row < 8, "row {} out of the verify pass", row);
+                let (l, h) = rows(&e, row);
+                let lb = unsafe { std::slice::from_raw_parts(l.as_ptr() as *const u8, v * 4) };
+                let (lsame, hsame, md) = if k < plain.len() {
+                    f.seek(SeekFrom::Start((k * v * 4) as u64)).unwrap();
+                    f.read_exact(&mut buf).unwrap();
+                    let same = buf[..] == lb[..];
+                    let md = if same { 0.0 } else {
+                        let pr = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, v) };
+                        pr.iter().zip(l).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+                    };
+                    (same, fnv(h) == plain[k].hh, md)
+                } else { (false, false, f32::NAN) };
+                got.push((t, lsame, hsame, row, md));
+                true
+            }, m, &ov).unwrap();
+            e.flush_draft_source();
+            let wall = ts.elapsed().as_secs_f64();
+            let cmp = got.len().min(plain.len());
+            let tok_same = (0..cmp).filter(|&i| got[i].0 == plain[i].tok).count();
+            let lsame = (1..cmp).filter(|&i| got[i].1).count();
+            let hsame = (1..cmp).filter(|&i| got[i].2).count();
+            let rowhist = { let mut h = [0usize; 8]; for g in &got[1..] { if g.3 < 8 { h[g.3] += 1; } } h };
+            let first = (0..cmp).find(|&i| got[i].0 != plain[i].tok || !got[i].1 || !got[i].2);
+            let fm = match first {
+                Some(i) => format!("pos {} (row {}): tok {} vs {}, logits {}, hf {}, max|diff| {:e}, plain margin {:.4}", i, got[i].3,
+                                   got[i].0, plain[i].tok, got[i].1, got[i].2, got[i].4, plain[i].margin),
+                None => "none".into(),
+            };
+            if first.is_some() || got.len() != plain.len() { bad += 1; }
+            let line = format!("| {} | {} | {} | {}/{} | {}/{} | {}/{} | {:.3} ({} / {} drafts, {} passes) | rows {:?} | {} | {:.1} s ({}) |",
+                               name, m.name(), cmp - 1, lsame, cmp - 1, hsame, cmp - 1, tok_same, cmp, r.accepted as f64 / (r.drafts_mtp + r.drafts_table + r.drafts_pad).max(1) as f64, r.accepted,
+                               r.drafts_mtp + r.drafts_table + r.drafts_pad, r.passes, rowhist, fm, wall, st.stop_reason);
+            eprintln!("{}", line);
+            table.push(line);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    println!("\n| prompt | depth | positions | logits bit-identical | hf bit-identical | tokens identical | acceptance | verify rows used (row 0..7) | first mismatch | time |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for l in &table { println!("{}", l); }
+    println!("peak footprint {:.2} GB", e.peak() as f64 / 1e9);
+    assert_eq!(bad, 0, "{} prompt x depth runs not bit-identical to plain greedy", bad);
+}
