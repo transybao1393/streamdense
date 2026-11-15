@@ -168,6 +168,10 @@ Plain `cargo test` in `engine/` also runs the Metal GPU tests and the tests that
 without weights they print `SKIP: ...` and return. Lints: `cargo clippy --workspace --all-targets --locked -- -D warnings`
 (allowed style lints and why are listed in `engine/Cargo.toml`).
 
+## History
+
+Development started on 2026-10-31. The public git history begins on 2026-11-14, when the code was first published.
+
 ## License
 
 [PolyForm Strict License 1.0.0](https://polyformproject.org/licenses/strict/1.0.0): see [`LICENSE`](LICENSE). You may
