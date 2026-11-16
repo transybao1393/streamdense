@@ -20,6 +20,7 @@
 //! line counts the compared decode positions by attention path of their kv length N (N < SDPA_TWO_PASS_MIN single
 //! pass, up to SDPA_VEC_MAX_N MLX two-pass mirror, above it split-K `attn_split_rows` + `attn_reduce_gate`).
 //! KV format: SD_EXACT_KV=q8 opens the engine with 8-bit KV (fast prefill via attn_flash_q8 as bf16; every decode attention row split-K).
+//! SD_EXACT_SAVE_IDS=DIR: write each prompt's plain greedy token ids (exact and bench mode) to DIR/<prompt>_<kv>_plain.ids (one per line, kv = bf16 / q8).
 //! Quality runs: SD_EXACT_TOKENS_OUT=FILE appends per plain position `prompt pos token argmax top1-top2-margin` (tab
 //! separated); SD_EXACT_PLAIN_ONLY=1 runs only the plain greedy part (no MTP depths), e.g. to compare bf16 vs q8 KV;
 //! SD_EXACT_PREFILL_EXACT=1 = exact prompt read (bf16 and q8), to separate the two effects.
@@ -115,6 +116,18 @@ fn mtp_exact_27b_per_position() {
         Ok("q8") => KvFormat::Q8,
         Ok("bf16") | Err(_) => KvFormat::Bf16,
         Ok(k) => panic!("SD_EXACT_KV={}: want bf16 or q8", k),
+    };
+    // SD_EXACT_SAVE_IDS=DIR: each prompt's plain greedy token ids to DIR/<prompt>_<kv>_plain.ids (one id per line)
+    let save_ids: Option<std::path::PathBuf> = std::env::var("SD_EXACT_SAVE_IDS").ok().filter(|s| !s.is_empty()).map(Into::into);
+    let kv_tag = if matches!(kv, KvFormat::Q8) { "q8" } else { "bf16" };
+    let save_plain_ids = |name: &str, toks: &[u32]| {
+        if let Some(dir) = &save_ids {
+            std::fs::create_dir_all(dir).unwrap();
+            let p = dir.join(format!("{}_{}_plain.ids", name, kv_tag));
+            let body: String = toks.iter().map(|t| format!("{}\n", t)).collect();
+            std::fs::write(&p, body).unwrap();
+            eprintln!("{}: plain ids saved to {}", name, p.display());
+        }
     };
     let plain_only = std::env::var("SD_EXACT_PLAIN_ONLY").is_ok_and(|s| s == "1");
     let tokens_out = std::env::var("SD_EXACT_TOKENS_OUT").ok();
@@ -220,6 +233,7 @@ fn mtp_exact_27b_per_position() {
             eprintln!("{}", line_p);
             table.push(line_p);
             plain_toks.push(tp.clone());
+            save_plain_ids(name, &tp);
             let mut runs: Vec<(String, &str, bool)> = vec![("mtp auto (old, context-blind)".into(), "0", false), ("mtp auto (context-aware)".into(), "1", false)];
             if ctx_d > 0 { runs.push((format!("mtp auto + ctx draft {}", ctx_d), "1", true)); }
             for (i, (label, ctx_cost, combined)) in runs.iter().enumerate() {
@@ -311,6 +325,7 @@ fn mtp_exact_27b_per_position() {
             true
         }).unwrap();
         drop(f);
+        save_plain_ids(name, &plain.iter().map(|r| r.tok).collect::<Vec<u32>>());
         let am_ok = plain.iter().skip(1).filter(|r| r.argmax == r.tok).count();
         eprintln!("{}: plain {} tokens in {:.1} s; f32 argmax == token at {}/{} decode positions; min margin {:.4}", name, plain.len(),
                   tp.elapsed().as_secs_f64(), am_ok, plain.len() - 1,
