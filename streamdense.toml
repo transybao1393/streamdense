@@ -13,7 +13,7 @@ nice      = 10     # CPU priority of the model process
 model   = "models/qwen38_27b_mlx4"   # relative paths resolve against the repo root
 port    = 8898
 max_ctx = 8192
-# kv    = "bf16"  # KV cache format: "bf16" (default) or "q8" (8-bit, 0.56x KV RAM; always the exact prompt read); or --kv q8
+# kv    = "auto"  # KV cache format: "auto" (default: q8, bf16 in the 12 GB mode), "q8" (8-bit, 0.56x KV RAM) or "bf16"; or --kv
 mtp     = true
 spec_depth = "auto" # MTP drafts verified per pass: 1 = draft 1 / verify 2; 2..7 = chained drafts, one exact pass of N + 1 rows;
                     # "auto" = adaptive 0..7 per pass (MTP confidence + acceptance history + draft table)

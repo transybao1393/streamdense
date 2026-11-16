@@ -53,14 +53,14 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
 
   | Context | KV | Plain | MTP auto | Peak RAM |
   |---|---|---|---|---|
-  | ~12,200 | bf16 | 12.86 tok/s | 16.48 tok/s | 16.13 GB |
-  | ~12,200 | 8-bit | 12.75 tok/s | 15.77 tok/s | 15.75 GB |
-  | ~32,560 | bf16 | 11.39 tok/s | 14.34 tok/s | 17.58 GB |
-  | ~32,560 | 8-bit | 11.30 tok/s | **14.82 tok/s** | **16.57 GB** |
+  | ~12,200 | bf16 | 11.51 tok/s | 15.55 tok/s | 16.14 GB |
+  | ~12,200 | 8-bit (default) | 12.07 tok/s | 14.82 tok/s | 15.75 GB |
+  | ~32,560 | bf16 | 11.33 tok/s | 14.49 tok/s | 17.56 GB |
+  | ~32,560 | 8-bit (default) | 11.34 tok/s | **13.70 tok/s** | **16.56 GB** |
   | Before: ~12,200 / ~32,560 | bf16 | 11.97 / 10.33 tok/s | 13.13 / 9.94 tok/s | 16.14 / 17.55 GB |
 
-  The 12K rows were measured before the faster one-row attention below; the 32K bf16 row includes the re-measured
-  auto-depth costs below.
+  All rows include every change below. Repeated runs of the same row vary by up to about 7% (for example 12K bf16
+  MTP measured 15.55, 15.77 and 16.48 tok/s on different runs).
 
   Copy-heavy output at long context (an edit prompt that rewrites the last 80 lines of the code in the prompt,
   8-bit KV, output identical to plain in every run):
@@ -68,7 +68,7 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   | Context | Plain | MTP auto | Context drafts | MTP + context drafts | Peak RAM |
   |---|---|---|---|---|---|
   | ~12,200 | 13.29 tok/s | 37.02 tok/s | 33.64 tok/s | **37.44 tok/s** | 15.77 GB |
-  | ~32,560 | 12.41 tok/s | 27.98 tok/s | **35.50 tok/s** | 32.98 tok/s | 16.58 GB |
+  | ~32,560 | 11.27 tok/s | 25.81 tok/s | **32.32 tok/s** | 29.42 tok/s | 16.58 GB |
 
   MTP auto depth uses re-measured attention costs per key (the 8-bit table was 2.4–3x too steep) and weighs each
   acceptance estimate by how much evidence it has, so copy output keeps deep passes and prose gets shallower ones.
@@ -78,7 +78,7 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   What changed: MTP auto depth now counts the attention cost of each verify row at long context, so MTP is faster
   than plain at 32K too (it was slower before); verify attention above 8,192 keys uses a faster split-K kernel (bf16
   and 8-bit KV); one-row decode attention shares key reads across the query heads of a KV head (21–31% faster from
-  4K to 32K keys, bit-identical); and 8-bit KV is optional (`[gateway] kv = "q8"`, default bf16), saving about 1 GB
+  4K to 32K keys, bit-identical); and 8-bit KV is the default (bf16 in the 12 GB mode; `[gateway] kv = "bf16"` to force bf16), saving about 1 GB
   at 32K. The fast prompt read now writes and reads 8-bit KV directly, so the 32K prompt reads in 453 s with 8-bit KV
   (950 s before, ~450 s with bf16). 32K with bf16 KV needs a RAM cap of about 18 GB.
 
@@ -93,13 +93,13 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   | Prompt | KV | llama.cpp plain | llama.cpp MTP | streamdense plain | streamdense best | Peak RAM, MTP (llama.cpp / ours) |
   |---|---|---|---|---|---|---|
   | ~12,200 summarize | 16-bit | 8.88 tok/s | 14.27 tok/s | 12.86 tok/s | 16.48 tok/s (MTP) | 17.26 / 16.13 GB |
-  | ~32,560 summarize | 16-bit | 8.43 tok/s | over the cap (18.35 GB at load) | 11.39 tok/s | 14.34 tok/s (MTP) | – / 17.58 GB |
-  | ~32,560 summarize | 8-bit | 8.81 tok/s | 9.98 tok/s | 11.30 tok/s | 14.82 tok/s (MTP) | 17.60 / 16.57 GB |
-  | ~32,560 edit | 8-bit | 8.98 tok/s | 12.63 tok/s | 12.41 tok/s | 35.50 tok/s (context drafts) | 17.60 / 16.58 GB |
+  | ~32,560 summarize | 16-bit | 8.43 tok/s | over the cap (18.35 GB at load) | 11.33 tok/s | 14.49 tok/s (MTP) | – / 17.56 GB |
+  | ~32,560 summarize | 8-bit | 8.81 tok/s | 9.98 tok/s | 11.34 tok/s | 13.70 tok/s (MTP) | 17.60 / 16.56 GB |
+  | ~32,560 edit | 8-bit | 8.98 tok/s | 12.63 tok/s | 11.27 tok/s | 32.32 tok/s (context drafts) | 17.60 / 16.58 GB |
 
   Plain llama.cpp decodes at about 0.7x our plain speed with the same RAM; its prompt read (72–79 tok/s, 426–455 s
   at 32K) is about the same as ours, and about 10% slower with MTP on. With MTP on both sides, streamdense is 1.15x
-  faster at 12K and 1.5x (prose) to 2.8x (edit) faster at 32K, using about 1 GB less RAM. llama.cpp's MTP output
+  faster at 12K and 1.4x (prose) to 2.6x (edit) faster at 32K, using about 1 GB less RAM. llama.cpp's MTP output
   equals its plain output. Its tokenizer gives the same token ids; the two quantizations differ, so greedy outputs
   share the first tokens and then diverge (first difference at token 10 of the 12K prompt).
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code

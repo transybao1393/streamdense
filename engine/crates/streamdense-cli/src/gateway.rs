@@ -93,7 +93,6 @@ pub fn main(a: &Args) {
     opt.cap = (a.f("--cap", 17.0) * 1e9) as u64;
     if let Some(r) = a.s("--reserve") { opt.reserve = (r.parse::<f64>().unwrap() * 1e9) as u64; }
     opt.max_ctx = a.f("--max-ctx", conf.cfg.gateway.max_ctx as f64) as usize;
-    opt.kv = match a.sd("--kv", &conf.cfg.gateway.kv).as_str() { "bf16" => KvFormat::Bf16, "q8" => KvFormat::Q8, k => die(format!("--kv {}: want bf16|q8", k)) };
     opt.mtp = if a.has("--no-mtp") { false } else { a.has("--mtp") || conf.cfg.gateway.mtp };
     // 12 GB mode (research): flag --forheader off|12gb > [forheader] mode; off by default
     let mut fhc = conf.cfg.forheader.clone();
@@ -106,6 +105,11 @@ pub fn main(a: &Args) {
     let ctx_dry = a.has("--ctx-draft-dry");
     if ctx_dry { fhc.ctx_draft = true; }
     let fh_on = match a.s("--forheader").unwrap_or_else(|| fhc.mode.clone()).as_str() { "off" => false, "12gb" => true, m => die(format!("--forheader {}: want off|12gb", m)) };
+    // KV format: --kv > [gateway] kv; "auto" (default) = q8, or bf16 in the 12 GB mode (its fast prompt read needs bf16)
+    opt.kv = match a.sd("--kv", &conf.cfg.gateway.kv).as_str() {
+        "bf16" => KvFormat::Bf16, "q8" => KvFormat::Q8, "auto" => if fh_on { KvFormat::Bf16 } else { KvFormat::Q8 },
+        k => die(format!("--kv {}: want auto|bf16|q8", k)),
+    };
     if fh_on {
         // MTP comes from [forheader] mtp (it costs resident neurons); [gateway] mtp / --mtp do not apply, --no-mtp still does
         let m = fhc.mtp && !a.has("--no-mtp");
