@@ -1,5 +1,5 @@
 //! streamdense gateway --model DIR --port 8898 --max-ctx 8192 [--mtp | --no-mtp] [--spec-depth N|auto] [--spec-cost ..] [--draft-table DIR] [--gemv mma|old] [--draft-vocab FILE] [--no-mtp-decode] [--think] [--log FILE]
-//!                     [--tokenizer DIR] [--cap 17] [--reserve GB] [--kv bf16|q8] [--seqs 1..4] [--abort-gb 16] [--swap-gb 7]
+//!                     [--tokenizer DIR] [--cap 17] [--reserve GB] [--kv bf16|q8 ([gateway] kv)] [--seqs 1..4] [--abort-gb 16] [--swap-gb 7]
 //!                     [--prefill-k N] [--prefill-t N] [--prefill-exact] [--threads N] [--host 127.0.0.1] [--name qwen38-27b]
 //!                     [--no-snapshots] [--snapshot-dir DIR] [--snapshot-max-files N] [--snapshot-max-gb GB] ([snapshots], default 32 / 8) [--no-activity]
 //!                     [--watcher-dir DIR (or $SD_WATCHER_DIR)] [--forheader off|12gb] [--no-fast] [--no-fused] [--ctx-draft | --no-ctx-draft | --ctx-draft-dry] [--plan (print the budget / 12 GB K and exit; loads nothing)]
@@ -93,7 +93,7 @@ pub fn main(a: &Args) {
     opt.cap = (a.f("--cap", 17.0) * 1e9) as u64;
     if let Some(r) = a.s("--reserve") { opt.reserve = (r.parse::<f64>().unwrap() * 1e9) as u64; }
     opt.max_ctx = a.f("--max-ctx", conf.cfg.gateway.max_ctx as f64) as usize;
-    opt.kv = match a.sd("--kv", "bf16").as_str() { "bf16" => KvFormat::Bf16, "q8" => KvFormat::Q8, k => die(format!("--kv {}: want bf16|q8", k)) };
+    opt.kv = match a.sd("--kv", &conf.cfg.gateway.kv).as_str() { "bf16" => KvFormat::Bf16, "q8" => KvFormat::Q8, k => die(format!("--kv {}: want bf16|q8", k)) };
     opt.mtp = if a.has("--no-mtp") { false } else { a.has("--mtp") || conf.cfg.gateway.mtp };
     // 12 GB mode (research): flag --forheader off|12gb > [forheader] mode; off by default
     let mut fhc = conf.cfg.forheader.clone();
@@ -268,7 +268,7 @@ pub fn main(a: &Args) {
     let snapshots = !a.has("--no-snapshots") && opt.dflash.is_none() && opt.dflash2.is_none();
     if opt.dflash.is_some() && !a.has("--no-snapshots") { eprintln!("drafter on: snapshots off (snapshot files hold no drafter context)"); }
     if opt.dflash2.is_some() && !a.has("--no-snapshots") { eprintln!("dflash2 on: snapshots off (streamed prefill and snapshot restore leave no context rows)"); }
-    let info = json!({"pid": std::process::id(), "model_dir": model, "max_ctx": opt.max_ctx, "mtp_available": opt.mtp,
+    let info = json!({"pid": std::process::id(), "model_dir": model, "max_ctx": opt.max_ctx, "kv": if opt.kv == KvFormat::Q8 { "q8" } else { "bf16" }, "mtp_available": opt.mtp,
         "mtp_decode": wc.mtp && opt.mtp, "spec_depth": opt.spec_depth, "spec_auto": opt.spec_auto, "seqs": opt.seqs, "gemv": opt.gemv.name(), "verify_fused": opt.verify_fused, "history": hist_on,
         "draft_table": opt.draft_table.as_ref().map(|p| p.display().to_string()),
         "drafter": opt.dflash.as_ref().map(|p| p.display().to_string()),

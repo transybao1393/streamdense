@@ -601,3 +601,51 @@ fn deep_spec_external_drafts() {
     }
     assert!(ok, "External drafts: output != plain or acceptance off-script");
 }
+
+/// 8-bit KV (`KvFormat::Q8`, exact prefill, every attention row split-K): MTP d = 1 (real head + oracle, pipe + sync),
+/// deep spec d = 2..7 (oracle) and auto (real head + oracle) == plain greedy of the same q8 engine, in tokens and in the
+/// recorded per-position top-1 / top-2 logits (bit for bit); ctx1k decode crosses position 1024.
+#[test]
+fn q8_kv_mtp_equals_plain() {
+    let Some(dir) = model_dir() else { return; };
+    let eng = QwenEngine::open(&dir, QwenOptions { max_ctx: 2048, mtp: true, spec_depth: 7, spec_auto: true, kv: streamdense_model::KvFormat::Q8,
+                                                   ..Default::default() }).expect("open tiny q8");
+    assert!(!eng.fast_prefill(), "q8 KV must take the exact prefill");
+    let ps = prompts();
+    let rec = |p: usize, n: usize| -> Vec<(u32, u32, u32)> {
+        (p - 1..p - 1 + n).map(|i| { let (t, a, b) = eng.rec_token(i); (t, a.to_bits(), b.to_bits()) }).collect()
+    };
+    let (mut ok, mut runs, mut acc, mut rej) = (true, 0usize, 0usize, 0usize);
+    for (id, n) in [("short", 64), ("code", 64), ("math", 64), ("syn1", 48), ("syn300", 48), ("ctx1k", 80)] {
+        let Some(p) = get(&ps, id) else { continue };
+        let g = eng.generate(p, n, false).unwrap();
+        let gr = rec(p.len(), g.tokens.len());
+        let seq: Vec<u32> = p.iter().chain(g.tokens.iter()).copied().collect();
+        let o = |pr: f64, s: u64| DraftOverride::Oracle { seq: seq.clone(), p: pr, seed: s };
+        let mut cases: Vec<(String, SpecResult)> = vec![];
+        for pipe in [true, false] {
+            cases.push((format!("d1 head {}", pipe), generate_mtp(&eng, p, g.tokens.len(), DraftOverride::None, pipe).unwrap()));
+            cases.push((format!("d1 o0.5 {}", pipe), generate_mtp(&eng, p, g.tokens.len(), o(0.5, 3), pipe).unwrap()));
+        }
+        for d in 2..=7 {
+            for pr in [0.5, 0.9] {
+                cases.push((format!("d{} o{}", d, pr), generate_spec_ov(&eng, p, g.tokens.len(), d, o(pr, 7 + d as u64)).unwrap()));
+            }
+        }
+        cases.push(("auto head".into(), generate_spec_mode(&eng, p, g.tokens.len(), SpecMode::Auto { max: 7 }, DraftOverride::None).unwrap()));
+        cases.push(("auto o0.7".into(), generate_spec_mode(&eng, p, g.tokens.len(), SpecMode::Auto { max: 7 }, o(0.7, 9)).unwrap()));
+        let mut eq_n = 0;
+        for (name, r) in &cases {
+            let eq = r.tokens == g.tokens && rec(p.len(), r.tokens.len()) == gr;
+            if !eq { println!("  q8 {:7} {}: tokens == plain {}, rec == plain {}", id, name, r.tokens == g.tokens, rec(p.len(), r.tokens.len()) == gr); }
+            ok &= eq;
+            eq_n += eq as usize;
+            acc += r.accepted;
+            rej += r.rejects;
+        }
+        runs += cases.len();
+        println!("  q8 {:7} (P {}, {} new): {} / {} MTP runs == plain (tokens + top-1/top-2 logits)", id, p.len(), g.tokens.len(), eq_n, cases.len());
+    }
+    println!("q8 KV: {} runs, accepted {} rejected {}", runs, acc, rej);
+    assert!(ok && runs > 0 && acc > 0 && rej > 0, "q8 KV: MTP != plain");
+}

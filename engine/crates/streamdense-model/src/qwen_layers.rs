@@ -10,7 +10,7 @@
 //! - `rmsnorm_b`: x, w, out, n, eps, out_stride; T groups x 1024. `rmsnorm_gated`: y, z, z_stride, w, out, eps;
 //!   (vh, T) groups x dv.
 //! - `dn_conv` / `dn_prep` / `dn_recur_ck{0,1}` with `DnDims` by value; `attn_prep_*`, `attn_partial_k*_*`,
-//!   `attn_reduce_gate`; `argmax_b`.
+//!   `attn_split_k*`, `attn_reduce_gate`; `argmax_b`.
 //! - `GemvImpl::Mma` (default): `qm_gemvt_k{K}_s8_m*` / `qm_swiglut_k{K}_s8` (`mma_use_twin`) or
 //!   `qm_gemv_n2_s8_m*` / `qm_swiglu_n1_s8` (gemv_mma_q4.metal; bindings at `mma_gemv_enc` / `mma_twin_gemv_enc`).
 use streamdense_core::DType;
@@ -159,7 +159,7 @@ const F32: usize = 4;
 
 /// Largest kv length N handled by `attn_sdpa_vec_b16`, the bit-exact mirror of MLX's decode attention (L = 1):
 /// single-pass `sdpa_vector` below `SDPA_TWO_PASS_MIN`, the fused 2-pass mirror from there up to this bound (its
-/// `blocks` <= 128). Rows with larger N use the split-K chunk path (`attn_partial` + `attn_reduce_gate`).
+/// `blocks` <= 128). Rows with larger N use the split-K chunk path (`attn_split_rows` + `attn_reduce_gate`).
 /// `SD_SDPA_VEC_MAX` overrides it (0 = always split-K).
 /// dn_conv `ck` value of a held pass (deltanet.metal DN_HOLD): no checkpoint, conv state not written back.
 pub const DN_HOLD: u32 = 0xFFFF_FFFE;
@@ -184,7 +184,7 @@ pub fn qwen_pipelines() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = Vec::new();
     for k in KS {
         v.extend_from_slice(&[gemv_name(k, 0), gemv_name(k, 2), gemv_name(k, 3), swiglu_name(k)]);
-        v.extend_from_slice(&[partial_name(k, false), partial_name(k, true)]);
+        v.extend_from_slice(&[partial_name(k, false), partial_name(k, true), split_name(k)]);
     }
     v.extend(mma_pipelines());
     v.extend_from_slice(&[
@@ -293,6 +293,27 @@ pub(crate) fn partial_name(k: usize, q8: bool) -> &'static str {
         (7, true) => "attn_partial_k7_q8", (8, true) => "attn_partial_k8_q8",
         _ => panic!("attn_partial: no variant for k {}", k),
     }
+}
+
+/// `attn_split_k{K}` (attn_gated.metal `attn_split_rows`, 256 threads): the bf16 split-K partials of a K-row pass,
+/// bit-identical per row to `attn_partial_k{K}_b16` (verify_bench::tests::verify_attn_splitk_bit_identical) and
+/// cheaper (27B attention shapes, 32K keys, one layer + reduce: K = 1 ~0.65x, K = 8 ~0.4x the attn_partial time).
+pub(crate) fn split_name(k: usize) -> &'static str {
+    match k {
+        1 => "attn_split_k1", 2 => "attn_split_k2", 3 => "attn_split_k3", 4 => "attn_split_k4",
+        5 => "attn_split_k5", 6 => "attn_split_k6", 7 => "attn_split_k7", 8 => "attn_split_k8",
+        _ => panic!("attn_split: no variant for k {}", k),
+    }
+}
+/// `SD_ATTN_SPLIT=old`: bf16 split-K passes run `attn_partial_k*` (A/B; same numbers, slower).
+fn split_old() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SD_ATTN_SPLIT").is_ok_and(|v| v.trim() == "old"))
+}
+/// Split-K partial kernel of a `k`-row pass and its threads per threadgroup (dispatch (nch, nh) groups either way):
+/// `attn_split_k{k}` for bf16 KV, `attn_partial_k{k}_q8` for q8 KV.
+pub(crate) fn split_k_kernel(k: usize, q8: bool) -> (&'static str, usize) {
+    if q8 || split_old() { (partial_name(k, q8), 128) } else { (split_name(k), 256) }
 }
 
 /// Bench only (decode_bench --verify K > 8): widest exact pass row count the encoders accept. 8 = the engine
@@ -908,10 +929,11 @@ pub(crate) fn attn_sdpa_rows(e: &Enc, kv: &KvRef, b: &VaBufs, po: usize, pml: us
     let lim = if kv.q8 { 0 } else { sdpa_vec_max_n().min(8192) }; // 8192: the kernel's blocks <= 128 bound
     let (n_lo, n_hi) = (pos + 1, pos + k);
     if n_hi > lim {
-        e.pso(partial_name(k, kv.q8))
+        let (pn, nt) = split_k_kernel(k, kv.q8);
+        e.pso(pn)
             .b(0, b.qr).b(1, kv.k).b(2, kv.v).b(3, kv.ksb).b(4, kv.vsb).b(5, po).b(6, pml).b(7, b.ctrl)
             .u(8, kv.max_ctx as u32).u(9, (nh / nkv) as u32)
-            .groups((nch, nh), 128);
+            .groups((nch, nh), nt);
         e.pso("attn_reduce_gate").b(0, po).b(1, pml).b(2, b.p).b(3, b.ao).u(4, nch as u32).u(5, prow as u32)
             .groups((nh, k), hdim / 4);
     }
@@ -1220,10 +1242,11 @@ pub fn bench_encode_layer_batch(e: &Enc, cfg: &QwenConfig, lw: &LayerW, seqs: &[
                 let lim = if kv.q8 { 0 } else { sdpa_vec_max_n().min(8192) };
                 let (n_lo, n_hi) = (io.pos + 1, io.pos + r);
                 if n_hi > lim {
-                    e.pso(partial_name(r, kv.q8))
+                    let (pn, nt) = split_k_kernel(r, kv.q8);
+                    e.pso(pn)
                         .b(0, qr).b(1, kv.k).b(2, kv.v).b(3, kv.ksb).b(4, kv.vsb).b(5, io.po).b(6, io.pml).b(7, sq.ctrl)
                         .u(8, kv.max_ctx as u32).u(9, (nh / nkv) as u32)
-                        .groups((nch, nh), 128);
+                        .groups((nch, nh), nt);
                     e.pso("attn_reduce_gate").b(0, io.po).b(1, io.pml).b(2, p).b(3, ao).u(4, nch as u32).u(5, prow as u32)
                         .groups((nh, r), hdim / 4);
                 }

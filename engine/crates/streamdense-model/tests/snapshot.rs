@@ -7,6 +7,7 @@
 //!   each replayed after: dirtying the engine with another prompt then restore (file), restore (RAM), and a second
 //!   freshly opened engine (restart) restoring the file. Equal: tokens, stop reasons, positions, rec records
 //!   (argmax, top-1, top-2 bitwise) for every generated position, and (plain) the full logits row per token.
+//! - the same with 8-bit KV (q8: exact prefill), plain and MTP.
 //! - cross: an MTP snapshot restored into a plain engine == the plain reference.
 //! - errors: bad magic, truncated body, tokens.len() != pos; cache key / longest-prefix lookup.
 //! - timing: save / restore (file, RAM) on the tiny model, and the 27B estimate at ~3 GB/s.
@@ -29,8 +30,9 @@ fn model_dir() -> Option<String> {
         None
     }
 }
-fn open(mtp: bool, exact: bool, max_ctx: usize) -> Option<QwenEngine> {
-    let opt = QwenOptions { max_ctx, mtp, prefill_exact: exact, ..Default::default() };
+fn open(mtp: bool, exact: bool, max_ctx: usize) -> Option<QwenEngine> { open_kv(mtp, exact, max_ctx, KvFormat::Bf16) }
+fn open_kv(mtp: bool, exact: bool, max_ctx: usize, kv: KvFormat) -> Option<QwenEngine> {
+    let opt = QwenOptions { max_ctx, mtp, prefill_exact: exact, kv, ..Default::default() };
     Some(QwenEngine::open(&model_dir()?, opt).expect("open tiny"))
 }
 fn rnd(seed: u64, n: usize) -> Vec<u32> {
@@ -82,9 +84,10 @@ fn feed_prefix(eng: &QwenEngine, prefix: &[u32], mtp: bool) -> u32 {
     t0.unwrap()
 }
 
-fn check_mode(mtp: bool, exact: bool) {
-    let Some(eng) = open(mtp, exact, 4096) else { return };
-    let tag = format!("{} {}", if mtp { "mtp" } else { "plain" }, if exact { "exact" } else { "fast" });
+fn check_mode(mtp: bool, exact: bool) { check_mode_kv(mtp, exact, KvFormat::Bf16) }
+fn check_mode_kv(mtp: bool, exact: bool, kv: KvFormat) {
+    let Some(eng) = open_kv(mtp, exact, 4096, kv) else { return };
+    let tag = format!("{} {}{}", if mtp { "mtp" } else { "plain" }, if exact { "exact" } else { "fast" }, if kv == KvFormat::Q8 { " q8" } else { "" });
     let prefix = rnd(0x51A9_5EED, P);
     let rem = rnd(0xBEEF_0001, R);
     let other = rnd(0x0DD_BA11, 300);
@@ -133,7 +136,7 @@ fn check_mode(mtp: bool, exact: bool) {
     }
     // restart: a second engine (different max_ctx: rows re-strided) from the file
     drop(mem);
-    let Some(e2) = open(mtp, exact, 2048) else { return };
+    let Some(e2) = open_kv(mtp, exact, 2048, kv) else { return };
     for (case, want) in [("a", &ref_a), ("b", &ref_b)] {
         let ids: Vec<u32> = if case == "a" { vec![t0] } else { rem.clone() };
         e2.restore_snapshot(&path).unwrap();
@@ -154,6 +157,11 @@ fn restore_plain_exact() { check_mode(false, true); }
 fn restore_mtp_fast() { check_mode(true, false); }
 #[test]
 fn restore_mtp_exact() { check_mode(true, true); }
+/// 8-bit KV (exact prefill): K / V bytes and their scale / min rows are saved and restored bit-exact
+#[test]
+fn restore_plain_q8() { check_mode_kv(false, true, KvFormat::Q8); }
+#[test]
+fn restore_mtp_q8() { check_mode_kv(true, true, KvFormat::Q8); }
 
 /// MTP-engine snapshot restored into a plain engine == plain reference (MTP == plain is the spec contract).
 #[test]

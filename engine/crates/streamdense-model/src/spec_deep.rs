@@ -343,7 +343,12 @@ pub fn generate_spec_ov(eng: &QwenEngine, prompt: &[u32], n_new: usize, depth: u
 // Planner (deterministic: only GPU-computed confidences and acceptance history, never timings):
 //   q_s (P(draft s accepted | drafts < s accepted)) = MTP: 0.5 cal_m[bin(top-1 prob)] + 0.5 ewma_s; table: 0.5
 //   cal_t[bin(conditional conf)] + 0.5 conf. E(d) = 1 + Σ_{i<=d} Π_{s<=i} q_s, T(d) = round_ms + pass_ms[d] (K = d+1)
-//   + mtp_ms * chain steps; choose d = argmax E/T. During the chain, future q use ewma; the chain continues while the
+//   + mtp_ms * chain steps + attention(K, N); choose d = argmax E/T (d = 0: a one-row pass, no drafts).
+//   Context-aware attention term: every verify row reads the whole KV, so a K-row pass costs ~K x one row's
+//   attention (split-K above 8192 keys: K = 8 ~7x K = 1). attention(K, N) = N x attn_layers x kv scale x
+//   us_per_key[K] (+ one MTP-layer row per chain step and per round); negligible at short contexts, it makes the
+//   planner pick shallower passes (down to d = 0) as N grows. SD_SPEC_CTX_COST=0 drops the term (the previous
+//   policy; bench comparison only). Speed only: the output is the verify argmax either way. During the chain, future q use ewma; the chain continues while the
 //   argmax lies beyond the drafts computed so far and Π q >= MIN_PREFIX. ewma / cal update after each verify up to
 //   the first rejected draft (conditional rates).
 // Every emitted token is the verify pass's argmax, as in `spec_loop_deep`: lossless whatever the drafts.
@@ -377,15 +382,35 @@ impl SpecMode {
 }
 
 /// Cost model of the adaptive planner. Defaults: measured synthetic full-pass GEMV ms (mma family) for
-/// K = 1..8, the measured chained MTP step GPU median, and a fixed per-round part (replay + MTP rows + hand-offs).
+/// K = 1..8, the measured chained MTP step GPU median, and a fixed per-round part (replay + MTP rows + hand-offs);
+/// plus the attention cost per key of a K-row pass (`attn_us_key*`, below).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpecCost {
     pub pass_ms: [f64; 8],
     pub mtp_ms: f64,
     pub round_ms: f64,
+    /// µs per KV key per attention layer of a K-row pass (K = 1..8), bf16 split-K path (`attn_split_rows` +
+    /// `attn_reduce_gate`: rows with N > 8192).
+    pub attn_us_key: [f64; 8],
+    /// Same for q8 KV (every row split-K, `attn_partial_k*_q8`).
+    pub attn_us_key_q8: [f64; 8],
+    /// Same for the single / two-pass sdpa rows (bf16 KV, N <= 8192).
+    pub attn_us_key_short: [f64; 8],
 }
+/// Attention cost constants (`SpecCost::attn_us_key*`): GPU median of one layer's attention path (`attn_sdpa_rows`)
+/// for a K-row pass at 27B attention shapes (24 q heads, 4 kv heads, head dim 256, bf16 KV) divided by N, on an
+/// M4 Pro: `verify_bench --attn-pass` (split-K at N = 32760, mean of the default and verify_mixers rows, linear in N
+/// within 4% from 8K to 32K; short path at N = 8000, default kernels). Other shapes are scaled by kv_dim / 1024.
+/// Split-K = `attn_split_rows` (2026-11-16; K = 5 / 6 and 7 / 8 cost about the same: two score passes, and
+/// 3 / 2-row value sweeps). The q8 table keeps the earlier `attn_partial` bf16 measurement as its estimate.
+const ATTN_US_KEY_SPLIT: [f64; 8] = [0.0305, 0.0451, 0.0549, 0.0620, 0.1021, 0.1015, 0.1279, 0.1204];
+const ATTN_US_KEY_SPLIT_Q8: [f64; 8] = [0.0475, 0.1089, 0.1553, 0.2209, 0.2424, 0.2590, 0.3063, 0.3343];
+const ATTN_US_KEY_SHORT: [f64; 8] = [0.0443, 0.0618, 0.0954, 0.1135, 0.1534, 0.1709, 0.2059, 0.2250];
 impl Default for SpecCost {
-    fn default() -> Self { SpecCost { pass_ms: [63.2, 76.4, 97.5, 114.7, 115.2, 115.9, 116.4, 116.6], mtp_ms: 4.2, round_ms: 7.0 } }
+    fn default() -> Self {
+        SpecCost { pass_ms: [63.2, 76.4, 97.5, 114.7, 115.2, 115.9, 116.4, 116.6], mtp_ms: 4.2, round_ms: 7.0,
+                   attn_us_key: ATTN_US_KEY_SPLIT, attn_us_key_q8: ATTN_US_KEY_SPLIT_Q8, attn_us_key_short: ATTN_US_KEY_SHORT }
+    }
 }
 impl SpecCost {
     /// Defaults with the fused verify matmuls (`QwenOptions.verify_fused`): pass ms for K >= 3 minus the matmul-pass
@@ -457,19 +482,49 @@ pub(crate) struct Plan {
     ew: [f64; SPEC_DEPTH_MAX],
     cal_m: [f64; NBIN],
     cal_t: [f64; NBIN],
+    /// attention layers of the main model x kv scale (0 = no attention term: the context-blind policy)
+    attn_w: f64,
+    /// kv scale alone (the MTP layer: one attention layer)
+    attn_mtp: f64,
+    /// every row takes the split-K path (q8 KV)
+    split_all: bool,
+    /// keys before the pass (the position p of the round)
+    pub(crate) n: usize,
 }
 impl Plan {
     pub(crate) fn new(cost: SpecCost) -> Plan {
         let c = [0.1, 0.3, 0.5, 0.7, 0.9];
-        Plan { cost, ew: [0.8; SPEC_DEPTH_MAX], cal_m: c, cal_t: c }
+        Plan { cost, ew: [0.8; SPEC_DEPTH_MAX], cal_m: c, cal_t: c, attn_w: 0.0, attn_mtp: 0.0, split_all: false, n: 0 }
     }
+    /// Context-aware planner: `attn_layers` attention layers with `kv_dim` (27B: 16, 1024), q8 KV or not.
+    pub(crate) fn with_attn(mut self, attn_layers: usize, kv_dim: usize, q8: bool) -> Plan {
+        let sc = kv_dim as f64 / 1024.0;
+        self.attn_w = attn_layers as f64 * sc;
+        self.attn_mtp = sc;
+        self.split_all = q8;
+        self
+    }
+    /// ms of one layer's attention (kv scale 1) for a K-row pass at the current n.
+    fn attn1(&self, k: usize) -> f64 {
+        let k = k.clamp(1, 8);
+        let lim = crate::qwen_layers::sdpa_vec_max_n().min(8192);
+        let tab = if self.split_all { &self.cost.attn_us_key_q8 }
+                  else if self.n + k > lim { &self.cost.attn_us_key } else { &self.cost.attn_us_key_short };
+        tab[k - 1] * (self.n + k) as f64 * 1e-3
+    }
+    /// ms of a K-row verify pass at the current n (matmuls + main-model attention).
+    pub(crate) fn pass(&self, k: usize) -> f64 { self.cost.pass_ms[k.clamp(1, 8) - 1] + self.attn_w * self.attn1(k) }
     /// MTP draft s (1-based), top-1 prob p if known.
     pub(crate) fn q_m(&self, s: usize, p: Option<f64>) -> f64 {
         let e = self.ew[(s - 1).min(SPEC_DEPTH_MAX - 1)];
         match p { Some(p) => 0.5 * self.cal_m[bin(p)] + 0.5 * e, None => e }
     }
     pub(crate) fn q_t(&self, c: f64) -> f64 { 0.5 * self.cal_t[bin(c)] + 0.5 * c.clamp(0.0, 1.0) }
-    pub(crate) fn t(&self, d: usize, steps: usize) -> f64 { self.cost.round_ms + self.cost.pass_ms[d.min(7)] + self.cost.mtp_ms * steps as f64 }
+    pub(crate) fn t(&self, d: usize, steps: usize) -> f64 {
+        // MTP layer attention: one row per chain step + the round's MTP rows (counted as one)
+        let mtp_attn = if self.attn_mtp > 0.0 { self.attn_mtp * self.attn1(1) * (steps + 1) as f64 } else { 0.0 };
+        self.cost.round_ms + self.pass(d.min(7) + 1) + self.cost.mtp_ms * steps as f64 + mtp_attn
+    }
     /// argmax over d in 0..=hi (hi <= q.len()) of E(d) / T(d, steps(d)); (d, ratio).
     pub(crate) fn best(&self, q: &[f64], hi: usize, steps: &dyn Fn(usize) -> usize) -> (usize, f64) {
         let (mut e, mut pr) = (1.0, 1.0);
@@ -563,6 +618,13 @@ impl QwenEngine {
     pub fn set_draft_source(&self, s: Option<Box<dyn DraftSource>>) -> Option<Box<dyn DraftSource>> { self.draft_src.replace(s) }
     /// Flush the draft source to disk (between generations).
     pub fn flush_draft_source(&self) { if let Some(s) = self.draft_src.borrow_mut().as_mut() { s.flush(); } }
+    /// The adaptive planner of a generation: `opt.spec_cost` + the context-aware attention term (off with
+    /// SD_SPEC_CTX_COST=0, the context-blind policy, for bench comparisons).
+    pub(crate) fn new_plan(&self) -> Plan {
+        let p = Plan::new(self.opt.spec_cost.clone());
+        if std::env::var("SD_SPEC_CTX_COST").is_ok_and(|v| v == "0") { return p; }
+        p.with_attn(self.cfg.n_attention(), self.cfg.kv_dim(), self.opt.kv != KvFormat::Bf16)
+    }
     /// The engine's default spec policy: Auto { max: spec_depth } with opt.spec_auto, else Fixed(spec_depth).
     pub fn spec_mode(&self) -> SpecMode {
         if self.opt.spec_auto { SpecMode::Auto { max: self.opt.spec_depth } } else { SpecMode::Fixed(self.opt.spec_depth) }
@@ -636,6 +698,7 @@ impl QwenEngine {
         }
         loop {
             let p = self.pos();
+            plan.n = p;
             // ---- drafts
             let cap = if auto { dmax.min(self.opt.max_ctx.saturating_sub(p + 1)) } else { dmax };
             if p + 1 + if auto { 0 } else { dmax } > self.opt.max_ctx { st.stop_reason = "ctx_full"; break; }
@@ -737,7 +800,7 @@ impl QwenEngine {
             // smallest encoded-ahead K that fits exactly, or with spare rows costing <= PAD_MS
             let pick = vpre.iter().enumerate()
                 .filter(|(_, x)| x.2 <= p && p <= x.3 && p + x.1 <= self.opt.max_ctx && x.1 >= k
-                        && (x.1 == k || (auto && plan.cost.pass_ms[x.1 - 1] - plan.cost.pass_ms[k - 1] <= PAD_MS)))
+                        && (x.1 == k || (auto && plan.pass(x.1) - plan.pass(k) <= PAD_MS)))
                 .min_by_key(|(_, x)| x.1).map(|(i, _)| i);
             let vcb = match pick {
                 Some(i) => {
@@ -899,7 +962,7 @@ impl QwenEngine {
         else if n_new <= 1 { st.stop_reason = "length"; }
         else {
             let mut oracle = Oracle::new(ov);
-            let mut plan = Plan::new(self.opt.spec_cost.clone());
+            let mut plan = self.new_plan();
             self.spec_loop_pipe(mode, n_new, stop, on_tok, &mut st, &mut r, &mut oracle, &mut hist, &mut plan, &|| false)?;
             r.overridden += oracle.as_ref().map_or(0, |o| o.used);
         }
@@ -946,4 +1009,71 @@ pub fn generate_spec_sync(eng: &QwenEngine, prompt: &[u32], n_new: usize, depth:
     eng.margins_check(p_len, &mut r)?;
     r.finish();
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_27b(n: usize, q: f64) -> (Plan, Vec<f64>) {
+        let mut p = Plan::new(SpecCost::default()).with_attn(16, 1024, false);
+        p.n = n;
+        (p, vec![q; SPEC_DEPTH_MAX])
+    }
+
+    /// Within each attention path (the MLX-mirror rows up to N = 8192, split-K above) the chosen depth never rises
+    /// as the context grows, and it falls below the short-context depth at 32K for q 0.7 (high acceptance, q >= 0.8,
+    /// still pays for deep passes at 32K with attn_split_rows; low already picks d <= 1). Split-K rows cost less per
+    /// key than the mirror rows, so the depth may rise again where a pass leaves the mirror path.
+    #[test]
+    fn depth_falls_with_context() {
+        for q in [0.5, 0.7, 0.8, 0.9] {
+            let mut prev = usize::MAX;
+            let mut ds = vec![];
+            for n in [100usize, 1024, 4096, 8183, 8191, 8192, 12288, 16384, 24576, 32768] {
+                let (p, qs) = plan_27b(n, q);
+                let (d, _) = p.best(&qs, SPEC_DEPTH_MAX, &|d| d.saturating_sub(1));
+                if n + 8 > 8192 && n <= 8192 { prev = usize::MAX; } // first N where a deep pass is costed as split-K
+                assert!(d <= prev, "q {}: depth rose to {} at N {} ({:?})", q, d, n, ds);
+                prev = d;
+                ds.push(d);
+            }
+            if q == 0.7 { assert!(ds[ds.len() - 1] < ds[0], "q {}: no fall {:?}", q, ds); }
+            println!("q {}: depth by N {:?}", q, ds);
+        }
+        // the measured 32K acceptance (~0.37): at most one draft pays off (with attn_split_rows a 2-row pass costs
+        // ~1.5x a 1-row pass in attention; with attn_partial it was ~2.3x and the planner chose 0)
+        let (p, qs) = plan_27b(32560, 0.37);
+        assert!(p.best(&qs, SPEC_DEPTH_MAX, &|d| d.saturating_sub(1)).0 <= 1);
+        // without the attention term (old policy) the same stats still draft
+        let mut old = Plan::new(SpecCost::default());
+        old.n = 32560;
+        assert!(old.best(&qs, SPEC_DEPTH_MAX, &|d| d.saturating_sub(1)).0 > 0);
+    }
+
+    /// Never below plain: the chosen depth's expected tokens per ms >= the one-row pass's, for any stats / N.
+    #[test]
+    fn never_below_plain() {
+        for n in [0usize, 500, 8191, 8192, 20000, 32768] {
+            for q in [0.0, 0.1, 0.3, 0.5, 0.9, 1.0] {
+                let (p, qs) = plan_27b(n, q);
+                let st = |d: usize| d.saturating_sub(1);
+                let (d, r) = p.best(&qs, SPEC_DEPTH_MAX, &st);
+                assert!(r >= 1.0 / p.t(0, st(0)) - 1e-15, "N {} q {}: d {} rate {} < plain", n, q, d, r);
+                if q == 0.0 { assert_eq!(d, 0); }
+            }
+        }
+    }
+
+    /// Short contexts: the attention term barely moves the plan (same depth as the context-blind planner).
+    #[test]
+    fn short_context_unchanged() {
+        for q in [0.5, 0.7, 0.8, 0.9] {
+            let (p, qs) = plan_27b(200, q);
+            let mut old = Plan::new(SpecCost::default());
+            old.n = 200;
+            let st = |d: usize| d.saturating_sub(1);
+            assert_eq!(p.best(&qs, SPEC_DEPTH_MAX, &st).0, old.best(&qs, SPEC_DEPTH_MAX, &st).0, "q {}", q);
+        }
+    }
 }

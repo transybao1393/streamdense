@@ -33,6 +33,7 @@ pub fn config_main(a: &Args) {
     println!("  model     = {}   ({})", g.model, model);
     println!("  port      = {}", g.port);
     println!("  max_ctx   = {}", g.max_ctx);
+    println!("  kv        = {}   (KV cache format: bf16 | q8 (8-bit, 0.56x KV RAM, exact prompt read); gateway --kv)", g.kv);
     println!("  mtp       = {}", g.mtp);
     println!("  spec_depth = {}   (MTP drafts verified per pass, or auto; gateway --spec-depth)", g.spec_depth.arg());
     println!("  draft_table = {:?}   (learning draft table for spec_depth auto, \"\" = off; gateway --draft-table)", g.draft_table);

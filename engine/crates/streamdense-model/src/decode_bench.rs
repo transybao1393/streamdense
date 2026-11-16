@@ -431,7 +431,7 @@ impl Synth {
                 ("compact down".into(), (h * kc / 2 + 2 * h * (n / 64) * 2) as f64)
             } else if nm.starts_with("dn_recur") {
                 (nm.clone(), 2.0 * (c.dn_vh * c.dn_dv * c.dn_dk * 4) as f64)
-            } else if nm == "attn_sdpa_vec_b16" || nm.starts_with("attn_partial") || nm.starts_with("va_sdpa_p1") {
+            } else if nm == "attn_sdpa_vec_b16" || nm.starts_with("attn_partial") || nm.starts_with("attn_split") || nm.starts_with("va_sdpa_p1") {
                 (nm.clone(), (2 * (self.opt.pos + 1) * c.kv_dim() * 2) as f64)
             } else if nm == "dn_conv" {
                 (nm.clone(), (c.conv_dim() * (2 + 2 * 3 + 4 * 2 + 2)) as f64)

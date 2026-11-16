@@ -108,7 +108,7 @@ impl QwenEngine {
         if ids.is_empty() { return Err("batch_begin: no tokens".into()); }
         let mut s = BatchSeq { slot, n_new, stop: stop.to_vec(), st: StreamStats { stop_reason: "", ..Default::default() },
                                r: SpecResult { depth: d, mode: mode.name(), ..Default::default() }, done: None, batched: 0, chained: 0, mode,
-                               hist: vec![], plan: Plan::new(self.opt.spec_cost.clone()), oracle: Oracle::new(ov), t_dec: Instant::now() };
+                               hist: vec![], plan: self.new_plan(), oracle: Oracle::new(ov), t_dec: Instant::now() };
         if self.pos() + ids.len() > self.opt.max_ctx { s.finish("ctx_full"); return Ok(s); }
         let tp = Instant::now();
         let (t1, hf) = self.prefill_mtp(ids)?;
@@ -180,6 +180,7 @@ impl QwenEngine {
             let auto = matches!(s.mode, SpecMode::Auto { .. });
             if p + 1 + if auto { 0 } else { dmax } > max_ctx { s.finish("ctx_full"); continue; }
             let cap = (if auto { dmax.min(max_ctx.saturating_sub(p + 1)) } else { dmax }).min(budget[bi] - 1);
+            s.plan.n = p;
             let mut w = Work { i, p, cap, drafts: vec![], rows: vec![], qs: vec![], steps: 0, chaining: cap > 0, row0: 0, k: 0, je: 0, why: None };
             if cap > 0 {
                 let d1 = self.ctrl_read().draft;

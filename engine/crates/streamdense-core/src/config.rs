@@ -30,6 +30,9 @@ pub struct Gateway {
     pub model: String,
     pub port: u16,
     pub max_ctx: usize,
+    /// KV cache format (gateway --kv): "bf16" (default) or "q8" (8-bit, 32-dim groups with an fp16 scale / min: 0.5625x
+    /// the bf16 KV bytes, MTP KV included). q8 always takes the exact prompt read (the fast prefill needs bf16 KV).
+    pub kv: String,
     pub mtp: bool,
     /// MTP drafts verified per pass (1 = draft 1 / verify 2; 2..=7 = chained drafts, one exact pass of
     /// spec_depth + 1 rows; "auto" = adaptive 0..=7 per pass; needs mtp)
@@ -57,7 +60,7 @@ pub struct Gateway {
 }
 impl Default for Gateway {
     fn default() -> Self {
-        Gateway { model: "models/qwen38_27b_mlx4".into(), port: 8898, max_ctx: 8192, mtp: true, spec_depth: SpecDepth::N(1), gemv: "mma".into(),
+        Gateway { model: "models/qwen38_27b_mlx4".into(), port: 8898, max_ctx: 8192, kv: "bf16".into(), mtp: true, spec_depth: SpecDepth::N(1), gemv: "mma".into(),
                   draft_vocab: String::new(), draft_table: String::new(), verify_fused: false, drafter: String::new(), dflash2: String::new() }
     }
 }
@@ -339,6 +342,9 @@ pub fn parse_file(path: &Path) -> Result<Config, String> {
     parse_str(&text).map_err(|e| format!("config {}: {}", path.display(), e))
 }
 
+/// `[gateway] kv` values (gateway --kv).
+pub const KV_FORMATS: [&str; 2] = ["bf16", "q8"];
+
 pub fn parse_str(text: &str) -> Result<Config, String> {
     let cfg: Config = toml::from_str(text).map_err(|e| e.to_string().trim_end().to_string())?;
     validate(&cfg)?;
@@ -352,6 +358,7 @@ fn validate(c: &Config) -> Result<(), String> {
     if !(r.margin_gb >= 0.0 && r.margin_gb.is_finite()) { return Err(format!("ram.margin_gb = {}: want >= 0", r.margin_gb)); }
     if !(-20..=20).contains(&r.nice) { return Err(format!("ram.nice = {}: want -20..=20", r.nice)); }
     if c.gateway.max_ctx == 0 { return Err("gateway.max_ctx = 0".into()); }
+    if !KV_FORMATS.contains(&c.gateway.kv.as_str()) { return Err(format!("gateway.kv = {:?}: want \"bf16\" or \"q8\"", c.gateway.kv)); }
     if c.gateway.model.is_empty() { return Err("gateway.model is empty".into()); }
     if let SpecDepth::N(d) = c.gateway.spec_depth {
         if !(1..=7).contains(&d) { return Err(format!("gateway.spec_depth = {}: want 1..=7 or \"auto\"", d)); }
@@ -500,6 +507,18 @@ mod tests {
         assert_eq!((l.library, l.library_cap_gb, l.library_text), (true, 4.0, false));
         assert!(parse_str("[watcher]\nlibrary_text = true\n").unwrap().watcher.library_text);
         assert!(parse_str("[watcher]\nlibrary_cap_gb = 0\n").unwrap_err().contains("library_cap_gb"));
+    }
+    #[test]
+    fn gateway_kv() {
+        assert_eq!(Gateway::default().kv, "bf16");
+        assert_eq!(parse_str("[ram]\ncap_gb = 16\n").unwrap().gateway.kv, "bf16");
+        assert_eq!(parse_str("[gateway]\nkv = \"q8\"\n").unwrap().gateway.kv, "q8");
+        assert_eq!(parse_str("[gateway]\nkv = \"bf16\"\n").unwrap().gateway.kv, "bf16");
+        for bad in ["\"q4\"", "\"Q8\"", "\"\"", "8"] {
+            assert!(parse_str(&format!("[gateway]\nkv = {}\n", bad)).is_err(), "kv = {} accepted", bad);
+        }
+        let t = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../streamdense.toml")).unwrap();
+        assert_eq!(parse_str(&t).unwrap().gateway.kv, "bf16", "the repo file keeps bf16 KV");
     }
     #[test]
     fn forheader_section() {

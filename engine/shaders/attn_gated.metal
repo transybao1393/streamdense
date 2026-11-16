@@ -21,7 +21,8 @@
 //   - attn_sdpa_vec_b16 (bf16 KV, N <= 8192): MLX's sdpa_vector / sdpa_vector_2pass mirrored per query row, bit-exact
 //     vs MLX L = 1 decode (measured). K-invariant because each row's arithmetic depends only on its own N.
 //   - attn_partial + attn_reduce_gate (q8 KV, or N > 8192): fixed 256-key chunks, each with fp32 partials (m, l, o)
-//     and an exact max-then-exp softmax per chunk, combined in chunk order. Not bit-exact vs MLX.
+//     and an exact max-then-exp softmax per chunk, combined in chunk order. Not bit-exact vs MLX. For bf16 KV the
+//     engine runs attn_split_rows instead of attn_partial (same partials bit for bit, cheaper per row).
 //   q/k RMSNorm uses MLX's rms_single_row partition (4 consecutive dims per thread, see attn_prep).
 // Layouts: p bf16 [T][P] with P = nh*2*HD + 2*nkv*HD (q|gate interleaved per head, then k, then v);
 // qr bf16 [T][nh][HD]; KV [nkv][max_ctx][HD] (bf16, or u8 + half2 (scale, min) per 32-dim group [nkv][max_ctx][HD/32]);
@@ -273,6 +274,165 @@ AGP(false, b16, 1) AGP(false, b16, 2) AGP(false, b16, 3) AGP(false, b16, 4) AGP(
 AGP(false, b16, 8)
 AGP(true, q8, 1) AGP(true, q8, 2) AGP(true, q8, 3) AGP(true, q8, 4) AGP(true, q8, 5) AGP(true, q8, 6) AGP(true, q8, 7)
 AGP(true, q8, 8)
+
+#define AG_UNROLL _Pragma("clang loop unroll(full)")
+// ---- attn_split_rows: the bf16 attn_partial of a K-row pass, cheaper per row. BIT-IDENTICAL per row to
+// attn_partial<false, K'> for every K' (so to the one-row pass): the same scores, max, p, chunk sums, written to po / pml
+// in the same layout; attn_reduce_gate is unchanged. (qwen_layers::split_k_kernel picks it; SD_ATTN_SPLIT=old keeps
+// attn_partial.)
+// Why attn_partial costs ~K x per row (27B shapes, 32K keys: K = 8 ~7x K = 1): every score reads the row's scaled q
+// from threadgroup memory (one 4-byte load per FMA; threadgroup bandwidth, not the FMAs, bounds the score loop), each
+// V sweep (2 rows) re-reads and re-converts the values, and q + scores + 4 x 1 KB reduce buffers per threadgroup (21 KB
+// at K = 8) leave one 4-simdgroup threadgroup per core.
+// Here (256 threads = 8 simdgroups per (chunk c, q head h), dispatch (nch, nh) groups x 256):
+// - scores: lane octet (rs = lane / 8) x sub (lane % 8, dims 32 sub .. 32 sub + 31). An octet holds the 32 q dims of
+//   ONE row (t = RP * pass + rs % RP) in registers and walks keys with key slot rs / RP (KO slots); octets of
+//   different rows read the same key bytes in the same step (one coalesced load). Score = the same chain as
+//   attn_partial: dd = fma(q_e, k_e, dd) for e = 0..31 from 0, then the xor butterfly 1, 2, 4. Rows > RP: NP passes
+//   of 8 / NP simdgroups. Keys are converted with float(bfloat) (exact, same value as the bit shift).
+// - m = max over the row's valid keys (order-free), p = fast::exp(s - m) once per (row, key) into the score buffer.
+// - o, l: attn_partial's 16 key streams (sgo = 0..3, rs = 0..3: keys j0 + 4 sgo + rs + 16 i, in order) with 16 dims
+//   per lane: simdgroup sg runs streams (sgo = sg / 2, rs = 2 (sg % 2) + rl), lane = 16 rl + 2 sub + hf holds dims
+//   32 sub + 16 hf + e, TB rows per sweep, l += p; acc_e = fma(p, v_e, acc_e) as there. Combine in attn_partial's
+//   order: Q = r_{2a} + r_{2a+1} (xor 16 here, xor 8 there), S_sgo = Q_{rs 0,1} + Q_{rs 2,3}, o = (((0 + S_0) + S_1) +
+//   S_2) + S_3, l likewise. With TB >= 4 the 4 KB pair-sum buffer reuses the finished sweep's p rows.
+// Masked keys (j >= pos + 1 + t) and empty chunks are skipped as in attn_partial, so K-invariance holds.
+template <uint K, uint RP, uint KO, uint TB>
+kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const uchar* Kc [[buffer(1)]],
+                            device const uchar* Vc [[buffer(2)]], device const half2* Ksb [[buffer(3)]],
+                            device const half2* Vsb [[buffer(4)]], device float4* po [[buffer(5)]],
+                            device float2* pml [[buffer(6)]], device const SdCtrl* ctrl [[buffer(7)]],
+                            constant uint& maxctx [[buffer(8)]], constant uint& grp [[buffer(9)]],
+                            uint2 tg [[threadgroup_position_in_grid]], uint2 ntgs [[threadgroups_per_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+#pragma METAL fp math_mode(safe)
+    const uint HD = AG_HD;
+    static_assert(RP * KO <= 4 && 8 % ((K + RP - 1) / RP) == 0, "attn_split_rows geometry");
+    constexpr uint NP = (K + RP - 1) / RP;                  // score passes (row sets), SGP simdgroups each
+    constexpr uint SGP = 8 / NP;
+    constexpr uint ST = SGP * KO;                           // key stride of a lane octet
+    constexpr bool AL = TB >= 4;                            // pair sums go to the finished sweep's p rows
+    constexpr uint KP = AL ? (K + TB - 1) / TB * TB : K;    // p rows (padded so the last sweep has TB rows)
+    threadgroup float sc[KP][AG_CH];                        // scores, then p = exp(s - m) of the valid keys
+    threadgroup float redm[8][K];                           // per simdgroup row maxima
+    threadgroup float prx[AL ? 1 : 4 * AG_HD];
+    threadgroup float pl[8];
+    uint c = tg.x, h = tg.y, nch = ntgs.x, nh = ntgs.y, kvh = h / grp;
+    uint n0 = ctrl->pos + 1;                                // keys visible to row 0
+    uint nmax = n0 + K - 1;
+    uint j0 = c * AG_CH, j1 = min(j0 + AG_CH, nmax);
+    {
+        uint rs = lane / 8, sub = lane % 8;
+        uint t = (sg / SGP) * RP + rs % RP, ko = rs / RP;
+        bool act = rs < RP * KO && t < K;
+        float q[32];
+        float mloc = -INFINITY;
+        AG_UNROLL for (uint e = 0; e < 32; e++) q[e] = AG_SCALE * bf(qr[(min(t, K - 1) * nh + h) * HD + sub * 32 + e]);
+        device const uint4* kb = (device const uint4*)(Kc + ((kvh * maxctx) * HD + sub * 32) * 2);
+        uint jf = j0 + (sg % SGP) * KO + ko;
+        uint4 kn[4];
+        if (jf < j1) AG_UNROLL for (uint i = 0; i < 4; i++) kn[i] = kb[jf * (HD / 8) + i];
+        for (uint j = jf; j < j1; j += ST) {
+            float kf[32];
+            AG_UNROLL for (uint i = 0; i < 4; i++) {
+                float4 a = float4(as_type<bfloat4>(kn[i].xy)), b = float4(as_type<bfloat4>(kn[i].zw));
+                kf[8 * i] = a.x; kf[8 * i + 1] = a.y; kf[8 * i + 2] = a.z; kf[8 * i + 3] = a.w;
+                kf[8 * i + 4] = b.x; kf[8 * i + 5] = b.y; kf[8 * i + 6] = b.z; kf[8 * i + 7] = b.w;
+            }
+            if (j + ST < j1) AG_UNROLL for (uint i = 0; i < 4; i++) kn[i] = kb[(j + ST) * (HD / 8) + i];
+            float dd = 0;
+            AG_UNROLL for (uint e = 0; e < 32; e++) dd = fma(q[e], kf[e], dd);
+            dd += simd_shuffle_xor(dd, 1); dd += simd_shuffle_xor(dd, 2); dd += simd_shuffle_xor(dd, 4);
+            if (act && j < n0 + t) {
+                mloc = max(mloc, dd);
+                if (sub == 0) sc[t][j - j0] = dd;
+            }
+        }
+        // octets of the same row in this simdgroup: rs, rs + RP, ... (key slots)
+        AG_UNROLL for (uint o = RP; o < RP * KO; o *= 2) mloc = max(mloc, simd_shuffle_xor(mloc, (ushort)(8 * o)));
+        if (sub == 0 && rs < RP && t < K) redm[sg][t] = mloc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < K * AG_CH; i += 256) {
+        uint t = i / AG_CH, jj = i % AG_CH;
+        if (j0 + jj < n0 + t) {
+            float m = -INFINITY;
+            AG_UNROLL for (uint s2 = 0; s2 < SGP; s2++) m = max(m, redm[(t / RP) * SGP + s2][t]);
+            sc[t][jj] = fast::exp(sc[t][jj] - m);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint rl = lane / 16, sub = (lane / 2) % 8, hf = lane % 2;
+    uint jv = j0 + 4 * (sg / 2) + 2 * (sg % 2) + rl;
+    uint dof = 32 * sub + 16 * hf;
+    device const uint4* vb = (device const uint4*)(Vc + ((kvh * maxctx) * HD + dof) * 2);
+    for (uint tb = 0; tb < K; tb += TB) {
+        float acc[TB][16], l[TB];
+        AG_UNROLL for (uint u = 0; u < TB; u++) { l[u] = 0; AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = 0; }
+        uint4 vn[2];
+        if (jv < j1) { vn[0] = vb[jv * (HD / 8)]; vn[1] = vb[jv * (HD / 8) + 1]; }
+        for (uint j = jv; j < j1; j += 16) {
+            float vf[16];
+            AG_UNROLL for (uint i = 0; i < 2; i++) {
+                float4 a = float4(as_type<bfloat4>(vn[i].xy)), b = float4(as_type<bfloat4>(vn[i].zw));
+                vf[8 * i] = a.x; vf[8 * i + 1] = a.y; vf[8 * i + 2] = a.z; vf[8 * i + 3] = a.w;
+                vf[8 * i + 4] = b.x; vf[8 * i + 5] = b.y; vf[8 * i + 6] = b.z; vf[8 * i + 7] = b.w;
+            }
+            if (j + 16 < j1) { vn[0] = vb[(j + 16) * (HD / 8)]; vn[1] = vb[(j + 16) * (HD / 8) + 1]; }
+            if (j < n0) {                                   // key visible to every row
+                AG_UNROLL for (uint u = 0; u < TB; u++) {
+                    if (tb + u < K) {
+                        float pe = sc[tb + u][j - j0];
+                        l[u] += pe;
+                        AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = fma(pe, vf[e], acc[u][e]);
+                    }
+                }
+            } else {
+                AG_UNROLL for (uint u = 0; u < TB; u++) {
+                    uint t = tb + u;
+                    if (t < K && j < n0 + t) {
+                        float pe = sc[t][j - j0];
+                        l[u] += pe;
+                        AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = fma(pe, vf[e], acc[u][e]);
+                    }
+                }
+            }
+        }
+        threadgroup float* pr = AL ? &sc[tb][0] : &prx[0];
+        if (AL) threadgroup_barrier(mem_flags::mem_threadgroup);   // every simdgroup done reading these p rows
+        AG_UNROLL for (uint u = 0; u < TB; u++) {
+            uint t = tb + u;
+            if (t >= K) break;                              // uniform
+            AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] += simd_shuffle_xor(acc[u][e], 16);
+            l[u] += simd_shuffle_xor(l[u], 16);
+            // S_sgo = Q_{sg = 2 sgo} + Q_{sg = 2 sgo + 1}; pr[sgo] = Q of the odd simdgroup, then S
+            if (rl == 0 && sg % 2 == 1) AG_UNROLL for (uint e = 0; e < 16; e++) pr[(sg / 2) * AG_HD + dof + e] = acc[u][e];
+            if (lane == 0) pl[sg] = l[u];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (rl == 0 && sg % 2 == 0)
+                AG_UNROLL for (uint e = 0; e < 16; e++) pr[(sg / 2) * AG_HD + dof + e] = acc[u][e] + pr[(sg / 2) * AG_HD + dof + e];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint slot = (t * nh + h) * nch + c;
+            if (tid < HD / 4) {
+                float4 o = 0;
+                AG_UNROLL for (uint s2 = 0; s2 < 4; s2++) o += ((threadgroup float4*)(pr + s2 * AG_HD))[tid];
+                po[slot * (HD / 4) + tid] = o;
+            }
+            if (tid == 0) {
+                float m = -INFINITY;
+                AG_UNROLL for (uint s2 = 0; s2 < SGP; s2++) m = max(m, redm[(t / RP) * SGP + s2][t]);
+                pml[slot] = float2(m, (((pl[0] + pl[1]) + (pl[2] + pl[3])) + (pl[4] + pl[5])) + (pl[6] + pl[7]));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+// (K, RP, KO, TB) per K: measured best of the valid geometries at 32K keys (verify_bench --attn-pass)
+#define ASR(K_, RP_, KO_, TB_) template [[host_name("attn_split_k" #K_)]] kernel void attn_split_rows<K_, RP_, KO_, TB_>( \
+    device const ushort*, device const uchar*, device const uchar*, device const half2*, device const half2*, \
+    device float4*, device float2*, device const SdCtrl*, constant uint&, constant uint&, uint2, uint2, uint, uint, uint);
+ASR(1, 1, 4, 1) ASR(2, 2, 2, 2) ASR(3, 4, 1, 3) ASR(4, 4, 1, 4) ASR(5, 4, 1, 3) ASR(6, 4, 1, 3) ASR(7, 4, 1, 2) ASR(8, 4, 1, 2)
 
 // ---- attn_reduce_gate: threadgroup (q head h, token t), 64 threads x float4 (HD = 256).
 // Combine the chunks (skipping empty ones, l = 0): M = max m, w = fast::exp(m - M), L = sum w l, o = sum w o

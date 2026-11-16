@@ -31,6 +31,12 @@ decode is then on, `--no-mtp-decode` turns it off), `--think` (honor the client'
 for speed), `--log FILE` (request log, else stderr), `--tokenizer DIR`, `--name qwen38-27b` (model id reported),
 engine options as in `qwen serve` (`--cap`, `--reserve`, `--kv`, `--prefill-k`, `--prefill-t`, `--prefill-exact`,
 `--threads`).
+`--kv bf16|q8` (or `[gateway] kv`, default `bf16`): KV cache format. `q8` = 8-bit KV (32-dim groups, fp16 scale + min),
+0.5625x the bf16 KV and MTP KV bytes (27B at 32K: KV 1.21 GB instead of 2.15 GB), counted in the budget / `--plan`.
+q8 always takes the exact prompt read (the fast prefill needs bf16 KV), so long prompts read slower; MTP output equals
+plain decode with the same q8 KV, but q8 output is not the bf16 output (27B, 128 greedy tokens: identical to bf16 on
+4 short prompts; at a 12K prompt the first difference was at token 94, at a bf16 top-2 margin of 0.09).
+Snapshots carry the KV format in their key (a bf16 snapshot never restores into a q8 engine).
 Snapshots (on by default, see "Snapshots" below): `--no-snapshots`, `--snapshot-dir DIR` (default
 `~/Library/Caches/streamdense/snapshots`, or `$SD_SNAPSHOT_DIR`), `--snapshot-max-files N`, `--snapshot-max-gb GB` (defaults from `[snapshots]`: 32 files, 8 GB; see "Snapshot tiers").
 Watcher state (see "Domain watcher"): `--watcher-dir DIR` or `$SD_WATCHER_DIR` (default `[watcher] dir`); test and smoke runs
@@ -49,7 +55,7 @@ swap_gb   = 7      # stop when system swap grows by more than this since start (
 margin_gb = 0      # sd-watchdog margin
 nice      = 10
 [gateway]
-model = "models/qwen38_27b_mlx4"   # port = 8898, max_ctx = 8192, mtp = true
+model = "models/qwen38_27b_mlx4"   # port = 8898, max_ctx = 8192, kv = "bf16", mtp = true
 ```
 
 Edit the file, then restart with `streamdense up` (extra args go to the gateway and win over the file, e.g.
