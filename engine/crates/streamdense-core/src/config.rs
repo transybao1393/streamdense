@@ -31,7 +31,7 @@ pub struct Gateway {
     pub port: u16,
     pub max_ctx: usize,
     /// KV cache format (gateway --kv): "bf16" (default) or "q8" (8-bit, 32-dim groups with an fp16 scale / min: 0.5625x
-    /// the bf16 KV bytes, MTP KV included). q8 always takes the exact prompt read (the fast prefill needs bf16 KV).
+    /// the bf16 KV bytes, MTP KV included). q8 takes the fast prompt read as bf16 does (not the 12 GB mode's streamed one).
     pub kv: String,
     pub mtp: bool,
     /// MTP drafts verified per pass (1 = draft 1 / verify 2; 2..=7 = chained drafts, one exact pass of

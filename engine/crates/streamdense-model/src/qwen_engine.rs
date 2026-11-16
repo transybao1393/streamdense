@@ -317,6 +317,7 @@ fn layout(cfg: &QwenConfig, opt: &QwenOptions) -> Result<Layout, String> {
         scratch.extend([("vf_xt".to_string(), xt), ("vf_st".to_string(), st)]);
     }
     if opt.verify_mixers && opt.kv == KvFormat::Bf16 { scratch.push(("va".to_string(), crate::qwen_layers::va_scratch_bytes(cfg, 8))); }
+    if !opt.verify_mixers && opt.kv == KvFormat::Bf16 { scratch.push(("va1".to_string(), crate::qwen_layers::va_scratch_bytes(cfg, 1))); }
     let n = cfg.kv_heads * opt.max_ctx * cfg.head_dim;
     let (kv_vals, kv_sb) = match opt.kv {
         KvFormat::Bf16 => (n * 2, 0),
@@ -687,6 +688,7 @@ impl QwenEngine {
             cfs: 0, vf: if opt.verify_fused { Some((o("vf_xt"), o("vf_st"))) } else { None },
             fxcap: if opt.ffn_x_capture { Some(o("fxcap")) } else { None },
             vm: if opt.verify_mixers { Some(if opt.kv == KvFormat::Bf16 { o("va") } else { crate::qwen_layers::VM_NO_ATTN }) } else { None },
+            va1: if !opt.verify_mixers && opt.kv == KvFormat::Bf16 { Some(o("va1")) } else { None },
             ban: None,
         };
         let mut io = io;
@@ -730,6 +732,7 @@ impl QwenEngine {
         if ctx_hold.is_some() { for n in ["dn_save_all", "dn_recur_hold"] { gpu.pipeline(n)?; } }
         if opt.verify_fused { for n in crate::qwen_layers::vf_engine_pipelines() { gpu.pipeline(&n)?; } }
         if opt.verify_mixers { for n in crate::qwen_layers::vm_pipelines() { gpu.pipeline(&n)?; } }
+        if !opt.verify_mixers && opt.kv == KvFormat::Bf16 { for n in ["va_sdpa_p1_r1", "va_sdpa_p2", "va_sdpa_p3"] { gpu.pipeline(n)?; } }
         if act.is_some() { for n in crate::activity::pipelines() { gpu.pipeline(n)?; } }
         let rm = if opt.read_mask {
             let r = arena.alloc("s:readmask", lay.rm_bytes)?;
@@ -1018,9 +1021,9 @@ impl QwenEngine {
         Ok(())
     }
 
-    /// Fast prefill (plan U25) is used for passes of > 8 rows unless `opt.prefill_exact`; it needs bf16 KV and is
+    /// Fast prefill (plan U25) is used for passes of > 8 rows unless `opt.prefill_exact` (bf16 and q8 KV alike); it is
     /// off in dump mode (dumps are stepwise).
-    pub fn fast_prefill(&self) -> bool { !self.opt.prefill_exact && (self.opt.kv == KvFormat::Bf16 || self.pf_on.get()) && self.dumper.is_none() }
+    pub fn fast_prefill(&self) -> bool { !self.opt.prefill_exact && self.dumper.is_none() }
 
     /// the KV refs of the main layers for the next pass (bf16 views while a converting prefill runs).
     pub(crate) fn kv_at(&self, l: usize) -> Option<&KvRef> {

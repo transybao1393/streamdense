@@ -49,15 +49,29 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   on their own (no model, 0.26 GB): verify passes of 1–8 rows are bit-identical to one-row passes at 221 positions up
   to 32,768 keys, including the split-K chunk edges (`verify_attn_long_bit_identical` in `verify_bench.rs`).
 
-  Decode speed by context (128 tokens, timed without the checks; 2026-11-16, machine shared with other work):
+  Decode speed by context (128 greedy tokens, timed without the checks; MTP output identical to plain in every run):
 
-  | Context | Plain | MTP auto | MTP acceptance | Peak RAM | Prompt reading |
-  |---|---|---|---|---|---|
-  | ~12,200 | 11.97 tok/s | 13.13 tok/s | 0.34 | 16.14 GB | ~79 tok/s |
-  | ~32,560 | 10.33 tok/s | 9.94 tok/s | 0.37 | 17.55 GB | ~72 tok/s |
+  | Context | KV | Plain | MTP auto | Peak RAM |
+  |---|---|---|---|---|
+  | ~12,200 | bf16 | 12.86 tok/s | 16.48 tok/s | 16.13 GB |
+  | ~12,200 | 8-bit | 12.75 tok/s | 15.77 tok/s | 15.75 GB |
+  | ~32,560 | bf16 | 10.94 tok/s | 13.98 tok/s | 17.56 GB |
+  | ~32,560 | 8-bit | 11.30 tok/s | **14.82 tok/s** | **16.57 GB** |
+  | Before: ~12,200 / ~32,560 | bf16 | 11.97 / 10.33 tok/s | 13.13 / 9.94 tok/s | 16.14 / 17.55 GB |
 
-  At 32K, MTP is no faster than plain decode on this task: each verify row reads the whole context in attention,
-  and too few drafts are accepted to pay for that. 32K needs a RAM cap of about 18 GB (KV 2.15 GB + MTP KV 0.13 GB).
+  The bf16 rows and the 12K 8-bit row were measured before the faster one-row attention below; the 32K 8-bit row
+  includes everything.
+
+  What changed: MTP auto depth now counts the attention cost of each verify row at long context, so MTP is faster
+  than plain at 32K too (it was slower before); verify attention above 8,192 keys uses a faster split-K kernel (bf16
+  and 8-bit KV); one-row decode attention shares key reads across the query heads of a KV head (21–31% faster from
+  4K to 32K keys, bit-identical); and 8-bit KV is optional (`[gateway] kv = "q8"`, default bf16), saving about 1 GB
+  at 32K. The fast prompt read now writes and reads 8-bit KV directly, so the 32K prompt reads in 453 s with 8-bit KV
+  (950 s before, ~450 s with bf16). 32K with bf16 KV needs a RAM cap of about 18 GB.
+
+  DFlash2 (optional drafter, off by default) at long context, output identical to plain: 15.17 tok/s at ~12,200
+  (bf16 KV, plain 12.65, peak 16.66 GB) and 11.09 tok/s at ~32,560 (8-bit KV, plain 11.81, peak 17.06 GB). Its
+  drafter sees only the last 2,048 positions, so acceptance drops to 0.24–0.29; MTP stays the default.
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code
   session start in 0.4–1.5 s, and a new session that restores a snapshot of the shared system prompt starts in 0.66 s.
 - Decode is memory-bandwidth bound: a full-model pass reads about 15 GB of weights, two thirds of it FFN.

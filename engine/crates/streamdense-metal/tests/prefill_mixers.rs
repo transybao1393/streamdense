@@ -10,6 +10,8 @@
 //!   q std x 2.5) on rows with N < 1024 (the mirror's single-pass path). Rows with N >= 1024 use MLX's 2-pass mirror,
 //!   which is itself less accurate (flash is the closer one to f64 there), so they are printed only. Plus an f64
 //!   reference on rows 0, T/2, T-1 (all heads): flash <= 2 ulp. Always finite, no writes past T rows.
+//! - `attn_flash_q8` vs `attn_flash_b16` on KV whose q8 dequantization (scale 2^-e, min -128 * scale) is exact in bf16
+//!   and fp16, with the bf16 KV holding those values: outputs bit-identical (only the tile loads differ).
 //! Run: cargo test --release --offline -p streamdense-metal --test prefill_mixers -- --nocapture --test-threads 1
 mod b_util;
 use b_util::*;
@@ -202,4 +204,58 @@ fn attn_flash_vs_sdpa_mirror() {
     }
     println!("attn_flash_b16 vs attn_sdpa_vec_b16: worst {} ulp (normal) / {} ulp (sharp) on N < 1024 rows, {} ulp on N >= 1024 rows (MLX 2-pass mirror), max abs {:.1e}, {:.3}% of {} outputs differ; vs f64: flash worst {} ulp, mirror worst {} ulp",
              worst_n, worst_s, worst_2p, absmax, 100.0 * nd as f64 / ntot as f64, ntot, worst_f, worst_m);
+}
+
+/// attn_flash_q8 == attn_flash_b16 bit for bit when the q8 groups dequantize exactly to the bf16 KV values
+/// (scale = 2^-e, e in 5..=7, min = -128 * scale: x = (code - 128) * scale has <= 8 significant bits).
+#[test]
+fn attn_flash_q8_vs_b16_exact_values() {
+    let mut gpu = Gpu::from_shader_files(&["common_bf16", "attn_gated"]).unwrap();
+    for k in ["attn_flash_b16", "attn_flash_q8"] { gpu.pipeline(k).unwrap(); }
+    let (maxctx, tmax) = (1280usize, 131usize);
+    let mut cases = 0;
+    for (nh, nkv) in [(4usize, 2usize), (24, 4)] {
+        let prow = nh * 2 * HD + 2 * nkv * HD;
+        let nkvv = nkv * maxctx * HD;
+        let ng = nkvv / 32;
+        let mut ar = Ar::new(&gpu, tmax * prow * 2 + tmax * nh * HD * 4 + nkvv * 6 + ng * 8 + (1 << 20));
+        let b = AB { nh, nkv, maxctx, prow, qr: ar.alloc(tmax * nh * HD * 2), kc: ar.alloc(nkvv * 2), vc: ar.alloc(nkvv * 2),
+                     p: ar.alloc(tmax * prow * 2), ao: ar.alloc(tmax * nh * HD * 2), ctrl: ar.alloc(256) };
+        let (k8, v8, ks, vs) = (ar.alloc(nkvv), ar.alloc(nkvv), ar.alloc(ng * 4), ar.alloc(ng * 4));
+        let mut r = Rng::new(nh as u64 * 11);
+        for (c8, cbf, sb) in [(k8, b.kc, ks), (v8, b.vc, vs)] {
+            let codes: Vec<u8> = (0..nkvv).map(|_| (r.u64() & 255) as u8).collect();
+            let es: Vec<i32> = (0..ng).map(|_| 5 + (r.u64() % 3) as i32).collect();
+            // fp16 bits: 2^-e and -2^(7 - e) (normal, exact)
+            let sbv: Vec<u16> = es.iter().flat_map(|&e| [((15 - e) << 10) as u16, 0x8000 | ((22 - e) << 10) as u16]).collect();
+            let vals: Vec<u16> = (0..nkvv).map(|i| to_bf((codes[i] as f32 - 128.0) * 2f32.powi(-es[i / 32]))).collect();
+            ar.put(c8, &codes); ar.put(cbf, &vals); ar.put(sb, &sbv);
+        }
+        ar.put(b.p, &r.bf_n(tmax * prow, 1.5));
+        ar.put(b.qr, &r.bf_n(tmax * nh * HD, 0.5));
+        let grp = nh / nkv;
+        for pos in [0usize, 5, 1000] {
+            for t in [1usize, 8, 17, 131] {
+                ar.put(b.ctrl, &[SdCtrl { pos: pos as u32, ..Default::default() }]);
+                let n = t * nh * HD;
+                ar.fill(b.ao, tmax * nh * HD * 2, 0xff);
+                run(&gpu, &ar, |e| flash(e, &b, t));
+                let refo: Vec<u16> = ar.get(b.ao, n);
+                ar.fill(b.ao, tmax * nh * HD * 2, 0xff);
+                run(&gpu, &ar, |e| {
+                    e.pso("attn_flash_q8").b(0, b.qr).b(1, k8).b(2, v8).b(3, b.p).b(4, b.ao).b(5, b.ctrl)
+                        .u(6, maxctx as u32).u(7, grp as u32).u(8, prow as u32).u(9, t as u32).b(10, ks).b(11, vs)
+                        .groups((t.div_ceil(8), nkv), 32 * grp);
+                });
+                let q8o: Vec<u16> = ar.get(b.ao, n);
+                let past: Vec<u16> = ar.get(b.ao + n * 2, (tmax - t) * nh * HD);
+                let d = (0..n).filter(|&i| q8o[i] != refo[i]).count();
+                let fin = q8o.iter().all(|&x| bf(x).is_finite());
+                if d > 0 || !fin { println!("  attn_flash_q8 nh {:2}/{} pos {:4} T {:3}: {} of {} outputs differ, finite {}", nh, nkv, pos, t, d, n, fin); }
+                assert!(d == 0 && fin && past.iter().all(|&x| x == 0xffff), "attn_flash_q8 != attn_flash_b16 (nh {} pos {} T {})", nh, pos, t);
+                cases += 1;
+            }
+        }
+    }
+    println!("attn_flash_q8 vs attn_flash_b16 (exactly representable KV): {} cases, all bit-identical", cases);
 }

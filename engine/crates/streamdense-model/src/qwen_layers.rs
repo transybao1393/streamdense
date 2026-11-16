@@ -116,6 +116,10 @@ pub struct PassIo {
     /// run dn_recur_v, and (sc = arena offset of `va_scratch_bytes(cfg, 8)`, VM_NO_ATTN = none: q8 KV) bf16-KV sdpa rows of
     /// passes of <= 8 rows run va_sdpa_p1/p3/p2 instead of attn_sdpa_vec_b16. Bit-identical per row. None = today.
     pub vm: Option<usize>,
+    /// one-row passes without `vm`: arena offset of `va_scratch_bytes(cfg, 1)` (bf16 KV). Some: K = 1 sdpa rows with
+    /// N <= lim run va_sdpa (R = 1) instead of attn_sdpa_vec_b16 (bit-identical per row; 27B shapes, one layer: 4096
+    /// keys 173 -> 120 µs, 8000 343 -> 210). None = attn_sdpa_vec_b16.
+    pub va1: Option<usize>,
     /// banned ids (gateway `format: plan`): arena offset of u32 [n, id0 .. id30]; Some (n > 0): `ban_logits` sets those
     /// logits to -inf before every head argmax (decode, MTP / deep / DFlash / context-draft verify). None = today.
     pub ban: Option<usize>,
@@ -185,6 +189,7 @@ pub fn qwen_pipelines() -> Vec<&'static str> {
     for k in KS {
         v.extend_from_slice(&[gemv_name(k, 0), gemv_name(k, 2), gemv_name(k, 3), swiglu_name(k)]);
         v.extend_from_slice(&[partial_name(k, false), partial_name(k, true), split_name(k, false), split_name(k, true)]);
+        v.extend([false, true].iter().filter_map(|&q8| split_gqa(k, q8).map(|x| x.0)));
     }
     v.extend(mma_pipelines());
     v.extend_from_slice(&[
@@ -315,10 +320,26 @@ fn split_old() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("SD_ATTN_SPLIT").is_ok_and(|v| v.trim() == "old"))
 }
-/// Split-K partial kernel of a `k`-row pass and its threads per threadgroup (dispatch (nch, nh) groups either way):
-/// `attn_split_k{k}[_q8]`, or `attn_partial_k{k}_{b16,q8}` with SD_ATTN_SPLIT=old.
-pub(crate) fn split_k_kernel(k: usize, q8: bool) -> (&'static str, usize) {
-    if split_old() { (partial_name(k, q8), 128) } else { (split_name(k, q8), 256) }
+/// GQA split-K variant of a `k`-row pass (attn_gated.metal `attn_split_rows` with G > 1): (kernel, G q heads per
+/// threadgroup, dispatch (nch, nh / G)); G divides the q heads per kv head. Same numbers as `split_name(k, q8)`, cheaper
+/// (27B shapes, 32K keys + reduce: K = 1 bf16 0.75x, q8 0.77x; K = 2 bf16 0.75x).
+pub(crate) fn split_gqa(k: usize, q8: bool) -> Option<(&'static str, usize)> {
+    match (k, q8) {
+        (1, false) => Some(("attn_split_k1_g3", 3)),
+        (1, true) => Some(("attn_split_k1_g2_q8", 2)),
+        (2, false) => Some(("attn_split_k2_g2", 2)),
+        _ => None,
+    }
+}
+/// Split-K partial kernel of a `k`-row pass, its threads per threadgroup and q heads per threadgroup G (dispatch
+/// (nch, nh / G) groups): `split_gqa` when G divides `grp` (q heads per kv head), else `attn_split_k{k}[_q8]` (G = 1),
+/// or `attn_partial_k{k}_{b16,q8}` (G = 1) with SD_ATTN_SPLIT=old.
+pub(crate) fn split_k_kernel(k: usize, q8: bool, grp: usize) -> (&'static str, usize, usize) {
+    if split_old() { return (partial_name(k, q8), 128, 1); }
+    match split_gqa(k, q8) {
+        Some((n, g)) if grp % g == 0 => (n, 256, g),
+        _ => (split_name(k, q8), 256, 1),
+    }
 }
 
 /// Bench only (decode_bench --verify K > 8): widest exact pass row count the encoders accept. 8 = the engine
@@ -934,13 +955,13 @@ pub(crate) fn attn_sdpa_rows(e: &Enc, kv: &KvRef, b: &VaBufs, po: usize, pml: us
     let lim = if kv.q8 { 0 } else { sdpa_vec_max_n().min(8192) }; // 8192: the kernel's blocks <= 128 bound
     let (n_lo, n_hi) = (pos + 1, pos + k);
     if n_hi > lim {
-        let (pn, nt) = split_k_kernel(k, kv.q8);
+        let (pn, nt, g) = split_k_kernel(k, kv.q8, nh / nkv);
         e.pso(pn)
             .b(0, b.qr).b(1, kv.k).b(2, kv.v).b(3, kv.ksb).b(4, kv.vsb).b(5, po).b(6, pml).b(7, b.ctrl)
             .u(8, kv.max_ctx as u32).u(9, (nh / nkv) as u32)
-            .groups((nch, nh), nt);
+            .groups((nch, nh / g), nt);
         e.pso("attn_reduce_gate").b(0, po).b(1, pml).b(2, b.p).b(3, b.ao).u(4, nch as u32).u(5, prow as u32)
-            .groups((nh, k), hdim / 4);
+            .groups((nh, k), hdim);
     }
     if let (true, Some(sc)) = (n_lo <= lim && !kv.q8 && k <= 8, vm.filter(|&o| o != VM_NO_ATTN)) {
         va_sdpa_enc(e, b, sc, va_r(k), k, nh, nkv, hdim, kv.max_ctx, prow, lim, sdpa_two_pass_min());
@@ -970,8 +991,9 @@ fn encode_attn_mix(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io: &PassI
         .groups((nh + nkv, k), hdim);
     // qr lives in the cv scratch (bf16 [k][nh][hd]; DeltaNet and attention never share a layer)
     cap(dump, e, format!("L{}.attn.q", l), io.cv, DType::BF16, &[k, nh, hdim])?;
+    let vm = io.vm.or(io.va1.filter(|_| k == 1));
     attn_sdpa_rows(e, kv, &VaBufs { qr: io.cv, k: kv.k, v: kv.v, p: io.p, ao: io.ao, ctrl: io.ctrl }, io.po, io.pml, io.pos, k, nch,
-                   nh, nkv, hdim, prow, io.vm);
+                   nh, nkv, hdim, prow, vm);
     cap(dump, e, format!("L{}.attn.o", l), io.ao, DType::BF16, &[k, cfg.q_dim()])?;
     Ok(())
 }
@@ -989,10 +1011,11 @@ pub const PREFILL_T_MAX: usize = 256;
 /// T = 8 mirror 266 us vs flash 567; T = 16 530 vs 575; T = 32 1129 vs 578.
 pub const PREFILL_FLASH_MIN_T: usize = 17;
 
-/// Kernels the prefill mixers use (build these pipelines before encoding; all but `dn_conv_pf` and `attn_flash_b16`
+/// Kernels the prefill mixers use (build these pipelines before encoding; all but `dn_conv_pf` and `attn_flash_*`
 /// are shared with `qwen_pipelines`).
 pub fn prefill_pipelines() -> Vec<&'static str> {
-    vec!["dn_conv_pf", "dn_prep", "dn_recur_ck0", "rmsnorm_gated", "attn_prep_b16", "attn_flash_b16", "attn_sdpa_vec_b16"]
+    vec!["dn_conv_pf", "dn_prep", "dn_recur_ck0", "rmsnorm_gated", "attn_prep_b16", "attn_prep_q8", "attn_flash_b16", "attn_flash_q8",
+         "attn_sdpa_vec_b16"]
 }
 
 fn check_prefill_t(t: usize) -> Result<(), String> {
@@ -1029,28 +1052,29 @@ pub fn encode_dn_prefill(e: &Enc, cfg: &QwenConfig, dw: &DnW, st: &DnState, io: 
     Ok(())
 }
 
-/// Gated attention mixer for the T = io.k rows of a prefill pass (bf16 KV only). Reads io.p (in_proj output, bf16
+/// Gated attention mixer for the T = io.k rows of a prefill pass. Reads io.p (in_proj output, bf16
 /// [T][attn_in_rows]); attn_prep_b16 writes qr into io.cv and K/V rows ctrl.pos .. ctrl.pos + T - 1 into the cache;
 /// then io.ao (bf16 [T][q_dim], gated; the o_proj input) comes from attn_flash_b16 (T >= PREFILL_FLASH_MIN_T; not
 /// bit-exact vs the per-row mirror: flash summation order, max abs diff ~5e-4 on random data) or from the bit-exact
 /// per-row mirror attn_sdpa_vec_b16 (small T, all rows' N = io.pos + t + 1 <= sdpa_vec_max_n()). Causal: row t sees
 /// keys 0 ..= pos + t. io.pos must be the host copy of ctrl.pos (as encode_attn).
+/// 8-bit KV (kv.q8): attn_prep_q8 (the decode path's KV writer: the same K / V values give the same q8 bytes and
+/// scale / min) and attn_flash_q8 (dequantizes the staged tiles to fp16) for every T (no per-row mirror for q8).
 pub fn encode_attn_prefill(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io: &PassIo) -> Result<(), String> {
     let t = io.k;
     check_prefill_t(t)?;
-    if kv.q8 { return Err("qwen_layers: prefill attention supports bf16 KV only".into()); }
     let (nh, nkv, hdim) = (cfg.heads, cfg.kv_heads, cfg.head_dim);
     let grp = nh / nkv;
     if grp * 32 > 1024 { return Err(format!("qwen_layers: attn_flash_b16 needs heads / kv_heads <= 32 (got {})", grp)); }
     if kv.k % 16 != 0 || kv.v % 16 != 0 { return Err("qwen_layers: attn_flash_b16 needs 16-byte aligned KV".into()); }
     let prow = cfg.attn_in_rows();
-    e.pso("attn_prep_b16")
+    e.pso(if kv.q8 { "attn_prep_q8" } else { "attn_prep_b16" })
         .b(0, io.p).b(1, aw.q_norm.off).b(2, aw.k_norm.off).b(3, io.cv)
         .b(4, kv.k).b(5, kv.v).b(6, kv.ksb).b(7, kv.vsb).b(8, io.invf).b(9, io.ctrl)
         .u(10, kv.max_ctx as u32).f(11, cfg.eps).u(12, nkv as u32).u(13, cfg.rope_dims as u32)
         .groups((nh + nkv, t), hdim);
     let lim = sdpa_vec_max_n().min(8192);
-    if t < PREFILL_FLASH_MIN_T && io.pos + t <= lim {
+    if !kv.q8 && t < PREFILL_FLASH_MIN_T && io.pos + t <= lim {
         e.pso("attn_sdpa_vec_b16")
             .b(0, io.cv).b(1, kv.k).b(2, kv.v).b(3, io.p).b(4, io.ao).b(5, io.ctrl)
             .u(6, kv.max_ctx as u32).u(7, grp as u32).u(8, prow as u32).u(9, lim as u32)
@@ -1058,9 +1082,9 @@ pub fn encode_attn_prefill(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io
             .groups((nh, t), 1024);
         return Ok(());
     }
-    e.pso("attn_flash_b16")
+    e.pso(if kv.q8 { "attn_flash_q8" } else { "attn_flash_b16" })
         .b(0, io.cv).b(1, kv.k).b(2, kv.v).b(3, io.p).b(4, io.ao).b(5, io.ctrl)
-        .u(6, kv.max_ctx as u32).u(7, grp as u32).u(8, prow as u32).u(9, t as u32)
+        .u(6, kv.max_ctx as u32).u(7, grp as u32).u(8, prow as u32).u(9, t as u32).b(10, kv.ksb).b(11, kv.vsb)
         .groups((t.div_ceil(8), nkv), 32 * grp);
     Ok(())
 }
@@ -1099,7 +1123,7 @@ fn gemm(e: &Enc, m: &Q4b, t: usize, mode: u32, x: usize, out: usize) {
 }
 
 /// One decoder layer for the T = io.k rows of a fast prefill pass (1..=PREFILL_T_MAX rows; used for T > 8).
-/// Plain mode only: no checkpoint, no dumps, bf16 KV. Same buffers as encode_layer.
+/// Plain mode only: no checkpoint, no dumps; bf16 or q8 KV. Same buffers as encode_layer.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_layer_prefill(e: &Enc, cfg: &QwenConfig, lw: &LayerW, st: Option<&DnState>, kv: Option<&KvRef>, io: &PassIo,
                             l: usize) -> Result<(), String> {
@@ -1247,13 +1271,13 @@ pub fn bench_encode_layer_batch(e: &Enc, cfg: &QwenConfig, lw: &LayerW, seqs: &[
                 let lim = if kv.q8 { 0 } else { sdpa_vec_max_n().min(8192) };
                 let (n_lo, n_hi) = (io.pos + 1, io.pos + r);
                 if n_hi > lim {
-                    let (pn, nt) = split_k_kernel(r, kv.q8);
+                    let (pn, nt, g) = split_k_kernel(r, kv.q8, nh / nkv);
                     e.pso(pn)
                         .b(0, qr).b(1, kv.k).b(2, kv.v).b(3, kv.ksb).b(4, kv.vsb).b(5, io.po).b(6, io.pml).b(7, sq.ctrl)
                         .u(8, kv.max_ctx as u32).u(9, (nh / nkv) as u32)
-                        .groups((nch, nh), nt);
+                        .groups((nch, nh / g), nt);
                     e.pso("attn_reduce_gate").b(0, io.po).b(1, io.pml).b(2, p).b(3, ao).u(4, nch as u32).u(5, prow as u32)
-                        .groups((nh, r), hdim / 4);
+                        .groups((nh, r), hdim);
                 }
                 if n_lo <= lim {
                     e.pso("attn_sdpa_vec_b16")

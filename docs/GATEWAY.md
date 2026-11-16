@@ -33,7 +33,8 @@ engine options as in `qwen serve` (`--cap`, `--reserve`, `--kv`, `--prefill-k`, 
 `--threads`).
 `--kv bf16|q8` (or `[gateway] kv`, default `bf16`): KV cache format. `q8` = 8-bit KV (32-dim groups, fp16 scale + min),
 0.5625x the bf16 KV and MTP KV bytes (27B at 32K: KV 1.21 GB instead of 2.15 GB), counted in the budget / `--plan`.
-q8 always takes the exact prompt read (the fast prefill needs bf16 KV), so long prompts read slower; MTP output equals
+q8 takes the fast prompt read too (unless `--prefill-exact`; its attention reads the q8 KV directly, no bf16 KV copy;
+the 12 GB mode's streamed read stays exact under q8); MTP output equals
 plain decode with the same q8 KV, but q8 output is not the bf16 output (27B, 128 greedy tokens: identical to bf16 on
 4 short prompts; at a 12K prompt the first difference was at token 94, at a bf16 top-2 margin of 0.09).
 Snapshots carry the KV format in their key (a bf16 snapshot never restores into a q8 engine).

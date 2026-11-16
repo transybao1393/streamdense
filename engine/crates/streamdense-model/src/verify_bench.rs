@@ -545,7 +545,11 @@ fn attn_rig(max_ctx: usize, seed: u64) -> Result<AttnRig, String> {
     g.pipeline("attn_sdpa_vec_b16")?;
     for p in vm_pipelines() { g.pipeline(&p)?; }
     for t in 1..=8 {
-        for q8 in [false, true] { g.pipeline(crate::qwen_layers::partial_name(t, q8))?; g.pipeline(crate::qwen_layers::split_name(t, q8))?; }
+        for q8 in [false, true] {
+            g.pipeline(crate::qwen_layers::partial_name(t, q8))?;
+            g.pipeline(crate::qwen_layers::split_name(t, q8))?;
+            if let Some((n, _)) = crate::qwen_layers::split_gqa(t, q8) { g.pipeline(n)?; }
+        }
     }
     g.pipeline("attn_reduce_gate")?;
     let kvb = AT_NKV * max_ctx * AT_HD * 2;
@@ -640,33 +644,36 @@ impl AttnRig {
     /// whatever their N (the split-K kernels are defined for every N).
     /// `q8`: on the q8 KV (kernel `name` must be a q8 variant).
     #[allow(clippy::too_many_arguments)]
-    fn splitk(&self, e: &Enc, t: usize, ao: usize, nch: usize, name: &str, threads: usize, q8: bool) {
+    fn splitk(&self, e: &Enc, t: usize, ao: usize, nch: usize, name: &str, threads: usize, q8: bool, g: usize) {
         let prow = AT_NH * 2 * AT_HD + 2 * AT_NKV * AT_HD;
         let b = &self.b;
         let [k, v, ks, vs] = if q8 { self.q8 } else { [b.k, b.v, b.k, b.v] };
         e.pso(name).b(0, b.qr).b(1, k).b(2, v).b(3, ks).b(4, vs).b(5, self.po).b(6, self.pml).b(7, b.ctrl)
-            .u(8, self.max_ctx as u32).u(9, (AT_NH / AT_NKV) as u32).groups((nch, AT_NH), threads);
+            .u(8, self.max_ctx as u32).u(9, (AT_NH / AT_NKV) as u32).groups((nch, AT_NH / g), threads);
         e.pso("attn_reduce_gate").b(0, self.po).b(1, self.pml).b(2, b.p).b(3, ao).u(4, nch as u32).u(5, prow as u32)
-            .groups((AT_NH, t), AT_HD / 4);
+            .groups((AT_NH, t), AT_HD);
     }
-    /// `attn_split_k{t}[_q8]` == the original `attn_partial_k{t}_{b16,q8}`, bit for bit over all t rows, at the minimal
+    /// `attn_split_k{t}[_q8]` and its GQA variant (`split_gqa`) == the original `attn_partial_k{t}_{b16,q8}`, bit for bit over all t rows, at the minimal
     /// chunk count and with every chunk of max_ctx dispatched.
     #[cfg(test)]
     fn check_splitk(&self, pos: usize, t: usize, q8: bool) -> Result<Vec<String>, String> {
         use crate::qwen_engine::ATTN_CHUNK;
         let n = t * AT_NH * AT_HD;
-        let (name, threads) = (crate::qwen_layers::split_name(t, q8), 256);
         let old = crate::qwen_layers::partial_name(t, q8);
+        let mut kerns = vec![(crate::qwen_layers::split_name(t, q8), 1)];
+        kerns.extend(crate::qwen_layers::split_gqa(t, q8));
         let mut bad = vec![];
         self.set_pos(pos);
         for nch in [(pos + t).div_ceil(ATTN_CHUNK), self.max_ctx.div_ceil(ATTN_CHUNK)] {
             self.a.sl::<u8>(self.ao2, 2 * n).fill(0x5a);
-            run(&self.g, &self.a, &|e| self.splitk(e, t, self.ao2, nch, old, 128, q8))?;
-            self.a.sl::<u8>(self.b.ao, 2 * n).fill(0xa5);
-            run(&self.g, &self.a, &|e| self.splitk(e, t, self.b.ao, nch, name, threads, q8))?;
-            let (x, y) = (self.a.sl::<u16>(self.b.ao, n), self.a.sl::<u16>(self.ao2, n));
-            let d = x.iter().zip(y.iter()).filter(|(u, v)| u != v).count();
-            if d > 0 { bad.push(format!("split-K {} vs {}, pos {} nch {}: {} / {} outputs differ", name, old, pos, nch, d, n)); }
+            run(&self.g, &self.a, &|e| self.splitk(e, t, self.ao2, nch, old, 128, q8, 1))?;
+            for &(name, g) in &kerns {
+                self.a.sl::<u8>(self.b.ao, 2 * n).fill(0xa5);
+                run(&self.g, &self.a, &|e| self.splitk(e, t, self.b.ao, nch, name, 256, q8, g))?;
+                let (x, y) = (self.a.sl::<u16>(self.b.ao, n), self.a.sl::<u16>(self.ao2, n));
+                let d = x.iter().zip(y.iter()).filter(|(u, v)| u != v).count();
+                if d > 0 { bad.push(format!("split-K {} vs {}, pos {} nch {}: {} / {} outputs differ", name, old, pos, nch, d, n)); }
+            }
         }
         Ok(bad)
     }
@@ -779,7 +786,8 @@ fn attn_pass_cli(poss: &[usize], reps: usize) -> Result<(), String> {
     for &pos in poss {
         rig.set_pos(pos);
         for vm in [false, true] {
-            let us = med(&|e, t| rig.pass(e, pos, t, 0, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), vm, false))?;
+            // default = the engine without verify mixers: va_sdpa (`PassIo::va1`) for K = 1 rows, attn_sdpa_vec_b16 else
+            let us = med(&|e, t| rig.pass(e, pos, t, 0, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), vm || t == 1, false))?;
             row(pos, if vm { "verify_mixers" } else { "default" }, &us);
         }
         let us = med(&|e, t| rig.pass(e, pos, t, 0, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), false, true))?;
@@ -787,10 +795,17 @@ fn attn_pass_cli(poss: &[usize], reps: usize) -> Result<(), String> {
         // the split-K kernels alone (+ attn_reduce_gate) for every row, whatever N: before / after attn_split_rows
         for q8 in [false, true] {
             let kv = if q8 { "q8 " } else { "" };
-            let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::partial_name(t, q8), 128, q8))?;
+            let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::partial_name(t, q8), 128, q8, 1))?;
             row(pos, &format!("{}split-K attn_partial", kv), &us);
-            let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::split_name(t, q8), 256, q8))?;
+            let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::split_name(t, q8), 256, q8, 1))?;
             row(pos, &format!("{}split-K attn_split", kv), &us);
+            // the GQA variants (engine kernel for those K): one K per kernel, the other columns repeat it
+            for kk in 1..=8 {
+                if let Some((n, g)) = crate::qwen_layers::split_gqa(kk, q8) {
+                    let us = med(&|e, _t| rig.splitk(e, kk, rig.b.ao, (pos + kk).div_ceil(ATTN_CHUNK), n, 256, q8, g))?;
+                    row(pos, &format!("{} (K = {} only)", n, kk), &us);
+                }
+            }
         }
     }
     Ok(())

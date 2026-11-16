@@ -19,10 +19,17 @@
 //! (plain and each depth) restores it and feeds the tail, so an 8K prompt is not re-prefilled per depth. Each table
 //! line counts the compared decode positions by attention path of their kv length N (N < SDPA_TWO_PASS_MIN single
 //! pass, up to SDPA_VEC_MAX_N MLX two-pass mirror, above it split-K `attn_split_rows` + `attn_reduce_gate`).
-//! KV format: SD_EXACT_KV=q8 opens the engine with 8-bit KV (exact prefill; every attention row split-K `attn_partial_k*_q8`).
+//! KV format: SD_EXACT_KV=q8 opens the engine with 8-bit KV (fast prefill via attn_flash_q8 as bf16; every decode attention row split-K).
 //! Quality runs: SD_EXACT_TOKENS_OUT=FILE appends per plain position `prompt pos token argmax top1-top2-margin` (tab
 //! separated); SD_EXACT_PLAIN_ONLY=1 runs only the plain greedy part (no MTP depths), e.g. to compare bf16 vs q8 KV;
-//! SD_EXACT_PREFILL_EXACT=1 = exact prompt read for bf16 too (q8 always reads exactly), to separate the two effects.
+//! SD_EXACT_PREFILL_EXACT=1 = exact prompt read (bf16 and q8), to separate the two effects.
+//! DFlash2 (bench only): SD_EXACT_DFLASH2=DIR (drafter dir, e.g. models/dflash2_27b_q4) adds rows after the MTP ones
+//! from a SECOND engine (the engine refuses DFlash2 together with MTP, and two 27B engines do not fit: the MTP engine is
+//! dropped first) with the same cap / kv / max_ctx: "dflash2" (`feed_stream_dflash2`) and "plain (dflash2 engine)".
+//! The drafter needs context rows for every prompt position and a snapshot restore leaves none, so the DFlash2 engine
+//! prefills the prompt prefix FRESH (one prefill per prompt), saves a snapshot, runs dflash2 straight on from that live
+//! state (tail + N tokens), then restores the snapshot for its own plain row. Tokens are compared with the MTP engine's
+//! plain row and with the DFlash2 engine's plain row. SD_EXACT_DFLASH2_ONLY=1: skip the MTP engine (no MTP rows).
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
@@ -93,6 +100,13 @@ fn mtp_exact_27b_per_position() {
     };
     let plain_only = std::env::var("SD_EXACT_PLAIN_ONLY").is_ok_and(|s| s == "1");
     let tokens_out = std::env::var("SD_EXACT_TOKENS_OUT").ok();
+    let df2_dir: Option<std::path::PathBuf> = std::env::var("SD_EXACT_DFLASH2").ok().filter(|s| !s.is_empty()).map(Into::into);
+    let df2_only = std::env::var("SD_EXACT_DFLASH2_ONLY").is_ok_and(|s| s == "1");
+    if let Some(p) = &df2_dir {
+        assert!(bench, "SD_EXACT_DFLASH2 needs SD_EXACT_BENCH=1");
+        assert!(p.join("config.json").exists() && p.join("model.safetensors").exists(), "SD_EXACT_DFLASH2={}: no config.json + model.safetensors", p.display());
+    }
+    assert!(!df2_only || df2_dir.is_some(), "SD_EXACT_DFLASH2_ONLY=1 needs SD_EXACT_DFLASH2=DIR");
     let prompts: Vec<(String, Vec<u32>)> = match &pfile {
         Some(p) => {
             let ids: Vec<u32> = std::fs::read_to_string(p).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
@@ -102,11 +116,22 @@ fn mtp_exact_27b_per_position() {
         }
         None => PROMPTS.iter().map(|(n, ids)| (n.to_string(), ids.to_vec())).collect(),
     };
+    let cap = cap_gb.map_or(QwenOptions::default().cap, |g| (g * 1e9) as u64);
+    let prefill_exact = std::env::var("SD_EXACT_PREFILL_EXACT").is_ok_and(|s| s == "1");
+    // the DFlash2 engine: the gateway's --dflash2 options (MTP off, no draft vocab / table), same cap / kv / max_ctx
+    let df2_opt = df2_dir.as_ref().map(|p| QwenOptions {
+        cap, prefill_exact, max_ctx, kv, mtp: false, spec_depth: 1, activity: true, activity_batch: true, read_mask: true,
+        dflash2: Some(p.clone()), ..Default::default()
+    });
+    if df2_only {
+        let (lines, bad, peak) = dflash2_bench(&d, df2_opt.unwrap(), &prompts, n, &sdir, pfile.is_some(), None);
+        print_bench(&lines, &format!("peak footprint (DFlash2 engine only) {:.2} GB", peak));
+        assert_eq!(bad, 0, "{} DFlash2 rows: tokens differ from plain greedy", bad);
+        return;
+    }
     let vk = format!("{}/draft_vocab.keep", d);
     let opt = QwenOptions {
-        cap: cap_gb.map_or(QwenOptions::default().cap, |g| (g * 1e9) as u64),
-        prefill_exact: std::env::var("SD_EXACT_PREFILL_EXACT").is_ok_and(|s| s == "1"),
-        max_ctx, kv, mtp: true, spec_depth: 7, spec_auto: true, activity: true, activity_batch: true, read_mask: true,
+        cap, prefill_exact, max_ctx, kv, mtp: true, spec_depth: 7, spec_auto: true, activity: true, activity_batch: true, read_mask: true,
         draft_vocab: std::path::Path::new(&vk).exists().then(|| vk.clone().into()),
         draft_table: Some(sdir.join("draft_table")),
         ..Default::default()
@@ -120,6 +145,8 @@ fn mtp_exact_27b_per_position() {
     let modes = [SpecMode::Fixed(2), SpecMode::Fixed(4), SpecMode::Fixed(7), SpecMode::Auto { max: 7 }];
     let mut table: Vec<String> = vec![];
     let mut bad = 0usize;
+    // bench: the MTP engine's plain greedy tokens per prompt (compared with DFlash2's)
+    let mut plain_toks: Vec<Vec<u32>> = vec![];
     let (tp_min, vec_max) = (streamdense_model::qwen_layers::sdpa_two_pass_min(), streamdense_model::qwen_layers::sdpa_vec_max_n());
     eprintln!("max_ctx {}; attention paths: single pass N < {}, two-pass {}..={}, split-K N > {}", max_ctx, tp_min, tp_min, vec_max, vec_max);
     for (name, ids) in &prompts {
@@ -166,6 +193,7 @@ fn mtp_exact_27b_per_position() {
                                  (tp.len() - 1) as f64 / dec_p, wall_p, tp.len() as f64 / wall_p);
             eprintln!("{}", line_p);
             table.push(line_p);
+            plain_toks.push(tp.clone());
             for (label, ctx_cost) in [("mtp auto (old, context-blind)", "0"), ("mtp auto (context-aware)", "1")] {
                 std::env::set_var("SD_SPEC_CTX_COST", ctx_cost);
                 // a fresh, empty draft table per run: neither run learns from the other's continuation
@@ -289,11 +317,16 @@ fn mtp_exact_27b_per_position() {
         if let Some(sp) = &snap { let _ = std::fs::remove_file(sp); }
     }
     if bench {
-        println!("\n| prompt | mode | tokens | decode s (first to last token) | decode tok/s (tokens - 1) | wall s incl. {} tail | wall tok/s | acceptance (accepted / drafts) | passes (stop) | real drafts per pass (0..7) |", SNAP_TAIL);
-        println!("|---|---|---|---|---|---|---|---|---|---|");
-        for l in &table { println!("{}", l); }
-        println!("peak footprint {:.2} GB", e.peak() as f64 / 1e9);
-        assert_eq!(bad, 0, "{} prompts: MTP tokens differ from plain greedy", bad);
+        let mut peak = format!("peak footprint {:.2} GB", e.peak() as f64 / 1e9);
+        if let Some(o) = df2_opt {
+            drop(e); // two 27B engines do not fit: free the MTP engine before the DFlash2 one opens
+            let (lines, b2, pk) = dflash2_bench(&d, o, &prompts, n, &sdir, pfile.is_some(), Some(&plain_toks));
+            table.extend(lines);
+            bad += b2;
+            peak = format!("{} (MTP engine); DFlash2 engine: process peak {:.2} GB (includes the MTP engine's peak if that was higher)", peak, pk);
+        }
+        print_bench(&table, &peak);
+        assert_eq!(bad, 0, "{} rows: MTP / DFlash2 tokens differ from plain greedy", bad);
         return;
     }
     println!("\n| prompt | depth | positions | N paths (single / two-pass / split-K) | min plain margin | logits bit-identical | hf bit-identical | tokens identical | acceptance | verify rows used (row 0..7) | first mismatch | time |");
@@ -301,4 +334,95 @@ fn mtp_exact_27b_per_position() {
     for l in &table { println!("{}", l); }
     println!("peak footprint {:.2} GB", e.peak() as f64 / 1e9);
     assert_eq!(bad, 0, "{} prompt x depth runs not bit-identical to plain greedy", bad);
+}
+
+fn print_bench(table: &[String], peak: &str) {
+    println!("\n| prompt | mode | tokens | decode s (first to last token) | decode tok/s (tokens - 1) | wall s incl. {} tail | wall tok/s | acceptance (accepted / drafts) | passes (stop) | real drafts per pass (0..7); dflash2: accepted per pass (0..7) |", SNAP_TAIL);
+    println!("|---|---|---|---|---|---|---|---|---|---|");
+    for l in table { println!("{}", l); }
+    println!("{}", peak);
+}
+
+/// Bench rows of a DFlash2 engine (opened here, dropped at the end): per prompt "dflash2" then "plain (dflash2 engine)".
+/// Prompt-file mode: the prefix is prefilled fresh (every pass captures the drafter's context rows), saved as a
+/// snapshot, dflash2 runs on from that live state; the plain row restores the snapshot (it needs no drafter context).
+/// Returns (table lines, rows whose tokens differ from plain, process peak footprint GB).
+fn dflash2_bench(d: &str, opt: QwenOptions, prompts: &[(String, Vec<u32>)], n: usize, sdir: &std::path::Path, snap_mode: bool,
+                 plain_mtp: Option<&[Vec<u32>]>) -> (Vec<String>, usize, f64) {
+    match QwenEngine::budget(d, &opt) {
+        Ok(b) => eprintln!("DFlash2 engine budget (cap {:.2} GB): arena {:.3} GB + reserve {:.3} GB = {:.3} GB\n{}", b.cap as f64 / 1e9,
+                           b.arena_bytes() as f64 / 1e9, b.reserve as f64 / 1e9, (b.arena_bytes() + b.reserve) as f64 / 1e9, b.report()),
+        Err(x) => panic!("DFlash2 engine budget: {}", x),
+    }
+    let t_open = Instant::now();
+    let e = QwenEngine::open(d, opt).unwrap();
+    let c = e.dflash2_config().unwrap();
+    eprintln!("DFlash2 engine: kv {:?}; open {:.1} s; block {} window {} ring {} rows; taps {:?}", e.opt.kv, t_open.elapsed().as_secs_f64(),
+              c.block, c.window, e.dflash2_ring_rows(), c.layer_ids);
+    let mut lines = vec![];
+    let mut bad = 0usize;
+    for (pi, (name, ids)) in prompts.iter().enumerate() {
+        let ids: Vec<u32> = ids.iter().map(|&x| x % e.cfg.vocab as u32).collect();
+        let pl = ids.len();
+        e.reset();
+        // fresh prefill of the prefix (context rows captured), snapshot for the plain row
+        let snap = snap_mode.then(|| {
+            let sp = sdir.join(format!("prefix_df2_{}.sdsnap", name));
+            let pre = &ids[..pl - SNAP_TAIL];
+            let t = Instant::now();
+            e.feed_stream(pre, 1, &[], &mut |_| true).unwrap();
+            assert_eq!(e.pos(), pre.len());
+            e.save_snapshot(&sp, pre).unwrap();
+            eprintln!("{}: DFlash2 engine: prefix {} prefilled fresh (drafter context {} rows, oldest kept {}) + snapshot in {:.1} s", name, pre.len(),
+                      e.dflash2_ctx_len(), e.dflash2_ctx_lo(), t.elapsed().as_secs_f64());
+            sp
+        });
+        let feed: &[u32] = if snap.is_some() { &ids[pl - SNAP_TAIL..] } else { &ids };
+        // ---- dflash2
+        let mut td: Vec<u32> = vec![];
+        let (mut s0, mut s1) = (None, None);
+        let tw = Instant::now();
+        let (st, ds) = e.feed_stream_dflash2(feed, n, &[], &mut |t| {
+            let now = Instant::now();
+            if s0.is_none() { s0 = Some(now); }
+            s1 = Some(now);
+            td.push(t);
+            true
+        }).unwrap();
+        let wall_d = tw.elapsed().as_secs_f64();
+        let dec_d = s1.unwrap().duration_since(s0.unwrap()).as_secs_f64();
+        let line_d = format!("| {} | dflash2 | {} | {:.2} s | {:.2} tok/s | {:.2} s | {:.2} tok/s | {:.3} ({} / {}) | {} ({}) | {:?} |", name, td.len(), dec_d,
+                             (td.len() - 1) as f64 / dec_d, wall_d, td.len() as f64 / wall_d, ds.acceptance(), ds.accepted, ds.drafted,
+                             ds.passes, st.stop_reason, ds.accept_hist);
+        eprintln!("{}\ndflash2 stats {}", line_d, ds.json());
+        if ds.short_ctx > 0 { eprintln!("WARNING: {} rounds drafted with a short drafter context (positions without context rows)", ds.short_ctx); }
+        lines.push(line_d);
+        // ---- plain on the DFlash2 engine (every decode pass also captures the drafter's tap rows)
+        e.reset();
+        if let Some(sp) = &snap { assert_eq!(e.restore_snapshot(sp).unwrap().len(), pl - SNAP_TAIL); }
+        let mut tp: Vec<u32> = vec![];
+        let (mut t0, mut t1) = (None, None);
+        let tw = Instant::now();
+        e.feed_stream(feed, n, &[], &mut |t| {
+            let now = Instant::now();
+            if t0.is_none() { t0 = Some(now); }
+            t1 = Some(now);
+            tp.push(t);
+            true
+        }).unwrap();
+        let wall_p = tw.elapsed().as_secs_f64();
+        let dec_p = t1.unwrap().duration_since(t0.unwrap()).as_secs_f64();
+        let line_p = format!("| {} | plain (dflash2 engine, taps captured) | {} | {:.2} s | {:.2} tok/s | {:.2} s | {:.2} tok/s | - | - | - |", name, tp.len(), dec_p,
+                             (tp.len() - 1) as f64 / dec_p, wall_p, tp.len() as f64 / wall_p);
+        eprintln!("{}", line_p);
+        lines.push(line_p);
+        eprintln!("tokens equal plain (dflash2 engine) vs dflash2: {} ({} vs {} tokens)", tp == td, tp.len(), td.len());
+        if tp != td { bad += 1; }
+        if let Some(pm) = plain_mtp.and_then(|v| v.get(pi)) {
+            eprintln!("tokens equal plain (MTP engine) vs dflash2: {} ({} vs {} tokens)", *pm == td, pm.len(), td.len());
+            if *pm != td { bad += 1; }
+        }
+        if let Some(sp) = &snap { let _ = std::fs::remove_file(sp); }
+    }
+    (lines, bad, e.peak() as f64 / 1e9)
 }

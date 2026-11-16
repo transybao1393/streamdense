@@ -7,7 +7,7 @@
 //!   each replayed after: dirtying the engine with another prompt then restore (file), restore (RAM), and a second
 //!   freshly opened engine (restart) restoring the file. Equal: tokens, stop reasons, positions, rec records
 //!   (argmax, top-1, top-2 bitwise) for every generated position, and (plain) the full logits row per token.
-//! - the same with 8-bit KV (q8: exact prefill), plain and MTP.
+//! - the same with 8-bit KV (q8: exact and fast prefill), plain and MTP.
 //! - cross: an MTP snapshot restored into a plain engine == the plain reference.
 //! - errors: bad magic, truncated body, tokens.len() != pos; cache key / longest-prefix lookup.
 //! - timing: save / restore (file, RAM) on the tiny model, and the 27B estimate at ~3 GB/s.
@@ -162,6 +162,11 @@ fn restore_mtp_exact() { check_mode(true, true); }
 fn restore_plain_q8() { check_mode_kv(false, true, KvFormat::Q8); }
 #[test]
 fn restore_mtp_q8() { check_mode_kv(true, true, KvFormat::Q8); }
+/// 8-bit KV with the fast prefill (attn_flash_q8)
+#[test]
+fn restore_plain_fast_q8() { check_mode_kv(false, false, KvFormat::Q8); }
+#[test]
+fn restore_mtp_fast_q8() { check_mode_kv(true, false, KvFormat::Q8); }
 
 /// MTP-engine snapshot restored into a plain engine == plain reference (MTP == plain is the spec contract).
 #[test]

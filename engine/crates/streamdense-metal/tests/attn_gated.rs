@@ -137,7 +137,7 @@ impl Bufs {
     fn reduce(&self, e: &Enc, t0: usize, k: usize, nch: usize) {
         let rs = NH * nch;
         e.pso("attn_reduce_gate").b(0, self.po + t0 * rs * HD * 4).b(1, self.pml + t0 * rs * 8).b(2, self.p + t0 * P * 2)
-            .b(3, self.ao + t0 * NH * HD * 2).u(4, nch as u32).u(5, P as u32).groups((NH, k), 64);
+            .b(3, self.ao + t0 * NH * HD * 2).u(4, nch as u32).u(5, P as u32).groups((NH, k), HD);
     }
     /// One pass of k tokens at ctrl slot `slot` (ctrl.pos set by the caller): prep, partial, reduce.
     fn pass(&self, e: &Enc, slot: usize, t0: usize, k: usize, nch: usize) {

@@ -228,7 +228,7 @@ impl Synth {
             k: 1, h: o("h"), x: o("x"), p: o("p"), cv: o("cv"), g: o("g"), beta: o("beta"), y: o("y"), yn: o("yn"), ao: o("ao"),
             f: o("f"), po: o("po"), pml: o("pml"), hf: o("hf"), ctrl: ctrl.off, nch_max: (opt.pos + 1).div_ceil(ATTN_CHUNK).min(nch_max),
             pos: opt.pos, logits: o("logits"), rec: rec.off, invf: o("invf"), dn_save: None, dn_hold: None, gemv: opt.gemv, act: None, rm: None,
-            fsel: None, cfs: cfs.off, vf: None, fxcap: None, vm: None, ban: None,
+            fsel: None, cfs: cfs.off, vf: None, fxcap: None, vm: None, va1: Some(va), ban: None,
         };
         let mut full = vec![];
         let mut cpt = vec![];

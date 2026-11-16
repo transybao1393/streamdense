@@ -4,7 +4,7 @@
 //! compares the layer outputs h (fast vs exact, same inputs and state). Projects whole-model prefill tok/s from the
 //! layer times (n_deltanet * dn + n_attention * attn; head and embedding not included).
 //! Run: cargo run --release --offline -p streamdense-model --example qwen_prefill_layer_bench -- [--t 128] [--pos 1000]
-//!      [--reps 3] [--k 8]
+//!      [--reps 3] [--k 8] [--kv bf16|q8]   (q8: 8-bit KV, random codes and fp16 scale / min)
 use streamdense_core::arena::Region;
 use streamdense_metal::{commit, contents, gpu_ms, wait, Enc, Gpu, SdCtrl, QWEN_SHADERS};
 use streamdense_model::qwen_layers::{encode_layer, encode_layer_prefill, encode_rope_invf, gemm_pipelines, prefill_pipelines,
@@ -56,6 +56,7 @@ fn main() {
     let pos: usize = arg("--pos").map_or(1000, |v| v.parse().unwrap());
     let reps: usize = arg("--reps").map_or(3, |v| v.parse().unwrap());
     let kx: usize = arg("--k").map_or(8, |v| v.parse().unwrap());
+    let q8 = arg("--kv").is_some_and(|v| v == "q8");
     let cfg = QwenConfig::from_model_dir(&model).expect("config");
     cfg.validate().expect("validate");
     let max_ctx = (pos + t).next_power_of_two().max(1024);
@@ -97,9 +98,25 @@ fn main() {
     let c_r = a.alloc(DnState::conv_bytes(&cfg, 1));
     let st = DnState { s: s_r.off, conv: c_r.off, copies: 1 };
     let kvn = cfg.kv_heads * max_ctx * cfg.head_dim;
-    let (kr, vr) = (a.bf_fill(kvn, &mut rng, &|r| r.n()), a.bf_fill(kvn, &mut rng, &|r| r.n()));
     let dummy = a.alloc(256);
-    let kv = KvRef { k: kr.off, v: vr.off, ksb: dummy.off, vsb: dummy.off, q8: false, max_ctx };
+    let kv = if q8 {
+        let (kr, vr) = (a.alloc(kvn), a.alloc(kvn));
+        for r in [kr, vr] { for v in a.sl::<u32>(r) { *v = rng.next() as u32; } }
+        // fp16 (scale, min) per 32-dim group: scale ~ 6 / 255, min ~ -3 (codes span about +-3, as r.n())
+        let sb = |a: &mut A, rng: &mut Rng| {
+            let r = a.alloc(kvn / 32 * 4);
+            for (i, v) in a.sl::<u16>(r).iter_mut().enumerate() {
+                let x: f32 = if i % 2 == 0 { (6.0 + 0.5 * rng.n()) / 255.0 } else { -3.0 + 0.1 * rng.n() };
+                *v = streamdense_core::f16::f32_to_f16(x);
+            }
+            r
+        };
+        let (ks, vs) = (sb(&mut a, &mut rng), sb(&mut a, &mut rng));
+        KvRef { k: kr.off, v: vr.off, ksb: ks.off, vsb: vs.off, q8: true, max_ctx }
+    } else {
+        let (kr, vr) = (a.bf_fill(kvn, &mut rng, &|r| r.n()), a.bf_fill(kvn, &mut rng, &|r| r.n()));
+        KvRef { k: kr.off, v: vr.off, ksb: dummy.off, vsb: dummy.off, q8: false, max_ctx }
+    };
     let nch_max = max_ctx.div_ceil(256);
     let mut sr = std::collections::HashMap::new();
     for (n, b) in scratch_sizes(&cfg, t, nch_max) { sr.insert(n, a.alloc(b)); }
@@ -108,7 +125,7 @@ fn main() {
     let o = |n: &str| sr[n].off;
     let io0 = PassIo { k: t, h: o("h"), x: o("x"), p: o("p"), cv: o("cv"), g: o("g"), beta: o("beta"), y: o("y"), yn: o("yn"),
                        ao: o("ao"), f: o("f"), po: o("po"), pml: o("pml"), hf: o("hf"), ctrl: ctrl.off, nch_max, pos,
-                       logits: o("logits"), rec: rec.off, invf: o("invf"), dn_save: None, dn_hold: None, gemv: Default::default(), act: None, rm: None, fsel: None, cfs: 0, vf: None, fxcap: None, vm: None, ban: None };
+                       logits: o("logits"), rec: rec.off, invf: o("invf"), dn_save: None, dn_hold: None, gemv: Default::default(), act: None, rm: None, fsel: None, cfs: 0, vf: None, fxcap: None, vm: None, va1: None, ban: None };
     let hin = a.bf_fill(t * h, &mut rng, &|r| r.n());
     let hbytes = t * h * 2;
     {
@@ -141,7 +158,7 @@ fn main() {
         e.end(); commit(&cb); wait(&cb).unwrap();
         gpu_ms(&cb)
     };
-    println!("T = {}, pos = {}, exact K = {} ({} passes), GPU {}", t, pos, kx, t / kx, g.name());
+    println!("T = {}, pos = {}, exact K = {} ({} passes), KV {}, GPU {}", t, pos, kx, t / kx, if q8 { "q8" } else { "bf16" }, g.name());
     println!("| layer | fast ms | exact ms | speedup | fast ms/token |");
     println!("|---|---|---|---|---|");
     let mut ms = [0.0f64; 2];

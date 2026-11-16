@@ -290,7 +290,8 @@ static inline void ag_u8x4(uint w, thread float* f) {
 // from threadgroup memory (one 4-byte load per FMA; threadgroup bandwidth, not the FMAs, bounds the score loop), each
 // V sweep (2 rows) re-reads and re-converts the values, and q + scores + 4 x 1 KB reduce buffers per threadgroup (21 KB
 // at K = 8) leave one 4-simdgroup threadgroup per core.
-// Here (256 threads = 8 simdgroups per (chunk c, q head h), dispatch (nch, nh) groups x 256):
+// Here (256 threads = 8 simdgroups per (chunk c, q head h), dispatch (nch, nh) groups x 256; with G > 1 per (chunk c,
+// heads h0 .. h0 + G - 1 of one kv head), dispatch (nch, nh / G), the K x G (row t, head h0 + g) pairs as rows v = G t + g):
 // - scores: lane octet (rs = lane / 8) x sub (lane % 8, dims 32 sub .. 32 sub + 31). An octet holds the 32 q dims of
 //   ONE row (t = RP * pass + rs % RP) in registers and walks keys with key slot rs / RP (KO slots); octets of
 //   different rows read the same key bytes in the same step (one coalesced load). Score = the same chain as
@@ -310,7 +311,7 @@ static inline void ag_u8x4(uint w, thread float* f) {
 //   the bytes, bounded the q8 kernel (it was slower than bf16 from K = 3 up); the score converts 4 codes at a time
 //   between its FMAs (same chain order).
 // Masked keys (j >= pos + 1 + t) and empty chunks are skipped as in attn_partial, so K-invariance holds.
-template <bool Q8, uint K, uint RP, uint KO, uint TB>
+template <bool Q8, uint K, uint G, uint RP, uint KO, uint TB>
 kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const uchar* Kc [[buffer(1)]],
                             device const uchar* Vc [[buffer(2)]], device const half2* Ksb [[buffer(3)]],
                             device const half2* Vsb [[buffer(4)]], device float4* po [[buffer(5)]],
@@ -321,28 +322,32 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
 #pragma METAL fp math_mode(safe)
     const uint HD = AG_HD;
-    static_assert(RP * KO <= 4 && 8 % ((K + RP - 1) / RP) == 0, "attn_split_rows geometry");
-    constexpr uint NP = (K + RP - 1) / RP;                  // score passes (row sets), SGP simdgroups each
+    constexpr uint V = K * G;                               // rows of this threadgroup: (row t, head h0 + g), v = G t + g
+    // G = 1 keeps the plain index expressions: the same code as before G (a hoisted min(v, V - 1) cost q8 K = 4 8%)
+    constexpr bool GQ = G > 1;
+    static_assert(RP * KO <= 4 && 8 % ((V + RP - 1) / RP) == 0, "attn_split_rows geometry");
+    constexpr uint NP = (V + RP - 1) / RP;                  // score passes (row sets), SGP simdgroups each
     constexpr uint SGP = 8 / NP;
     constexpr uint ST = SGP * KO;                           // key stride of a lane octet
     constexpr bool AL = TB >= 4;                            // pair sums go to the finished sweep's p rows
-    constexpr uint KP = AL ? (K + TB - 1) / TB * TB : K;    // p rows (padded so the last sweep has TB rows)
+    constexpr uint KP = AL ? (V + TB - 1) / TB * TB : V;    // p rows (padded so the last sweep has TB rows)
     threadgroup float sc[KP][AG_CH];                        // scores, then p = exp(s - m) of the valid keys
-    threadgroup float redm[8][K];                           // per simdgroup row maxima
+    threadgroup float redm[8][V];                           // per simdgroup row maxima
     threadgroup float prx[AL ? 1 : 4 * AG_HD];
     threadgroup float pl[8];
     threadgroup float pab[Q8 ? 4 * AG_NG : 1];             // Q8: ab of the odd simdgroup per (stream quad, group)
-    uint c = tg.x, h = tg.y, nch = ntgs.x, nh = ntgs.y, kvh = h / grp;
+    uint c = tg.x, h0 = GQ ? tg.y * G : tg.y, nch = ntgs.x, nh = GQ ? ntgs.y * G : ntgs.y, kvh = h0 / grp;
     uint n0 = ctrl->pos + 1;                                // keys visible to row 0
     uint nmax = n0 + K - 1;
     uint j0 = c * AG_CH, j1 = min(j0 + AG_CH, nmax);
     {
         uint rs = lane / 8, sub = lane % 8;
-        uint t = (sg / SGP) * RP + rs % RP, ko = rs / RP;
-        bool act = rs < RP * KO && t < K;
+        uint v = (sg / SGP) * RP + rs % RP, ko = rs / RP, t = GQ ? v / G : v;
+        bool act = rs < RP * KO && v < V;
         float q[32];
         float mloc = -INFINITY;
-        AG_UNROLL for (uint e = 0; e < 32; e++) q[e] = AG_SCALE * bf(qr[(min(t, K - 1) * nh + h) * HD + sub * 32 + e]);
+        AG_UNROLL for (uint e = 0; e < 32; e++)
+            q[e] = AG_SCALE * bf(qr[(GQ ? (min(v, V - 1) / G) * nh + h0 + min(v, V - 1) % G : min(v, V - 1) * nh + h0) * HD + sub * 32 + e]);
         float qs = 0;
         if (Q8) AG_UNROLL for (uint e = 0; e < 32; e++) qs += q[e];
         uint jf = j0 + (sg % SGP) * KO + ko;
@@ -366,7 +371,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
                 dd += simd_shuffle_xor(dd, 1); dd += simd_shuffle_xor(dd, 2); dd += simd_shuffle_xor(dd, 4);
                 if (act && j < n0 + t) {
                     mloc = max(mloc, dd);
-                    if (sub == 0) sc[t][j - j0] = dd;
+                    if (sub == 0) sc[v][j - j0] = dd;
                 }
             }
         } else {
@@ -386,21 +391,21 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
             dd += simd_shuffle_xor(dd, 1); dd += simd_shuffle_xor(dd, 2); dd += simd_shuffle_xor(dd, 4);
             if (act && j < n0 + t) {
                 mloc = max(mloc, dd);
-                if (sub == 0) sc[t][j - j0] = dd;
+                if (sub == 0) sc[v][j - j0] = dd;
             }
         }
         }
         // octets of the same row in this simdgroup: rs, rs + RP, ... (key slots)
         AG_UNROLL for (uint o = RP; o < RP * KO; o *= 2) mloc = max(mloc, simd_shuffle_xor(mloc, (ushort)(8 * o)));
-        if (sub == 0 && rs < RP && t < K) redm[sg][t] = mloc;
+        if (sub == 0 && rs < RP && v < V) redm[sg][v] = mloc;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < K * AG_CH; i += 256) {
-        uint t = i / AG_CH, jj = i % AG_CH;
-        if (j0 + jj < n0 + t) {
+    for (uint i = tid; i < V * AG_CH; i += 256) {
+        uint v = i / AG_CH, jj = i % AG_CH;
+        if (j0 + jj < n0 + (GQ ? v / G : v)) {
             float m = -INFINITY;
-            AG_UNROLL for (uint s2 = 0; s2 < SGP; s2++) m = max(m, redm[(t / RP) * SGP + s2][t]);
-            sc[t][jj] = fast::exp(sc[t][jj] - m);
+            AG_UNROLL for (uint s2 = 0; s2 < SGP; s2++) m = max(m, redm[(v / RP) * SGP + s2][v]);
+            sc[v][jj] = fast::exp(sc[v][jj] - m);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -410,7 +415,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
     device const uint4* vb = (device const uint4*)(Vc + ((kvh * maxctx) * HD + dof) * (Q8 ? 1 : 2));
     device const half2* vsp = Vsb + (kvh * maxctx) * AG_NG + sub;
     constexpr uint VW = Q8 ? HD / 16 : HD / 8;              // uint4 per cached V row
-    for (uint tb = 0; tb < K; tb += TB) {
+    for (uint tb = 0; tb < V; tb += TB) {
         float acc[TB][16], l[TB], ab[TB];
         AG_UNROLL for (uint u = 0; u < TB; u++) { l[u] = 0; ab[u] = 0; AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = 0; }
         uint4 vn[2];
@@ -432,7 +437,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
             }
             if (j < n0) {                                   // key visible to every row
                 AG_UNROLL for (uint u = 0; u < TB; u++) {
-                    if (tb + u < K) {
+                    if (tb + u < V) {
                         float pe = sc[tb + u][j - j0];
                         l[u] += pe;
                         float ps = Q8 ? pe * sb.x : pe;
@@ -442,9 +447,9 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
                 }
             } else {
                 AG_UNROLL for (uint u = 0; u < TB; u++) {
-                    uint t = tb + u;
-                    if (t < K && j < n0 + t) {
-                        float pe = sc[t][j - j0];
+                    uint v = tb + u;
+                    if (v < V && j < n0 + (GQ ? v / G : v)) {
+                        float pe = sc[v][j - j0];
                         l[u] += pe;
                         float ps = Q8 ? pe * sb.x : pe;
                         AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = fma(ps, vf[e], acc[u][e]);
@@ -456,8 +461,8 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
         threadgroup float* pr = AL ? &sc[tb][0] : &prx[0];
         if (AL) threadgroup_barrier(mem_flags::mem_threadgroup);   // every simdgroup done reading these p rows
         AG_UNROLL for (uint u = 0; u < TB; u++) {
-            uint t = tb + u;
-            if (t >= K) break;                              // uniform
+            uint v = tb + u;
+            if (v >= V) break;                              // uniform
             AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] += simd_shuffle_xor(acc[u][e], 16);
             l[u] += simd_shuffle_xor(l[u], 16);
             if (Q8) ab[u] += simd_shuffle_xor(ab[u], 16);
@@ -475,7 +480,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint slot = (t * nh + h) * nch + c;
+            uint slot = (GQ ? (v / G) * nh + h0 + v % G : v * nh + h0) * nch + c;
             if (tid < HD / 4) {
                 float4 o = 0;
                 AG_UNROLL for (uint s2 = 0; s2 < 4; s2++) o += ((threadgroup float4*)(pr + s2 * AG_HD))[tid];
@@ -483,7 +488,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
             }
             if (tid == 0) {
                 float m = -INFINITY;
-                AG_UNROLL for (uint s2 = 0; s2 < SGP; s2++) m = max(m, redm[(t / RP) * SGP + s2][t]);
+                AG_UNROLL for (uint s2 = 0; s2 < SGP; s2++) m = max(m, redm[(v / RP) * SGP + s2][v]);
                 pml[slot] = float2(m, (((pl[0] + pl[1]) + (pl[2] + pl[3])) + (pl[4] + pl[5])) + (pl[6] + pl[7]));
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -491,7 +496,10 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
     }
 }
 // (K, RP, KO, TB) per K: measured best of the valid geometries at 32K keys (verify_bench --attn-pass)
-#define ASR(Q_, S_, K_, RP_, KO_, TB_) template [[host_name("attn_split_k" #K_ S_)]] kernel void attn_split_rows<Q_, K_, RP_, KO_, TB_>( \
+#define ASRG(Q_, N_, K_, G_, RP_, KO_, TB_) template [[host_name(N_)]] kernel void attn_split_rows<Q_, K_, G_, RP_, KO_, TB_>( \
+    device const ushort*, device const uchar*, device const uchar*, device const half2*, device const half2*, \
+    device float4*, device float2*, device const SdCtrl*, constant uint&, constant uint&, uint2, uint2, uint, uint, uint);
+#define ASR(Q_, S_, K_, RP_, KO_, TB_) template [[host_name("attn_split_k" #K_ S_)]] kernel void attn_split_rows<Q_, K_, 1, RP_, KO_, TB_>( \
     device const ushort*, device const uchar*, device const uchar*, device const half2*, device const half2*, \
     device float4*, device float2*, device const SdCtrl*, constant uint&, constant uint&, uint2, uint2, uint, uint, uint);
 ASR(false, "", 1, 1, 4, 1) ASR(false, "", 2, 2, 2, 2) ASR(false, "", 3, 4, 1, 3) ASR(false, "", 4, 4, 1, 4)
@@ -500,15 +508,21 @@ ASR(false, "", 5, 4, 1, 3) ASR(false, "", 6, 4, 1, 3) ASR(false, "", 7, 4, 1, 2)
 // valid ones, incl. 2 rows per lane octet, were slower)
 ASR(true, "_q8", 1, 1, 4, 1) ASR(true, "_q8", 2, 2, 2, 2) ASR(true, "_q8", 3, 4, 1, 3) ASR(true, "_q8", 4, 4, 1, 4)
 ASR(true, "_q8", 5, 4, 1, 3) ASR(true, "_q8", 6, 4, 1, 3) ASR(true, "_q8", 7, 4, 1, 2) ASR(true, "_q8", 8, 4, 1, 2)
+// GQA (qwen_layers::split_gqa): G q heads of one kv head per threadgroup, dispatch (nch, nh / G); rows v = G t + g share
+// each key load. Same per-row arithmetic as above. Measured at the 27B shapes (24 q / 4 kv heads), 32K keys, + reduce:
+// K = 1 bf16 G = 3 986 -> 741 µs (G = 6 806, G = 2 831), q8 G = 2 793 -> 612 (G = 3 673, G = 6 624); K = 2 bf16 G = 2
+// 1480 -> 1113 (q8 G = 2 and K >= 3 with G > 1: no gain).
+ASRG(false, "attn_split_k1_g3", 1, 3, 4, 1, 3) ASRG(true, "attn_split_k1_g2_q8", 1, 2, 2, 2, 2) ASRG(false, "attn_split_k2_g2", 2, 2, 4, 1, 4)
 
-// ---- attn_reduce_gate: threadgroup (q head h, token t), 64 threads x float4 (HD = 256).
+// ---- attn_reduce_gate: threadgroup (q head h, token t), HD threads, one dim each (64 threads x float4 before: 32K keys
+// 38 -> 22 µs at K = 1; the chunk loads are issued 4 at a time).
 // Combine the chunks (skipping empty ones, l = 0): M = max m, w = fast::exp(m - M), L = sum w l, o = sum w o
-// (chunk order, fp32), then ob = bf(o / L) (sdpa output, bf16), then mx.sigmoid on the bf16 gate as MLX's
+// (chunk order, fp32, per dim), then ob = bf(o / L) (sdpa output, bf16), then mx.sigmoid on the bf16 gate as MLX's
 // bf16 unary op (each bf16 op rounded): e = bf(precise::exp(|g|)), y = bf(1 / bf(1 + e)), s = g < 0 ? y : bf(1 - y);
 // ao = bf(ob * s).
 // Buffers: po [0], pml [1], p [2] (gate of head h, token t at p + t * p_stride + h * 2 * HD + HD), ao [3]
 // (bf16 [T][nh * HD]), nch [4], p_stride [5] (elements per p row = nh*2*HD + 2*nkv*HD).
-kernel void attn_reduce_gate(device const float4* po [[buffer(0)]], device const float2* pml [[buffer(1)]],
+kernel void attn_reduce_gate(device const float* po [[buffer(0)]], device const float2* pml [[buffer(1)]],
                              device const ushort* p [[buffer(2)]], device ushort* ao [[buffer(3)]],
                              constant uint& nch [[buffer(4)]], constant uint& p_stride [[buffer(5)]],
                              uint2 tg [[threadgroup_position_in_grid]], uint2 ntgs [[threadgroups_per_grid]],
@@ -518,27 +532,35 @@ kernel void attn_reduce_gate(device const float4* po [[buffer(0)]], device const
     uint h = tg.x, t = tg.y, nh = ntgs.x, base = (t * nh + h) * nch;
     float M = -INFINITY;
     for (uint c = 0; c < nch; c++) { float2 ml = pml[base + c]; if (ml.y > 0.0f) M = max(M, ml.x); }
-    float L = 0;
-    float4 o = 0;
-    for (uint c = 0; c < nch; c++) {
+    float L = 0, o = 0;
+    uint c = 0;
+    for (; c + 4 <= nch; c += 4) {
+        float2 ml[4];
+        float pv[4];
+        AG_UNROLL for (uint i = 0; i < 4; i++) { ml[i] = pml[base + c + i]; pv[i] = po[(base + c + i) * HD + lane]; }
+        AG_UNROLL for (uint i = 0; i < 4; i++) {
+            if (ml[i].y > 0.0f) {
+                float w = fast::exp(ml[i].x - M);
+                L = fma(w, ml[i].y, L);
+                o = fma(w, pv[i], o);
+            }
+        }
+    }
+    for (; c < nch; c++) {
         float2 ml = pml[base + c];
         if (ml.y > 0.0f) {
             float w = fast::exp(ml.x - M);
             L = fma(w, ml.y, L);
-            o = fma(float4(w), po[(base + c) * (HD / 4) + lane], o);
+            o = fma(w, po[(base + c) * HD + lane], o);
         }
     }
-    float4 r = L == 0.0f ? o : o / L;
-    device const ushort* g = p + t * p_stride + h * 2 * HD + HD + lane * 4;
-    device ushort* out = ao + t * nh * HD + h * HD + lane * 4;
-    for (uint i = 0; i < 4; i++) {
-        float ob = bf(to_bf(r[i]));
-        float gv = bf(g[i]);
-        float e = bf(to_bf(precise::exp(fabs(gv))));
-        float y = bf(to_bf(1.0f / bf(to_bf(1.0f + e))));
-        float s = gv < 0.0f ? y : bf(to_bf(1.0f - y));
-        out[i] = to_bf(ob * s);
-    }
+    float r = L == 0.0f ? o : o / L;
+    float ob = bf(to_bf(r));
+    float gv = bf(p[t * p_stride + h * 2 * HD + HD + lane]);
+    float e = bf(to_bf(precise::exp(fabs(gv))));
+    float y = bf(to_bf(1.0f / bf(to_bf(1.0f + e))));
+    float s = gv < 0.0f ? y : bf(to_bf(1.0f - y));
+    ao[t * nh * HD + h * HD + lane] = to_bf(ob * s);
 }
 
 // ---- attn_sdpa_vec_b16: MLX's decode attention (mlx/backend/metal/kernels/sdpa_vector.h, T = bf16, D = V = 256, L = 1,
@@ -688,26 +710,33 @@ kernel void attn_sdpa_vec_b16(device const ushort* qr [[buffer(0)]], device cons
     }
 }
 
-// ---- attn_flash_b16 (PF-B, prefill): causal flash attention for T query rows against the bf16 KV cache (keys
-// 0 .. ctrl.pos + t for row t; attn_prep_b16 has already written the T new K/V rows), fused with the sigmoid gate.
+// ---- attn_flash_b16 / attn_flash_q8 (PF-B, prefill): causal flash attention for T query rows against the KV cache (keys
+// 0 .. ctrl.pos + t for row t; attn_prep_b16 / _q8 has already written the T new K/V rows), fused with the sigmoid gate.
 // Threadgroup = one kv head x one 8-row query tile; simdgroup s = q head kvh * grp + s (GQA: the grp heads share
 // every staged K/V block). Per simdgroup: Q (8 x 256, prescaled by 1/16) and O (8 x 256, fp32) live in registers as
 // 32 + 32 simdgroup 8x8 fragments; key blocks of AF_BK keys are staged as bf16 in threadgroup memory (row stride
 // padded to 264), S = Q K^T and O += P V on simdgroup_matrix<float>, online softmax (fast::exp, MLX-style) per row.
 // Output: ob = bf(o / l), ao = bf(ob * sigmoid_bf16(gate)) exactly as attn_reduce_gate.
 // Not bit-exact vs attn_sdpa_vec_b16 (different summation order); fp32 throughout.
-// Buffers: qr [0], Kc [1], Vc [2] (bf16 [nkv][max_ctx][HD]), p [3] (gate), ao [4], ctrl [5], max_ctx [6], grp [7],
-// p_stride [8], T [9]. Dispatch: groups (ceil(T / 8), nkv) x (32 * grp) threads (grp <= 32).
+// Buffers: qr [0], Kc [1], Vc [2] (bf16 [nkv][max_ctx][HD], or u8 when Q8), p [3] (gate), ao [4], ctrl [5], max_ctx [6],
+// grp [7], p_stride [8], T [9], Ksb [10], Vsb [11] (Q8: half2 (scale, min) [nkv][max_ctx][HD / 32]; bf16: unused).
+// Dispatch: groups (ceil(T / 8), nkv) x (32 * grp) threads (grp <= 32).
+// attn_flash_q8 (8-bit KV, as written by attn_prep_q8): the staging loop dequantizes each 8-dim slice to fp16 in
+// threadgroup memory, x = half(scale * q + min) (fp32 fma, then one fp16 rounding: 2^-11 relative, far below the q8
+// step (max - min) / 255; q8 scale / min are fp16 already, so the range fits), the rest is the bf16 kernel with fp16
+// unpacks. Not bit-exact vs the q8 decode attention (its s = scale * (q . kq) + min * sum(q) chain).
 constant uint AF_BK = 16;            // keys per staged block
 constant uint AF_KS = AG_HD + 8;     // padded threadgroup row stride (ushort); 528 B keeps uint4 alignment
-kernel void attn_flash_b16(device const ushort* qr [[buffer(0)]], device const ushort* Kc [[buffer(1)]],
-                           device const ushort* Vc [[buffer(2)]], device const ushort* p [[buffer(3)]],
-                           device ushort* ao [[buffer(4)]], device const SdCtrl* ctrl [[buffer(5)]],
-                           constant uint& maxctx [[buffer(6)]], constant uint& grp [[buffer(7)]],
-                           constant uint& p_stride [[buffer(8)]], constant uint& T [[buffer(9)]],
-                           uint2 tg [[threadgroup_position_in_grid]], uint2 ntgs [[threadgroups_per_grid]],
-                           uint tid [[thread_index_in_threadgroup]],
-                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+template <bool Q8>
+kernel void attn_flash(device const ushort* qr [[buffer(0)]], device const uchar* Kc [[buffer(1)]],
+                       device const uchar* Vc [[buffer(2)]], device const ushort* p [[buffer(3)]],
+                       device ushort* ao [[buffer(4)]], device const SdCtrl* ctrl [[buffer(5)]],
+                       constant uint& maxctx [[buffer(6)]], constant uint& grp [[buffer(7)]],
+                       constant uint& p_stride [[buffer(8)]], constant uint& T [[buffer(9)]],
+                       device const half2* Ksb [[buffer(10)]], device const half2* Vsb [[buffer(11)]],
+                       uint2 tg [[threadgroup_position_in_grid]], uint2 ntgs [[threadgroups_per_grid]],
+                       uint tid [[thread_index_in_threadgroup]],
+                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
 #pragma METAL fp math_mode(safe)
     constexpr uint HD = AG_HD, ND = AG_HD / 8;
     threadgroup ushort tK[AF_BK * AF_KS];
@@ -734,14 +763,26 @@ kernel void attn_flash_b16(device const ushort* qr [[buffer(0)]], device const u
         }
     }
     float m = -INFINITY, l = 0.0f;
-    device const ushort* kbase = Kc + kvh * maxctx * HD;
-    device const ushort* vbase = Vc + kvh * maxctx * HD;
+    device const ushort* kbase = (device const ushort*)Kc + kvh * maxctx * HD;
+    device const ushort* vbase = (device const ushort*)Vc + kvh * maxctx * HD;
+    const uint rbase = kvh * maxctx;            // first KV row of this kv head
     for (uint kb = 0; kb < nkeys; kb += AF_BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < AF_BK * (HD / 8); i += ntid) {
             uint r = i / (HD / 8), c8 = (i % (HD / 8)) * 8, key = kb + r;
             uint4 kv = 0, vv = 0;
-            if (key < nkeys) {                  // keys past the tile's range are zero (never NaN garbage)
+            if (key < nkeys && Q8) {            // dequantize 8 codes of one 32-dim group to fp16
+                uint row = rbase + key;
+                uint2 kw = *(device const uint2*)(Kc + row * HD + c8);
+                uint2 vw = *(device const uint2*)(Vc + row * HD + c8);
+                float2 ks = float2(Ksb[row * AG_NG + c8 / 32]), vs = float2(Vsb[row * AG_NG + c8 / 32]);
+                _Pragma("clang loop unroll(full)") for (uint w = 0; w < 2; w++) {
+                    float4 kq = float4(as_type<uchar4>(kw[w])), vq = float4(as_type<uchar4>(vw[w]));
+                    half4 kh = half4(fma(float4(ks.x), kq, float4(ks.y))), vh = half4(fma(float4(vs.x), vq, float4(vs.y)));
+                    kv[2 * w] = as_type<uint>(kh.xy); kv[2 * w + 1] = as_type<uint>(kh.zw);
+                    vv[2 * w] = as_type<uint>(vh.xy); vv[2 * w + 1] = as_type<uint>(vh.zw);
+                }
+            } else if (key < nkeys) {           // keys past the tile's range are zero (never NaN garbage)
                 kv = *(device const uint4*)(kbase + key * HD + c8);
                 vv = *(device const uint4*)(vbase + key * HD + c8);
             }
@@ -757,8 +798,8 @@ kernel void attn_flash_b16(device const ushort* qr [[buffer(0)]], device const u
                 simdgroup_float8x8 qf, kt;                   // K^T block: (dim fm, key fn / fn + 1)
                 qf.thread_elements()[0] = AG_SCALE * as_type<float>(qpk[d] << 16);
                 qf.thread_elements()[1] = AG_SCALE * as_type<float>(qpk[d] & 0xffff0000u);
-                kt.thread_elements()[0] = bf(k0[8 * d]);
-                kt.thread_elements()[1] = bf(k0[AF_KS + 8 * d]);
+                kt.thread_elements()[0] = Q8 ? float(as_type<half>(k0[8 * d])) : bf(k0[8 * d]);
+                kt.thread_elements()[1] = Q8 ? float(as_type<half>(k0[AF_KS + 8 * d])) : bf(k0[AF_KS + 8 * d]);
                 simdgroup_multiply_accumulate(sf[j], qf, kt, sf[j]);
             }
         }
@@ -795,8 +836,8 @@ kernel void attn_flash_b16(device const ushort* qr [[buffer(0)]], device const u
             _Pragma("clang loop unroll(full)") for (uint j = 0; j < AF_BK / 8; j++) {
                 simdgroup_float8x8 vf;                       // V block: (key fm, dim fn / fn + 1)
                 uint vw = *(threadgroup const uint*)(tV + (8 * j + fm) * AF_KS + 8 * d + fn);
-                vf.thread_elements()[0] = as_type<float>(vw << 16);
-                vf.thread_elements()[1] = as_type<float>(vw & 0xffff0000u);
+                vf.thread_elements()[0] = Q8 ? float(as_type<half2>(vw).x) : as_type<float>(vw << 16);
+                vf.thread_elements()[1] = Q8 ? float(as_type<half2>(vw).y) : as_type<float>(vw & 0xffff0000u);
                 simdgroup_multiply_accumulate(of[d], sf[j], vf, of[d]);
             }
         }
@@ -816,3 +857,9 @@ kernel void attn_flash_b16(device const ushort* qr [[buffer(0)]], device const u
         }
     }
 }
+#define AFL(Q_, N_) template [[host_name(N_)]] kernel void attn_flash<Q_>(device const ushort*, device const uchar*, \
+    device const uchar*, device const ushort*, device ushort*, device const SdCtrl*, constant uint&, constant uint&, \
+    constant uint&, constant uint&, device const half2*, device const half2*, uint2, uint2, uint, uint, uint);
+AFL(false, "attn_flash_b16")
+AFL(true, "attn_flash_q8")
+#undef AFL
