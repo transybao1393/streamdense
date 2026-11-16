@@ -184,7 +184,7 @@ pub fn qwen_pipelines() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = Vec::new();
     for k in KS {
         v.extend_from_slice(&[gemv_name(k, 0), gemv_name(k, 2), gemv_name(k, 3), swiglu_name(k)]);
-        v.extend_from_slice(&[partial_name(k, false), partial_name(k, true), split_name(k)]);
+        v.extend_from_slice(&[partial_name(k, false), partial_name(k, true), split_name(k, false), split_name(k, true)]);
     }
     v.extend(mma_pipelines());
     v.extend_from_slice(&[
@@ -295,25 +295,30 @@ pub(crate) fn partial_name(k: usize, q8: bool) -> &'static str {
     }
 }
 
-/// `attn_split_k{K}` (attn_gated.metal `attn_split_rows`, 256 threads): the bf16 split-K partials of a K-row pass,
-/// bit-identical per row to `attn_partial_k{K}_b16` (verify_bench::tests::verify_attn_splitk_bit_identical) and
-/// cheaper (27B attention shapes, 32K keys, one layer + reduce: K = 1 ~0.65x, K = 8 ~0.4x the attn_partial time).
-pub(crate) fn split_name(k: usize) -> &'static str {
-    match k {
-        1 => "attn_split_k1", 2 => "attn_split_k2", 3 => "attn_split_k3", 4 => "attn_split_k4",
-        5 => "attn_split_k5", 6 => "attn_split_k6", 7 => "attn_split_k7", 8 => "attn_split_k8",
+/// `attn_split_k{K}` / `attn_split_k{K}_q8` (attn_gated.metal `attn_split_rows`, 256 threads): the split-K partials
+/// of a K-row pass, bit-identical per row to `attn_partial_k{K}_b16` / `_q8`
+/// (verify_bench::tests::verify_attn_splitk_bit_identical, verify_attn_splitk_q8_bit_identical) and cheaper (27B
+/// attention shapes, 32K keys, one layer + reduce, bf16: K = 1 ~0.65x, K = 8 ~0.4x the attn_partial time).
+pub(crate) fn split_name(k: usize, q8: bool) -> &'static str {
+    match (k, q8) {
+        (1, false) => "attn_split_k1", (2, false) => "attn_split_k2", (3, false) => "attn_split_k3",
+        (4, false) => "attn_split_k4", (5, false) => "attn_split_k5", (6, false) => "attn_split_k6",
+        (7, false) => "attn_split_k7", (8, false) => "attn_split_k8",
+        (1, true) => "attn_split_k1_q8", (2, true) => "attn_split_k2_q8", (3, true) => "attn_split_k3_q8",
+        (4, true) => "attn_split_k4_q8", (5, true) => "attn_split_k5_q8", (6, true) => "attn_split_k6_q8",
+        (7, true) => "attn_split_k7_q8", (8, true) => "attn_split_k8_q8",
         _ => panic!("attn_split: no variant for k {}", k),
     }
 }
-/// `SD_ATTN_SPLIT=old`: bf16 split-K passes run `attn_partial_k*` (A/B; same numbers, slower).
+/// `SD_ATTN_SPLIT=old`: split-K passes run `attn_partial_k*` (A/B; same numbers, slower).
 fn split_old() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("SD_ATTN_SPLIT").is_ok_and(|v| v.trim() == "old"))
 }
 /// Split-K partial kernel of a `k`-row pass and its threads per threadgroup (dispatch (nch, nh) groups either way):
-/// `attn_split_k{k}` for bf16 KV, `attn_partial_k{k}_q8` for q8 KV.
+/// `attn_split_k{k}[_q8]`, or `attn_partial_k{k}_{b16,q8}` with SD_ATTN_SPLIT=old.
 pub(crate) fn split_k_kernel(k: usize, q8: bool) -> (&'static str, usize) {
-    if q8 || split_old() { (partial_name(k, q8), 128) } else { (split_name(k), 256) }
+    if split_old() { (partial_name(k, q8), 128) } else { (split_name(k, q8), 256) }
 }
 
 /// Bench only (decode_bench --verify K > 8): widest exact pass row count the encoders accept. 8 = the engine

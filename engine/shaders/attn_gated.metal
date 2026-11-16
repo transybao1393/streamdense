@@ -21,8 +21,8 @@
 //   - attn_sdpa_vec_b16 (bf16 KV, N <= 8192): MLX's sdpa_vector / sdpa_vector_2pass mirrored per query row, bit-exact
 //     vs MLX L = 1 decode (measured). K-invariant because each row's arithmetic depends only on its own N.
 //   - attn_partial + attn_reduce_gate (q8 KV, or N > 8192): fixed 256-key chunks, each with fp32 partials (m, l, o)
-//     and an exact max-then-exp softmax per chunk, combined in chunk order. Not bit-exact vs MLX. For bf16 KV the
-//     engine runs attn_split_rows instead of attn_partial (same partials bit for bit, cheaper per row).
+//     and an exact max-then-exp softmax per chunk, combined in chunk order. Not bit-exact vs MLX. The engine runs
+//     attn_split_rows instead of attn_partial (same partials bit for bit, cheaper per row; bf16 and q8 KV).
 //   q/k RMSNorm uses MLX's rms_single_row partition (4 consecutive dims per thread, see attn_prep).
 // Layouts: p bf16 [T][P] with P = nh*2*HD + 2*nkv*HD (q|gate interleaved per head, then k, then v);
 // qr bf16 [T][nh][HD]; KV [nkv][max_ctx][HD] (bf16, or u8 + half2 (scale, min) per 32-dim group [nkv][max_ctx][HD/32]);
@@ -276,8 +276,8 @@ AGP(true, q8, 1) AGP(true, q8, 2) AGP(true, q8, 3) AGP(true, q8, 4) AGP(true, q8
 AGP(true, q8, 8)
 
 #define AG_UNROLL _Pragma("clang loop unroll(full)")
-// ---- attn_split_rows: the bf16 attn_partial of a K-row pass, cheaper per row. BIT-IDENTICAL per row to
-// attn_partial<false, K'> for every K' (so to the one-row pass): the same scores, max, p, chunk sums, written to po / pml
+// ---- attn_split_rows: the attn_partial of a K-row pass, cheaper per row. BIT-IDENTICAL per row to
+// attn_partial<Q8, K'> for every K' (so to the one-row pass): the same scores, max, p, chunk sums, written to po / pml
 // in the same layout; attn_reduce_gate is unchanged. (qwen_layers::split_k_kernel picks it; SD_ATTN_SPLIT=old keeps
 // attn_partial.)
 // Why attn_partial costs ~K x per row (27B shapes, 32K keys: K = 8 ~7x K = 1): every score reads the row's scaled q
@@ -296,8 +296,12 @@ AGP(true, q8, 8)
 //   32 sub + 16 hf + e, TB rows per sweep, l += p; acc_e = fma(p, v_e, acc_e) as there. Combine in attn_partial's
 //   order: Q = r_{2a} + r_{2a+1} (xor 16 here, xor 8 there), S_sgo = Q_{rs 0,1} + Q_{rs 2,3}, o = (((0 + S_0) + S_1) +
 //   S_2) + S_3, l likewise. With TB >= 4 the 4 KB pair-sum buffer reuses the finished sweep's p rows.
+// Q8 (u8 KV + half2 (scale, min) per 32-dim group): the lane's 32 key dims are one group, score = attn_partial's
+//   dd = fma(sc, dd, min * qs) with qs = q_0 + ... + q_31 (in order, from 0) before the butterfly. V: acc_e =
+//   fma(p * sc, v_e, acc_e), ab = fma(p, min, ab) per lane (both 16-dim halves of a group hold the same ab), combined as
+//   attn_partial: o_e = (Q_e + Q'_e) + (ab_Q + ab_Q') per key-stream quad, then the same chunk-order sum.
 // Masked keys (j >= pos + 1 + t) and empty chunks are skipped as in attn_partial, so K-invariance holds.
-template <uint K, uint RP, uint KO, uint TB>
+template <bool Q8, uint K, uint RP, uint KO, uint TB>
 kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const uchar* Kc [[buffer(1)]],
                             device const uchar* Vc [[buffer(2)]], device const half2* Ksb [[buffer(3)]],
                             device const half2* Vsb [[buffer(4)]], device float4* po [[buffer(5)]],
@@ -318,6 +322,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
     threadgroup float redm[8][K];                           // per simdgroup row maxima
     threadgroup float prx[AL ? 1 : 4 * AG_HD];
     threadgroup float pl[8];
+    threadgroup float pab[Q8 ? 4 * AG_NG : 1];             // Q8: ab of the odd simdgroup per (stream quad, group)
     uint c = tg.x, h = tg.y, nch = ntgs.x, nh = ntgs.y, kvh = h / grp;
     uint n0 = ctrl->pos + 1;                                // keys visible to row 0
     uint nmax = n0 + K - 1;
@@ -329,12 +334,37 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
         float q[32];
         float mloc = -INFINITY;
         AG_UNROLL for (uint e = 0; e < 32; e++) q[e] = AG_SCALE * bf(qr[(min(t, K - 1) * nh + h) * HD + sub * 32 + e]);
-        device const uint4* kb = (device const uint4*)(Kc + ((kvh * maxctx) * HD + sub * 32) * 2);
+        float qs = 0;
+        if (Q8) AG_UNROLL for (uint e = 0; e < 32; e++) qs += q[e];
         uint jf = j0 + (sg % SGP) * KO + ko;
+        float kf[32];
+        if (Q8) {
+            device const uint4* kb = (device const uint4*)(Kc + (kvh * maxctx) * HD + sub * 32);
+            device const half2* sbp = Ksb + (kvh * maxctx) * AG_NG + sub;
+            uint4 kn[2];
+            half2 sbn = half2(0);
+            if (jf < j1) { kn[0] = kb[jf * (HD / 16)]; kn[1] = kb[jf * (HD / 16) + 1]; sbn = sbp[jf * AG_NG]; }
+            for (uint j = jf; j < j1; j += ST) {
+                AG_UNROLL for (uint i = 0; i < 2; i++) AG_UNROLL for (uint v = 0; v < 4; v++) {
+                    float4 f = float4(as_type<uchar4>(kn[i][v]));
+                    kf[16 * i + 4 * v] = f.x; kf[16 * i + 4 * v + 1] = f.y; kf[16 * i + 4 * v + 2] = f.z; kf[16 * i + 4 * v + 3] = f.w;
+                }
+                float2 sb = float2(sbn);
+                if (j + ST < j1) { kn[0] = kb[(j + ST) * (HD / 16)]; kn[1] = kb[(j + ST) * (HD / 16) + 1]; sbn = sbp[(j + ST) * AG_NG]; }
+                float dd = 0;
+                AG_UNROLL for (uint e = 0; e < 32; e++) dd = fma(q[e], kf[e], dd);
+                dd = fma(sb.x, dd, sb.y * qs);
+                dd += simd_shuffle_xor(dd, 1); dd += simd_shuffle_xor(dd, 2); dd += simd_shuffle_xor(dd, 4);
+                if (act && j < n0 + t) {
+                    mloc = max(mloc, dd);
+                    if (sub == 0) sc[t][j - j0] = dd;
+                }
+            }
+        } else {
+        device const uint4* kb = (device const uint4*)(Kc + ((kvh * maxctx) * HD + sub * 32) * 2);
         uint4 kn[4];
         if (jf < j1) AG_UNROLL for (uint i = 0; i < 4; i++) kn[i] = kb[jf * (HD / 8) + i];
         for (uint j = jf; j < j1; j += ST) {
-            float kf[32];
             AG_UNROLL for (uint i = 0; i < 4; i++) {
                 float4 a = float4(as_type<bfloat4>(kn[i].xy)), b = float4(as_type<bfloat4>(kn[i].zw));
                 kf[8 * i] = a.x; kf[8 * i + 1] = a.y; kf[8 * i + 2] = a.z; kf[8 * i + 3] = a.w;
@@ -348,6 +378,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
                 mloc = max(mloc, dd);
                 if (sub == 0) sc[t][j - j0] = dd;
             }
+        }
         }
         // octets of the same row in this simdgroup: rs, rs + RP, ... (key slots)
         AG_UNROLL for (uint o = RP; o < RP * KO; o *= 2) mloc = max(mloc, simd_shuffle_xor(mloc, (ushort)(8 * o)));
@@ -366,26 +397,40 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
     uint rl = lane / 16, sub = (lane / 2) % 8, hf = lane % 2;
     uint jv = j0 + 4 * (sg / 2) + 2 * (sg % 2) + rl;
     uint dof = 32 * sub + 16 * hf;
-    device const uint4* vb = (device const uint4*)(Vc + ((kvh * maxctx) * HD + dof) * 2);
+    device const uint4* vb = (device const uint4*)(Vc + ((kvh * maxctx) * HD + dof) * (Q8 ? 1 : 2));
+    device const half2* vsp = Vsb + (kvh * maxctx) * AG_NG + sub;
+    constexpr uint VW = Q8 ? HD / 16 : HD / 8;              // uint4 per cached V row
     for (uint tb = 0; tb < K; tb += TB) {
-        float acc[TB][16], l[TB];
-        AG_UNROLL for (uint u = 0; u < TB; u++) { l[u] = 0; AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = 0; }
+        float acc[TB][16], l[TB], ab[TB];
+        AG_UNROLL for (uint u = 0; u < TB; u++) { l[u] = 0; ab[u] = 0; AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = 0; }
         uint4 vn[2];
-        if (jv < j1) { vn[0] = vb[jv * (HD / 8)]; vn[1] = vb[jv * (HD / 8) + 1]; }
+        half2 sbn = half2(0);
+        if (jv < j1) { vn[0] = vb[jv * VW]; if (Q8) sbn = vsp[jv * AG_NG]; else vn[1] = vb[jv * VW + 1]; }
         for (uint j = jv; j < j1; j += 16) {
             float vf[16];
-            AG_UNROLL for (uint i = 0; i < 2; i++) {
-                float4 a = float4(as_type<bfloat4>(vn[i].xy)), b = float4(as_type<bfloat4>(vn[i].zw));
-                vf[8 * i] = a.x; vf[8 * i + 1] = a.y; vf[8 * i + 2] = a.z; vf[8 * i + 3] = a.w;
-                vf[8 * i + 4] = b.x; vf[8 * i + 5] = b.y; vf[8 * i + 6] = b.z; vf[8 * i + 7] = b.w;
+            float2 sb = float2(sbn);
+            if (Q8) {
+                AG_UNROLL for (uint v = 0; v < 4; v++) {
+                    float4 f = float4(as_type<uchar4>(vn[0][v]));
+                    vf[4 * v] = f.x; vf[4 * v + 1] = f.y; vf[4 * v + 2] = f.z; vf[4 * v + 3] = f.w;
+                }
+                if (j + 16 < j1) { vn[0] = vb[(j + 16) * VW]; sbn = vsp[(j + 16) * AG_NG]; }
+            } else {
+                AG_UNROLL for (uint i = 0; i < 2; i++) {
+                    float4 a = float4(as_type<bfloat4>(vn[i].xy)), b = float4(as_type<bfloat4>(vn[i].zw));
+                    vf[8 * i] = a.x; vf[8 * i + 1] = a.y; vf[8 * i + 2] = a.z; vf[8 * i + 3] = a.w;
+                    vf[8 * i + 4] = b.x; vf[8 * i + 5] = b.y; vf[8 * i + 6] = b.z; vf[8 * i + 7] = b.w;
+                }
+                if (j + 16 < j1) { vn[0] = vb[(j + 16) * VW]; vn[1] = vb[(j + 16) * VW + 1]; }
             }
-            if (j + 16 < j1) { vn[0] = vb[(j + 16) * (HD / 8)]; vn[1] = vb[(j + 16) * (HD / 8) + 1]; }
             if (j < n0) {                                   // key visible to every row
                 AG_UNROLL for (uint u = 0; u < TB; u++) {
                     if (tb + u < K) {
                         float pe = sc[tb + u][j - j0];
                         l[u] += pe;
-                        AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = fma(pe, vf[e], acc[u][e]);
+                        float ps = Q8 ? pe * sb.x : pe;
+                        AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = fma(ps, vf[e], acc[u][e]);
+                        if (Q8) ab[u] = fma(pe, sb.y, ab[u]);
                     }
                 }
             } else {
@@ -394,7 +439,9 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
                     if (t < K && j < n0 + t) {
                         float pe = sc[t][j - j0];
                         l[u] += pe;
-                        AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = fma(pe, vf[e], acc[u][e]);
+                        float ps = Q8 ? pe * sb.x : pe;
+                        AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] = fma(ps, vf[e], acc[u][e]);
+                        if (Q8) ab[u] = fma(pe, sb.y, ab[u]);
                     }
                 }
             }
@@ -406,12 +453,20 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
             if (t >= K) break;                              // uniform
             AG_UNROLL for (uint e = 0; e < 16; e++) acc[u][e] += simd_shuffle_xor(acc[u][e], 16);
             l[u] += simd_shuffle_xor(l[u], 16);
+            if (Q8) ab[u] += simd_shuffle_xor(ab[u], 16);
             // S_sgo = Q_{sg = 2 sgo} + Q_{sg = 2 sgo + 1}; pr[sgo] = Q of the odd simdgroup, then S
             if (rl == 0 && sg % 2 == 1) AG_UNROLL for (uint e = 0; e < 16; e++) pr[(sg / 2) * AG_HD + dof + e] = acc[u][e];
+            if (Q8 && rl == 0 && hf == 0 && sg % 2 == 1) pab[(sg / 2) * AG_NG + sub] = ab[u];
             if (lane == 0) pl[sg] = l[u];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (rl == 0 && sg % 2 == 0)
-                AG_UNROLL for (uint e = 0; e < 16; e++) pr[(sg / 2) * AG_HD + dof + e] = acc[u][e] + pr[(sg / 2) * AG_HD + dof + e];
+            if (rl == 0 && sg % 2 == 0) {
+                // Q8: attn_partial's red = acc + ab after the 4-stream sum, i.e. (Q + Q') + (ab_Q + ab_Q')
+                float abs_ = Q8 ? ab[u] + pab[(sg / 2) * AG_NG + sub] : 0.0f;
+                AG_UNROLL for (uint e = 0; e < 16; e++) {
+                    float s = acc[u][e] + pr[(sg / 2) * AG_HD + dof + e];
+                    pr[(sg / 2) * AG_HD + dof + e] = Q8 ? s + abs_ : s;
+                }
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint slot = (t * nh + h) * nch + c;
             if (tid < HD / 4) {
@@ -429,10 +484,14 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
     }
 }
 // (K, RP, KO, TB) per K: measured best of the valid geometries at 32K keys (verify_bench --attn-pass)
-#define ASR(K_, RP_, KO_, TB_) template [[host_name("attn_split_k" #K_)]] kernel void attn_split_rows<K_, RP_, KO_, TB_>( \
+#define ASR(Q_, S_, K_, RP_, KO_, TB_) template [[host_name("attn_split_k" #K_ S_)]] kernel void attn_split_rows<Q_, K_, RP_, KO_, TB_>( \
     device const ushort*, device const uchar*, device const uchar*, device const half2*, device const half2*, \
     device float4*, device float2*, device const SdCtrl*, constant uint&, constant uint&, uint2, uint2, uint, uint, uint);
-ASR(1, 1, 4, 1) ASR(2, 2, 2, 2) ASR(3, 4, 1, 3) ASR(4, 4, 1, 4) ASR(5, 4, 1, 3) ASR(6, 4, 1, 3) ASR(7, 4, 1, 2) ASR(8, 4, 1, 2)
+ASR(false, "", 1, 1, 4, 1) ASR(false, "", 2, 2, 2, 2) ASR(false, "", 3, 4, 1, 3) ASR(false, "", 4, 4, 1, 4)
+ASR(false, "", 5, 4, 1, 3) ASR(false, "", 6, 4, 1, 3) ASR(false, "", 7, 4, 1, 2) ASR(false, "", 8, 4, 1, 2)
+// q8 KV: attn_split_k{K}_q8, bit-identical to attn_partial_k{K}_q8 (the bf16 geometries; other valid ones measured within noise)
+ASR(true, "_q8", 1, 1, 4, 1) ASR(true, "_q8", 2, 2, 2, 2) ASR(true, "_q8", 3, 4, 1, 3) ASR(true, "_q8", 4, 4, 1, 4)
+ASR(true, "_q8", 5, 4, 1, 3) ASR(true, "_q8", 6, 4, 1, 3) ASR(true, "_q8", 7, 4, 1, 2) ASR(true, "_q8", 8, 4, 1, 2)
 
 // ---- attn_reduce_gate: threadgroup (q head h, token t), 64 threads x float4 (HD = 256).
 // Combine the chunks (skipping empty ones, l = 0): M = max m, w = fast::exp(m - M), L = sum w l, o = sum w o

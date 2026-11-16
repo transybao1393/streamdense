@@ -535,15 +535,18 @@ const AT_NH: usize = 24;
 const AT_NKV: usize = 4;
 const AT_HD: usize = 256;
 
-struct AttnRig { g: Gpu, a: Arena, b: crate::qwen_layers::VaBufs, sc: usize, ao2: usize, max_ctx: usize, po: usize, pml: usize, bytes: usize }
+/// `q8`: the same-shaped KV in q8 (u8 values k, v + half2 (scale, min) per 32-dim group ks, vs), random contents.
+struct AttnRig { g: Gpu, a: Arena, b: crate::qwen_layers::VaBufs, sc: usize, ao2: usize, max_ctx: usize, po: usize, pml: usize, bytes: usize,
+                 q8: [usize; 4] }
 
 fn attn_rig(max_ctx: usize, seed: u64) -> Result<AttnRig, String> {
     use crate::qwen_layers::{va_scratch_bytes, vm_pipelines, VaBufs};
     let mut g = Gpu::from_shader_files(&["common_bf16", "deltanet", "attn_gated", "verify_mixers"])?;
     g.pipeline("attn_sdpa_vec_b16")?;
     for p in vm_pipelines() { g.pipeline(&p)?; }
-    for t in 1..=8 { g.pipeline(crate::qwen_layers::partial_name(t, false))?; }
-    for t in 1..=8 { g.pipeline(crate::qwen_layers::split_name(t))?; }
+    for t in 1..=8 {
+        for q8 in [false, true] { g.pipeline(crate::qwen_layers::partial_name(t, q8))?; g.pipeline(crate::qwen_layers::split_name(t, q8))?; }
+    }
     g.pipeline("attn_reduce_gate")?;
     let kvb = AT_NKV * max_ctx * AT_HD * 2;
     let prow = AT_NH * 2 * AT_HD + 2 * AT_NKV * AT_HD;
@@ -552,19 +555,33 @@ fn attn_rig(max_ctx: usize, seed: u64) -> Result<AttnRig, String> {
     // split-K partials for 8 rows over every chunk of max_ctx: po f32 [8][nh][nch][hd], pml f32x2 [8][nh][nch]
     let nch = max_ctx.div_ceil(crate::qwen_engine::ATTN_CHUNK);
     let (pob, pmlb) = (8 * AT_NH * nch * AT_HD * 4, 8 * AT_NH * nch * 8);
-    let len = 2 * kvb + 8 * prow * 2 + 3 * 8 * AT_NH * AT_HD * 2 + cfg_sc + pob + pmlb + (4 << 20);
+    let (kqb, ksb) = (AT_NKV * max_ctx * AT_HD, AT_NKV * max_ctx * (AT_HD / 32) * 4);
+    let len = 2 * kvb + 2 * (kqb + ksb) + 8 * prow * 2 + 3 * 8 * AT_NH * AT_HD * 2 + cfg_sc + pob + pmlb + (4 << 20);
     let mut a = Arena::new(&g, len)?;
     let (k, v) = (a.alloc(kvb)?, a.alloc(kvb)?);
     let (qr, p, ao, ao2) = (a.alloc(8 * AT_NH * AT_HD * 2)?, a.alloc(8 * prow * 2)?, a.alloc(8 * AT_NH * AT_HD * 2)?, a.alloc(8 * AT_NH * AT_HD * 2)?);
     let ctrl = a.alloc(std::mem::size_of::<streamdense_metal::SdCtrl>())?;
     let sc = a.alloc(cfg_sc)?;
     let (po, pml) = (a.alloc(pob)?, a.alloc(pmlb)?);
+    let q8 = [a.alloc(kqb)?, a.alloc(kqb)?, a.alloc(ksb)?, a.alloc(ksb)?];
     let mut rng = Rng(seed);
     // keys / queries ~N(0, 1) with a few large values: peaked softmaxes and wide exponents in the partial sums
     for o in [k, v] { for x in a.sl::<u16>(o, kvb / 2) { *x = to_bf(if rng.f() < 0.02 { 6.0 * rng.n() } else { rng.n() }); } }
     for x in a.sl::<u16>(qr, 8 * AT_NH * AT_HD) { *x = to_bf(2.0 * rng.n()); }
     for x in a.sl::<u16>(p, 8 * prow) { *x = to_bf(3.0 * rng.n()); }
-    Ok(AttnRig { g, a, b: VaBufs { qr, k, v, p, ao, ctrl }, sc, ao2, max_ctx, po, pml, bytes: len })
+    // q8 KV: random codes; per group fp16 scale ~ range / 255 and min ~ -range / 2 (range 1..13, a few groups with
+    // large ranges), plus zero / signed-zero / subnormal scales and mins scattered through
+    for o in [q8[0], q8[1]] { for x in a.sl::<u8>(o, kqb) { *x = (rng.next() >> 56) as u8; } }
+    let f16 = streamdense_core::f16::f32_to_f16;
+    for o in [q8[2], q8[3]] {
+        for (i, x) in a.sl::<u16>(o, ksb / 2).chunks_exact_mut(2).enumerate() {
+            let r = if rng.f() < 0.02 { 12.0 + 40.0 * rng.f() } else { 1.0 + 12.0 * rng.f() };
+            x[0] = f16(r / 255.0);
+            x[1] = f16(-r * (0.3 + 0.4 * rng.f()));
+            match i % 211 { 3 => x[0] = 0, 5 => x[1] = 0x8000, 7 => { x[0] = 0x0001; x[1] = 0x0000 } 11 => x[0] = 0x03ff, _ => {} }
+        }
+    }
+    Ok(AttnRig { g, a, b: VaBufs { qr, k, v, p, ao, ctrl }, sc, ao2, max_ctx, po, pml, bytes: len, q8 })
 }
 
 impl AttnRig {
@@ -608,49 +625,56 @@ impl AttnRig {
 impl AttnRig {
     /// `t` rows of the engine's attention (`attn_sdpa_rows`: split-K for rows with N > lim, then the verify mirror
     /// for rows with N <= lim) at ctrl.pos = `pos`, reading qr / p rows `row0..row0 + t`, writing ao rows from `ao`.
-    /// `vm`: verify mixers on (va_sdpa rows for N <= lim) or off (attn_sdpa_vec_b16 rows).
+    /// `vm`: verify mixers on (va_sdpa rows for N <= lim) or off (attn_sdpa_vec_b16 rows). `q8`: on the q8 KV.
     #[allow(clippy::too_many_arguments)]
-    fn pass(&self, e: &Enc, pos: usize, t: usize, row0: usize, ao: usize, nch: usize, vm: bool) {
+    fn pass(&self, e: &Enc, pos: usize, t: usize, row0: usize, ao: usize, nch: usize, vm: bool, q8: bool) {
         let prow = AT_NH * 2 * AT_HD + 2 * AT_NKV * AT_HD;
         let rb = AT_NH * AT_HD * 2;
         let b = crate::qwen_layers::VaBufs { qr: self.b.qr + row0 * rb, p: self.b.p + row0 * prow * 2, ao, ..self.b };
-        let kv = crate::qwen_layers::KvRef { k: self.b.k, v: self.b.v, ksb: self.b.k, vsb: self.b.v, q8: false, max_ctx: self.max_ctx };
+        let [k, v, ksb, vsb] = if q8 { self.q8 } else { [self.b.k, self.b.v, self.b.k, self.b.v] };
+        let b = crate::qwen_layers::VaBufs { k, v, ..b };
+        let kv = crate::qwen_layers::KvRef { k, v, ksb, vsb, q8, max_ctx: self.max_ctx };
         crate::qwen_layers::attn_sdpa_rows(e, &kv, &b, self.po, self.pml, pos, t, nch, AT_NH, AT_NKV, AT_HD, prow, vm.then_some(self.sc));
     }
     /// Split-K partials (kernel `name`, `threads` per threadgroup) + attn_reduce_gate for all `t` rows at ctrl.pos,
     /// whatever their N (the split-K kernels are defined for every N).
-    fn splitk(&self, e: &Enc, t: usize, ao: usize, nch: usize, name: &str, threads: usize) {
+    /// `q8`: on the q8 KV (kernel `name` must be a q8 variant).
+    #[allow(clippy::too_many_arguments)]
+    fn splitk(&self, e: &Enc, t: usize, ao: usize, nch: usize, name: &str, threads: usize, q8: bool) {
         let prow = AT_NH * 2 * AT_HD + 2 * AT_NKV * AT_HD;
         let b = &self.b;
-        e.pso(name).b(0, b.qr).b(1, b.k).b(2, b.v).b(3, b.k).b(4, b.v).b(5, self.po).b(6, self.pml).b(7, b.ctrl)
+        let [k, v, ks, vs] = if q8 { self.q8 } else { [b.k, b.v, b.k, b.v] };
+        e.pso(name).b(0, b.qr).b(1, k).b(2, v).b(3, ks).b(4, vs).b(5, self.po).b(6, self.pml).b(7, b.ctrl)
             .u(8, self.max_ctx as u32).u(9, (AT_NH / AT_NKV) as u32).groups((nch, AT_NH), threads);
         e.pso("attn_reduce_gate").b(0, self.po).b(1, self.pml).b(2, b.p).b(3, ao).u(4, nch as u32).u(5, prow as u32)
             .groups((AT_NH, t), AT_HD / 4);
     }
-    /// `attn_split_k{t}` == the original `attn_partial_k{t}_b16`, bit for bit over all t rows, at the minimal chunk
-    /// count and with every chunk of max_ctx dispatched.
+    /// `attn_split_k{t}[_q8]` == the original `attn_partial_k{t}_{b16,q8}`, bit for bit over all t rows, at the minimal
+    /// chunk count and with every chunk of max_ctx dispatched.
     #[cfg(test)]
-    fn check_splitk(&self, pos: usize, t: usize) -> Result<Vec<String>, String> {
+    fn check_splitk(&self, pos: usize, t: usize, q8: bool) -> Result<Vec<String>, String> {
         use crate::qwen_engine::ATTN_CHUNK;
         let n = t * AT_NH * AT_HD;
-        let (name, threads) = (crate::qwen_layers::split_name(t), 256);
+        let (name, threads) = (crate::qwen_layers::split_name(t, q8), 256);
+        let old = crate::qwen_layers::partial_name(t, q8);
         let mut bad = vec![];
         self.set_pos(pos);
         for nch in [(pos + t).div_ceil(ATTN_CHUNK), self.max_ctx.div_ceil(ATTN_CHUNK)] {
             self.a.sl::<u8>(self.ao2, 2 * n).fill(0x5a);
-            run(&self.g, &self.a, &|e| self.splitk(e, t, self.ao2, nch, crate::qwen_layers::partial_name(t, false), 128))?;
+            run(&self.g, &self.a, &|e| self.splitk(e, t, self.ao2, nch, old, 128, q8))?;
             self.a.sl::<u8>(self.b.ao, 2 * n).fill(0xa5);
-            run(&self.g, &self.a, &|e| self.splitk(e, t, self.b.ao, nch, name, threads))?;
+            run(&self.g, &self.a, &|e| self.splitk(e, t, self.b.ao, nch, name, threads, q8))?;
             let (x, y) = (self.a.sl::<u16>(self.b.ao, n), self.a.sl::<u16>(self.ao2, n));
             let d = x.iter().zip(y.iter()).filter(|(u, v)| u != v).count();
-            if d > 0 { bad.push(format!("split-K {} vs attn_partial_k{}_b16, pos {} nch {}: {} / {} outputs differ", name, t, pos, nch, d, n)); }
+            if d > 0 { bad.push(format!("split-K {} vs {}, pos {} nch {}: {} / {} outputs differ", name, old, pos, nch, d, n)); }
         }
         Ok(bad)
     }
     /// K-invariance of the whole attention path at long contexts: a t-row pass at `pos` (chunks just covering
     /// pos + t, and again with every chunk of max_ctx dispatched) == t one-row passes at pos + i (each with its own
     /// minimal chunk count), bit for bit over all t rows. Returns (failures, max |diff| over mismatching outputs).
-    fn check_rows(&self, pos: usize, t: usize) -> Result<(Vec<String>, f32), String> {
+    /// `q8`: the same on the q8 KV (split-K for every row).
+    fn check_rows(&self, pos: usize, t: usize, q8: bool) -> Result<(Vec<String>, f32), String> {
         use crate::qwen_engine::ATTN_CHUNK;
         let rb = AT_NH * AT_HD * 2;
         let n = t * AT_NH * AT_HD;
@@ -659,14 +683,14 @@ impl AttnRig {
         self.a.sl::<u8>(self.ao2, 2 * n).fill(0x5a);
         for i in 0..t {
             self.set_pos(pos + i);
-            run(&self.g, &self.a, &|e| self.pass(e, pos + i, 1, i, self.ao2 + i * rb, (pos + i + 1).div_ceil(ATTN_CHUNK), true))?;
+            run(&self.g, &self.a, &|e| self.pass(e, pos + i, 1, i, self.ao2 + i * rb, (pos + i + 1).div_ceil(ATTN_CHUNK), true, q8))?;
         }
         let mut bad = vec![];
         let mut worst = 0f32;
         self.set_pos(pos);
         for nch in [(pos + t).div_ceil(ATTN_CHUNK), self.max_ctx.div_ceil(ATTN_CHUNK)] {
             self.a.sl::<u8>(self.b.ao, 2 * n).fill(0xa5);
-            run(&self.g, &self.a, &|e| self.pass(e, pos, t, 0, self.b.ao, nch, true))?;
+            run(&self.g, &self.a, &|e| self.pass(e, pos, t, 0, self.b.ao, nch, true, q8))?;
             let (x, y) = (self.a.sl::<u16>(self.b.ao, n), self.a.sl::<u16>(self.ao2, n));
             let mut rows = vec![];
             for (i, (u, v)) in x.iter().zip(y.iter()).enumerate() {
@@ -677,7 +701,7 @@ impl AttnRig {
                 }
             }
             let d = x.iter().zip(y.iter()).filter(|(u, v)| u != v).count();
-            if d > 0 { bad.push(format!("attn rows pos {} T {} nch {}: {} / {} outputs differ (rows {:?})", pos, t, nch, d, n, rows)); }
+            if d > 0 { bad.push(format!("attn rows{} pos {} T {} nch {}: {} / {} outputs differ (rows {:?})", if q8 { " q8" } else { "" }, pos, t, nch, d, n, rows)); }
         }
         Ok((bad, worst))
     }
@@ -690,7 +714,7 @@ fn attn_cli(poss: &[usize], ks: &[usize], reps: usize) -> Result<(), String> {
     let mut bad = vec![];
     println!("verify attention rig: arena {:.1} MB, max_ctx {}", rig.bytes as f64 / 1e6, max_ctx);
     for &pos in poss {
-        for &t in ks.iter().filter(|&&t| (1..=8).contains(&t)) { bad.extend(rig.check(pos, t)?); bad.extend(rig.check_rows(pos, t)?.0); }
+        for &t in ks.iter().filter(|&&t| (1..=8).contains(&t)) { bad.extend(rig.check(pos, t)?); bad.extend(rig.check_rows(pos, t, false)?.0); }
     }
     println!("verify attention bit identity (pos {:?}, K {:?}, R {:?}): {}", poss, ks, crate::qwen_layers::VA_RS,
              if bad.is_empty() { "ALL OK".into() } else { format!("FAIL\n  {}", bad.join("\n  ")) });
@@ -729,7 +753,7 @@ fn attn_cli(poss: &[usize], ks: &[usize], reps: usize) -> Result<(), String> {
 /// GPU ms of one layer's engine attention path (`attn_sdpa_rows`, as a verify pass of K rows runs it: split-K for
 /// rows with N > 8192, else attn_sdpa_vec_b16 / va_sdpa with verify mixers) for K = 1..8 at kv length N ~ pos,
 /// median over `reps` command buffers of 4 passes each, then the split-K kernels alone (attn_partial vs
-/// attn_split_rows, + attn_reduce_gate). One layer of the 27B (nh 24, nkv 4, hd 256, bf16 KV).
+/// attn_split_rows, + attn_reduce_gate). One layer of the 27B (nh 24, nkv 4, hd 256), bf16 KV, then the same for q8 KV.
 fn attn_pass_cli(poss: &[usize], reps: usize) -> Result<(), String> {
     use crate::qwen_engine::ATTN_CHUNK;
     let max_ctx = poss.iter().max().copied().unwrap_or(1024) + 16;
@@ -755,14 +779,19 @@ fn attn_pass_cli(poss: &[usize], reps: usize) -> Result<(), String> {
     for &pos in poss {
         rig.set_pos(pos);
         for vm in [false, true] {
-            let us = med(&|e, t| rig.pass(e, pos, t, 0, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), vm))?;
+            let us = med(&|e, t| rig.pass(e, pos, t, 0, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), vm, false))?;
             row(pos, if vm { "verify_mixers" } else { "default" }, &us);
         }
+        let us = med(&|e, t| rig.pass(e, pos, t, 0, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), false, true))?;
+        row(pos, "q8 default", &us);
         // the split-K kernels alone (+ attn_reduce_gate) for every row, whatever N: before / after attn_split_rows
-        let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::partial_name(t, false), 128))?;
-        row(pos, "split-K attn_partial", &us);
-        let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::split_name(t), 256))?;
-        row(pos, "split-K attn_split", &us);
+        for q8 in [false, true] {
+            let kv = if q8 { "q8 " } else { "" };
+            let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::partial_name(t, q8), 128, q8))?;
+            row(pos, &format!("{}split-K attn_partial", kv), &us);
+            let us = med(&|e, t| rig.splitk(e, t, rig.b.ao, (pos + t).div_ceil(ATTN_CHUNK), crate::qwen_layers::split_name(t, q8), 256, q8))?;
+            row(pos, &format!("{}split-K attn_split", kv), &us);
+        }
     }
     Ok(())
 }
@@ -857,7 +886,7 @@ mod tests {
     }
 
     /// Long contexts up to 32768 keys: the full attention path (split-K above lim = 8192, verify mirror below, both
-    /// in a straddling pass) of a K-row pass == K one-row passes, bit for bit, K = 1..8. Positions straddle lim, cross
+    /// in a straddling pass; q8 KV: split-K for every row) of a K-row pass == K one-row passes, bit for bit, K = 1..8. Positions straddle lim, cross
     /// the 256-key chunk edges (N = 256 c, 256 c + 1), sit mid range and reach N = 32768.
     #[test]
     fn verify_attn_long_bit_identical() {
@@ -871,14 +900,16 @@ mod tests {
                     16383, 16384, 16385, 20000, 24575, 24576, 24577, 32511, 32512, 32760, 32764, 32767] {
             for t in 1..=8 {
                 if pos + t <= MAX {
-                    let (b, w) = rig.check_rows(pos, t).unwrap();
-                    bad.extend(b);
-                    worst = worst.max(w);
-                    checked += 1;
+                    for q8 in [false, true] {
+                        let (b, w) = rig.check_rows(pos, t, q8).unwrap();
+                        bad.extend(b);
+                        worst = worst.max(w);
+                        checked += 1;
+                    }
                 }
             }
         }
-        println!("verify_attn_long: {} (pos, T) passes checked, {} failures, max |diff| {}", checked, bad.len(), worst);
+        println!("verify_attn_long: {} (pos, T, kv) passes checked, {} failures, max |diff| {}", checked, bad.len(), worst);
         assert!(bad.is_empty(), "max |diff| {}\n{}", worst, bad.join("\n"));
     }
     /// The split-K kernel the engine runs for K rows == the original `attn_partial_k{K}_b16`, bit for bit, K = 1..8,
@@ -904,10 +935,30 @@ mod tests {
         poss.extend((0..16).map(|i| 9000 + 257 * i + i * i)); // assorted fills of the last chunk
         for &pos in &poss {
             for t in 1..=8 {
-                if pos + t <= MAX { bad.extend(rig.check_splitk(pos, t).unwrap()); checked += 1; }
+                if pos + t <= MAX { bad.extend(rig.check_splitk(pos, t, false).unwrap()); checked += 1; }
             }
         }
         println!("verify_attn_splitk: {} (pos, K) passes checked x 2 chunk counts, {} failures", checked, bad.len());
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// q8 KV: `attn_split_k{K}_q8` == `attn_partial_k{K}_q8`, bit for bit, K = 1..8, up to 32768 keys, at the same
+    /// positions as verify_attn_splitk_bit_identical (zero / subnormal scales and signed-zero mins in the rig's KV).
+    #[test]
+    fn verify_attn_splitk_q8_bit_identical() {
+        const MAX: usize = 32768;
+        let rig = attn_rig(MAX, 17).expect("rig");
+        let mut bad = vec![];
+        let mut checked = 0;
+        let mut poss = vec![0usize, 1, 2, 5, 37, 250, 252, 253, 254, 255, 256, 257, 511, 1000, 1023, 4093, 8183, 8191, 8192, 8193,
+                            8447, 8448, 12287, 12345, 16380, 16383, 16384, 20000, 24575, 24576, 32511, 32512, 32760, 32764, 32767];
+        poss.extend((0..16).map(|i| 9000 + 257 * i + i * i));
+        for &pos in &poss {
+            for t in 1..=8 {
+                if pos + t <= MAX { bad.extend(rig.check_splitk(pos, t, true).unwrap()); checked += 1; }
+            }
+        }
+        println!("verify_attn_splitk_q8: {} (pos, K) passes checked x 2 chunk counts, {} failures", checked, bad.len());
         assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 }
