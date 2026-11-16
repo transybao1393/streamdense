@@ -276,6 +276,12 @@ AGP(true, q8, 1) AGP(true, q8, 2) AGP(true, q8, 3) AGP(true, q8, 4) AGP(true, q8
 AGP(true, q8, 8)
 
 #define AG_UNROLL _Pragma("clang loop unroll(full)")
+// 4 u8 codes (one uint, little endian) -> exact floats via half: (0x6400 | b) is the half 1024 + b, minus 1024 = b.
+static inline void ag_u8x4(uint w, thread float* f) {
+    half2 lo = as_type<half2>((w & 0x00ff00ffu) | 0x64006400u) - half2(1024.0h);
+    half2 hi = as_type<half2>(((w >> 8) & 0x00ff00ffu) | 0x64006400u) - half2(1024.0h);
+    f[0] = lo.x; f[1] = hi.x; f[2] = lo.y; f[3] = hi.y;
+}
 // ---- attn_split_rows: the attn_partial of a K-row pass, cheaper per row. BIT-IDENTICAL per row to
 // attn_partial<Q8, K'> for every K' (so to the one-row pass): the same scores, max, p, chunk sums, written to po / pml
 // in the same layout; attn_reduce_gate is unchanged. (qwen_layers::split_k_kernel picks it; SD_ATTN_SPLIT=old keeps
@@ -299,7 +305,10 @@ AGP(true, q8, 8)
 // Q8 (u8 KV + half2 (scale, min) per 32-dim group): the lane's 32 key dims are one group, score = attn_partial's
 //   dd = fma(sc, dd, min * qs) with qs = q_0 + ... + q_31 (in order, from 0) before the butterfly. V: acc_e =
 //   fma(p * sc, v_e, acc_e), ab = fma(p, min, ab) per lane (both 16-dim halves of a group hold the same ab), combined as
-//   attn_partial: o_e = (Q_e + Q'_e) + (ab_Q + ab_Q') per key-stream quad, then the same chunk-order sum.
+//   attn_partial: o_e = (Q_e + Q'_e) + (ab_Q + ab_Q') per key-stream quad, then the same chunk-order sum. Codes go
+//   to float with ag_u8x4 (half bit trick, exact, the same values as float(uchar)): the u8 -> float conversions, not
+//   the bytes, bounded the q8 kernel (it was slower than bf16 from K = 3 up); the score converts 4 codes at a time
+//   between its FMAs (same chain order).
 // Masked keys (j >= pos + 1 + t) and empty chunks are skipped as in attn_partial, so K-invariance holds.
 template <bool Q8, uint K, uint RP, uint KO, uint TB>
 kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const uchar* Kc [[buffer(1)]],
@@ -337,7 +346,6 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
         float qs = 0;
         if (Q8) AG_UNROLL for (uint e = 0; e < 32; e++) qs += q[e];
         uint jf = j0 + (sg % SGP) * KO + ko;
-        float kf[32];
         if (Q8) {
             device const uint4* kb = (device const uint4*)(Kc + (kvh * maxctx) * HD + sub * 32);
             device const half2* sbp = Ksb + (kvh * maxctx) * AG_NG + sub;
@@ -345,14 +353,15 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
             half2 sbn = half2(0);
             if (jf < j1) { kn[0] = kb[jf * (HD / 16)]; kn[1] = kb[jf * (HD / 16) + 1]; sbn = sbp[jf * AG_NG]; }
             for (uint j = jf; j < j1; j += ST) {
-                AG_UNROLL for (uint i = 0; i < 2; i++) AG_UNROLL for (uint v = 0; v < 4; v++) {
-                    float4 f = float4(as_type<uchar4>(kn[i][v]));
-                    kf[16 * i + 4 * v] = f.x; kf[16 * i + 4 * v + 1] = f.y; kf[16 * i + 4 * v + 2] = f.z; kf[16 * i + 4 * v + 3] = f.w;
-                }
+                uint4 kc[2] = {kn[0], kn[1]};
                 float2 sb = float2(sbn);
                 if (j + ST < j1) { kn[0] = kb[(j + ST) * (HD / 16)]; kn[1] = kb[(j + ST) * (HD / 16) + 1]; sbn = sbp[(j + ST) * AG_NG]; }
                 float dd = 0;
-                AG_UNROLL for (uint e = 0; e < 32; e++) dd = fma(q[e], kf[e], dd);
+                AG_UNROLL for (uint g = 0; g < 8; g++) {           // 4 codes at a time, the chain in dim order
+                    float f4[4];
+                    ag_u8x4(kc[g / 4][g % 4], f4);
+                    AG_UNROLL for (uint e = 0; e < 4; e++) dd = fma(q[4 * g + e], f4[e], dd);
+                }
                 dd = fma(sb.x, dd, sb.y * qs);
                 dd += simd_shuffle_xor(dd, 1); dd += simd_shuffle_xor(dd, 2); dd += simd_shuffle_xor(dd, 4);
                 if (act && j < n0 + t) {
@@ -362,6 +371,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
             }
         } else {
         device const uint4* kb = (device const uint4*)(Kc + ((kvh * maxctx) * HD + sub * 32) * 2);
+        float kf[32];
         uint4 kn[4];
         if (jf < j1) AG_UNROLL for (uint i = 0; i < 4; i++) kn[i] = kb[jf * (HD / 8) + i];
         for (uint j = jf; j < j1; j += ST) {
@@ -410,10 +420,7 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
             float vf[16];
             float2 sb = float2(sbn);
             if (Q8) {
-                AG_UNROLL for (uint v = 0; v < 4; v++) {
-                    float4 f = float4(as_type<uchar4>(vn[0][v]));
-                    vf[4 * v] = f.x; vf[4 * v + 1] = f.y; vf[4 * v + 2] = f.z; vf[4 * v + 3] = f.w;
-                }
+                AG_UNROLL for (uint v = 0; v < 4; v++) ag_u8x4(vn[0][v], &vf[4 * v]);
                 if (j + 16 < j1) { vn[0] = vb[(j + 16) * VW]; sbn = vsp[(j + 16) * AG_NG]; }
             } else {
                 AG_UNROLL for (uint i = 0; i < 2; i++) {
@@ -489,7 +496,8 @@ kernel void attn_split_rows(device const ushort* qr [[buffer(0)]], device const 
     device float4*, device float2*, device const SdCtrl*, constant uint&, constant uint&, uint2, uint2, uint, uint, uint);
 ASR(false, "", 1, 1, 4, 1) ASR(false, "", 2, 2, 2, 2) ASR(false, "", 3, 4, 1, 3) ASR(false, "", 4, 4, 1, 4)
 ASR(false, "", 5, 4, 1, 3) ASR(false, "", 6, 4, 1, 3) ASR(false, "", 7, 4, 1, 2) ASR(false, "", 8, 4, 1, 2)
-// q8 KV: attn_split_k{K}_q8, bit-identical to attn_partial_k{K}_q8 (the bf16 geometries; other valid ones measured within noise)
+// q8 KV: attn_split_k{K}_q8, bit-identical to attn_partial_k{K}_q8 (the bf16 geometries; re-measured after ag_u8x4: the other
+// valid ones, incl. 2 rows per lane octet, were slower)
 ASR(true, "_q8", 1, 1, 4, 1) ASR(true, "_q8", 2, 2, 2, 2) ASR(true, "_q8", 3, 4, 1, 3) ASR(true, "_q8", 4, 4, 1, 4)
 ASR(true, "_q8", 5, 4, 1, 3) ASR(true, "_q8", 6, 4, 1, 3) ASR(true, "_q8", 7, 4, 1, 2) ASR(true, "_q8", 8, 4, 1, 2)
 
