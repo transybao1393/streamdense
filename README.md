@@ -55,12 +55,25 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   |---|---|---|---|---|
   | ~12,200 | bf16 | 12.86 tok/s | 16.48 tok/s | 16.13 GB |
   | ~12,200 | 8-bit | 12.75 tok/s | 15.77 tok/s | 15.75 GB |
-  | ~32,560 | bf16 | 10.94 tok/s | 13.98 tok/s | 17.56 GB |
+  | ~32,560 | bf16 | 11.39 tok/s | 14.34 tok/s | 17.58 GB |
   | ~32,560 | 8-bit | 11.30 tok/s | **14.82 tok/s** | **16.57 GB** |
   | Before: ~12,200 / ~32,560 | bf16 | 11.97 / 10.33 tok/s | 13.13 / 9.94 tok/s | 16.14 / 17.55 GB |
 
-  The bf16 rows and the 12K 8-bit row were measured before the faster one-row attention below; the 32K 8-bit row
-  includes everything.
+  The 12K rows were measured before the faster one-row attention below; the 32K bf16 row includes the re-measured
+  auto-depth costs below.
+
+  Copy-heavy output at long context (an edit prompt that rewrites the last 80 lines of the code in the prompt,
+  8-bit KV, output identical to plain in every run):
+
+  | Context | Plain | MTP auto | Context drafts | MTP + context drafts | Peak RAM |
+  |---|---|---|---|---|---|
+  | ~12,200 | 13.29 tok/s | 37.02 tok/s | 33.64 tok/s | **37.44 tok/s** | 15.77 GB |
+  | ~32,560 | 12.41 tok/s | 27.98 tok/s | **35.50 tok/s** | 32.98 tok/s | 16.58 GB |
+
+  MTP auto depth uses re-measured attention costs per key (the 8-bit table was 2.4–3x too steep) and weighs each
+  acceptance estimate by how much evidence it has, so copy output keeps deep passes and prose gets shallower ones.
+  MTP + context drafts (`[gateway] mtp_ctx_draft = 7`, default 0 = off) fills each pass from a suffix match in the
+  context first, then MTP; on prose at 32K it is 8% slower than MTP alone (13.18 vs 14.34 tok/s), so it stays off.
 
   What changed: MTP auto depth now counts the attention cost of each verify row at long context, so MTP is faster
   than plain at 32K too (it was slower before); verify attention above 8,192 keys uses a faster split-K kernel (bf16

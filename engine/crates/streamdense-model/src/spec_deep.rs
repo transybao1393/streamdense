@@ -341,7 +341,8 @@ pub fn generate_spec_ov(eng: &QwenEngine, prompt: &[u32], n_new: usize, depth: u
 //           Drafting cannot overlap the verify itself: D1 needs the verify's final hidden of the last accepted row
 //           and the bonus token's embedding (SSD pread of a GPU-chosen id).
 // Planner (deterministic: only GPU-computed confidences and acceptance history, never timings):
-//   q_s (P(draft s accepted | drafts < s accepted)) = MTP: 0.5 cal_m[bin(top-1 prob)] + 0.5 ewma_s; table: 0.5
+//   q_s (P(draft s accepted | drafts < s accepted)) = MTP: 0.5 cal_m[bin(top-1 prob)] + 0.5 ewma_s (each term at the
+//   weight of its observations, up to N_FULL, the rest from the prior blend: `Plan::q_m`); table: 0.5
 //   cal_t[bin(conditional conf)] + 0.5 conf. E(d) = 1 + Σ_{i<=d} Π_{s<=i} q_s, T(d) = round_ms + pass_ms[d] (K = d+1)
 //   + mtp_ms * chain steps + attention(K, N); choose d = argmax E/T (d = 0: a one-row pass, no drafts).
 //   Context-aware attention term: every verify row reads the whole KV, so a K-row pass costs ~K x one row's
@@ -361,6 +362,9 @@ const PAD_MS: f64 = 1.5;
 pub(crate) const MIN_PREFIX: f64 = 0.03;
 const NBIN: usize = 5;
 const EW_ALPHA: f64 = 0.15;
+/// Observations after which a calibration bin / a depth's EWMA counts fully in `Plan::q_m` (before: blended with
+/// its prior in proportion).
+const N_FULL: u32 = 8;
 pub(crate) const TAIL: usize = 16;
 
 /// Speculative depth policy of a generation.
@@ -392,7 +396,7 @@ pub struct SpecCost {
     /// µs per KV key per attention layer of a K-row pass (K = 1..8), bf16 split-K path (`attn_split_rows` +
     /// `attn_reduce_gate`: rows with N > 8192).
     pub attn_us_key: [f64; 8],
-    /// Same for q8 KV (every row split-K, `attn_partial_k*_q8`).
+    /// Same for q8 KV (every row split-K, `attn_split_k*_q8` / GQA variants).
     pub attn_us_key_q8: [f64; 8],
     /// Same for the single / two-pass sdpa rows (bf16 KV, N <= 8192).
     pub attn_us_key_short: [f64; 8],
@@ -401,10 +405,14 @@ pub struct SpecCost {
 /// for a K-row pass at 27B attention shapes (24 q heads, 4 kv heads, head dim 256, bf16 KV) divided by N, on an
 /// M4 Pro: `verify_bench --attn-pass` (split-K at N = 32760, mean of the default and verify_mixers rows, linear in N
 /// within 4% from 8K to 32K; short path at N = 8000, default kernels). Other shapes are scaled by kv_dim / 1024.
-/// Split-K = `attn_split_rows` (2026-11-16; K = 5 / 6 and 7 / 8 cost about the same: two score passes, and
-/// 3 / 2-row value sweeps). The q8 table keeps the earlier `attn_partial` bf16 measurement as its estimate.
-const ATTN_US_KEY_SPLIT: [f64; 8] = [0.0305, 0.0451, 0.0549, 0.0620, 0.1021, 0.1015, 0.1279, 0.1204];
-const ATTN_US_KEY_SPLIT_Q8: [f64; 8] = [0.0475, 0.1089, 0.1553, 0.2209, 0.2424, 0.2590, 0.3063, 0.3343];
+/// Split-K = `attn_split_rows` (K = 5 / 6 and 7 / 8 cost about the same: two score passes, and 3 / 2-row value
+/// sweeps). Re-measured 2026-11-16 after the q8 split-K kernel (u8 conversion) and the GQA-shared K = 1 / 2 kernels:
+/// bf16 = mean of default + verify_mixers rows, q8 = the "q8 default" row, two runs at N = 32768 each (12288: within
+/// 10%); bf16 K = 1 / 2 fell from 0.0305 / 0.0451, every q8 K from 0.0475 .. 0.3343 (the old `attn_partial`
+/// estimate, 2.4-3x too steep: the planner over-charged deep passes at long context with q8 KV). Short path
+/// unchanged (N = 8000 re-measured within 6%).
+const ATTN_US_KEY_SPLIT: [f64; 8] = [0.0240, 0.0342, 0.0557, 0.0622, 0.1031, 0.1019, 0.1280, 0.1220];
+const ATTN_US_KEY_SPLIT_Q8: [f64; 8] = [0.0199, 0.0351, 0.0537, 0.0607, 0.1046, 0.1020, 0.1338, 0.1218];
 const ATTN_US_KEY_SHORT: [f64; 8] = [0.0443, 0.0618, 0.0954, 0.1135, 0.1534, 0.1709, 0.2059, 0.2250];
 impl Default for SpecCost {
     fn default() -> Self {
@@ -448,6 +456,9 @@ pub trait DraftSource {
     fn observe(&mut self, context_tail: &[u32], accepted: &[u32], verifier_top3: &[[u32; 3]]);
     fn begin_sequence(&mut self, prompt: &[u32]);
     fn flush(&mut self);
+    /// `begin_sequence` of a feed that starts at KV position `pos` (`seq` = the fed tokens + the first output token);
+    /// sources that index the whole KV (ctx_draft.rs `CtxSource`) keep their history up to `pos`.
+    fn begin_at(&mut self, pos: usize, seq: &[u32]) { let _ = pos; self.begin_sequence(seq) }
 }
 impl DraftSource for DraftTable {
     fn propose(&mut self, t: &[u32], max: usize) -> Vec<(u32, f32)> { DraftTable::propose(self, t, max) }
@@ -481,6 +492,9 @@ pub(crate) struct Plan {
     pub(crate) cost: SpecCost,
     ew: [f64; SPEC_DEPTH_MAX],
     cal_m: [f64; NBIN],
+    /// observations so far of each ew depth / cal_m bin (saturating at N_FULL)
+    n_ew: [u32; SPEC_DEPTH_MAX],
+    n_cal: [u32; NBIN],
     cal_t: [f64; NBIN],
     /// attention layers of the main model x kv scale (0 = no attention term: the context-blind policy)
     attn_w: f64,
@@ -494,7 +508,8 @@ pub(crate) struct Plan {
 impl Plan {
     pub(crate) fn new(cost: SpecCost) -> Plan {
         let c = [0.1, 0.3, 0.5, 0.7, 0.9];
-        Plan { cost, ew: [0.8; SPEC_DEPTH_MAX], cal_m: c, cal_t: c, attn_w: 0.0, attn_mtp: 0.0, split_all: false, n: 0 }
+        Plan { cost, ew: [0.8; SPEC_DEPTH_MAX], cal_m: c, n_ew: [0; SPEC_DEPTH_MAX], n_cal: [0; NBIN], cal_t: c, attn_w: 0.0, attn_mtp: 0.0,
+               split_all: false, n: 0 }
     }
     /// Context-aware planner: `attn_layers` attention layers with `kv_dim` (27B: 16, 1024), q8 KV or not.
     pub(crate) fn with_attn(mut self, attn_layers: usize, kv_dim: usize, q8: bool) -> Plan {
@@ -514,10 +529,18 @@ impl Plan {
     }
     /// ms of a K-row verify pass at the current n (matmuls + main-model attention).
     pub(crate) fn pass(&self, k: usize) -> f64 { self.cost.pass_ms[k.clamp(1, 8) - 1] + self.attn_w * self.attn1(k) }
-    /// MTP draft s (1-based), top-1 prob p if known.
+    /// MTP draft s (1-based), top-1 prob p if known: 0.5 cal_m[bin(p)] + 0.5 ew[s], each term taken at the weight of
+    /// its evidence (observations / N_FULL) and the rest from the prior blend. A bin without data does not drag a
+    /// well-measured high acceptance down (copy-heavy text: the chain otherwise stops at the first draft whose MTP
+    /// probability lands in a not-yet-seen low bin), and vice versa; with both measured it is the plain 50 / 50 blend.
     pub(crate) fn q_m(&self, s: usize, p: Option<f64>) -> f64 {
-        let e = self.ew[(s - 1).min(SPEC_DEPTH_MAX - 1)];
-        match p { Some(p) => 0.5 * self.cal_m[bin(p)] + 0.5 * e, None => e }
+        let i = (s - 1).min(SPEC_DEPTH_MAX - 1);
+        let e = self.ew[i];
+        let Some(p) = p else { return e };
+        let b = bin(p);
+        let c = self.cal_m[b];
+        let (wc, we) = (0.5 * self.n_cal[b] as f64 / N_FULL as f64, 0.5 * self.n_ew[i] as f64 / N_FULL as f64);
+        wc * c + we * e + (1.0 - wc - we) * (0.5 * c + 0.5 * e)
     }
     pub(crate) fn q_t(&self, c: f64) -> f64 { 0.5 * self.cal_t[bin(c)] + 0.5 * c.clamp(0.0, 1.0) }
     pub(crate) fn t(&self, d: usize, steps: usize) -> f64 {
@@ -537,6 +560,16 @@ impl Plan {
         }
         b
     }
+    /// Chain decision after s = qs.len() MTP drafts (q of each known): run one more chain step when the best depth
+    /// over 0..=cap (later drafts at their ew, s - 1 steps already sunk) lies beyond s and Π q >= MIN_PREFIX.
+    pub(crate) fn go_on(&self, qs: &[f64], cap: usize) -> bool {
+        let s = qs.len();
+        let mut qq = qs.to_vec();
+        for t in s + 1..=cap { qq.push(self.q_m(t, None)); }
+        let pre: f64 = qs.iter().product();
+        let (b, _) = self.best(&qq, cap, &|d| d.max(s) - 1);
+        b > s && pre >= MIN_PREFIX
+    }
     /// After a verify: drafts (source, MTP prob or table conditional conf) with j accepted.
     pub(crate) fn update(&mut self, rows: &[(Src, f64)], j: usize) {
         for (i, &(src, c)) in rows.iter().enumerate().take(j + 1) {
@@ -545,7 +578,12 @@ impl Plan {
                 Src::Mtp => {
                     let s = i.min(SPEC_DEPTH_MAX - 1);
                     self.ew[s] += EW_ALPHA * (ok - self.ew[s]);
-                    if c >= 0.0 { let b = bin(c); self.cal_m[b] += EW_ALPHA * (ok - self.cal_m[b]); }
+                    self.n_ew[s] = (self.n_ew[s] + 1).min(N_FULL);
+                    if c >= 0.0 {
+                        let b = bin(c);
+                        self.cal_m[b] += EW_ALPHA * (ok - self.cal_m[b]);
+                        self.n_cal[b] = (self.n_cal[b] + 1).min(N_FULL);
+                    }
                 }
                 Src::Table => { let b = bin(c); self.cal_t[b] += EW_ALPHA * (ok - self.cal_t[b]); }
                 Src::Pad => {}
@@ -743,13 +781,7 @@ impl QwenEngine {
                     drafts[s - 1] = last;
                     self.reader.read_rows(&[last], self.stage_row(s))?;
                     if s >= cap { break; }
-                    let go_on = if auto {
-                        let mut qq = qs.clone();
-                        for t in s + 1..=cap { qq.push(plan.q_m(t, None)); }
-                        let pre: f64 = qs.iter().product();
-                        let (b, _) = plan.best(&qq, cap, &|d| d.max(s) - 1);
-                        b > s && pre >= MIN_PREFIX
-                    } else { true };
+                    let go_on = !auto || plan.go_on(&qs, cap);
                     if !go_on || s - 1 >= chain.len() { break; }
                     if oracle.as_ref().is_some_and(|o| o.skip_chain) {
                         // DraftOverride::External: no chain step; the placeholder is replaced (and staged) by the
@@ -939,6 +971,7 @@ impl QwenEngine {
         if ids.is_empty() { return Err("feed_stream_spec: no tokens".into()); }
         if self.pos() + ids.len() > self.opt.max_ctx { st.stop_reason = "ctx_full"; return Ok((st, r)); }
         let tp = Instant::now();
+        let p0 = self.pos();
         let (t1, hf) = self.prefill_mtp(ids)?;
         self.mtp_first_draft(t1, hf, 0)?;
         let (_, _, ms) = self.mtp_parts()?;
@@ -949,7 +982,7 @@ impl QwenEngine {
             if let Some(s) = self.draft_src.borrow_mut().as_mut() {
                 let mut seq = ids.to_vec();
                 seq.push(t1);
-                s.begin_sequence(&seq);
+                s.begin_at(p0, &seq);
             }
         }
         st.prefill_s = tp.elapsed().as_secs_f64();
@@ -1063,6 +1096,66 @@ mod tests {
                 if q == 0.0 { assert_eq!(d, 0); }
             }
         }
+    }
+
+    /// The chain of one round as `spec_loop_pipe` runs it: MTP drafts with top-1 probs `probs` (one per chain step,
+    /// as far as the planner continues), then the final depth among the computed drafts (steps sunk). Returns d.
+    fn round_depth(p: &Plan, probs: &[f64]) -> usize {
+        let cap = SPEC_DEPTH_MAX;
+        let mut qs = vec![p.q_m(1, Some(probs[0]))];
+        while qs.len() < cap && p.go_on(&qs, cap) { let s = qs.len(); qs.push(p.q_m(s + 1, Some(probs[s]))); }
+        let steps = qs.len() - 1;
+        p.best(&qs, qs.len(), &|_| steps).0
+    }
+    fn rng(s: &mut u64) -> f64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; (*s >> 11) as f64 / (1u64 << 53) as f64 }
+
+    /// Synthetic acceptance histories of the two measured regimes (27B, 32K context):
+    /// copy-heavy edit (q8 KV): ~0.9 conditional acceptance at every depth, MTP probs mostly high with some mid / low
+    /// ones that are accepted too -> the planner keeps going deep (>= 5 drafts) even through a low-prob draft, like
+    /// the context-blind policy (measured: all depth 7, 28.59 tok/s vs 23.49 with depth 1 in 10 / 34 rounds).
+    /// prose summary (bf16 KV): ~0.5 acceptance, roughly calibrated MTP probs -> shallow (<= 2 drafts) on typical
+    /// drafts, as the context-aware policy measured (12.79 vs 11.77 tok/s context-blind).
+    #[test]
+    fn regimes_copy_deep_prose_shallow() {
+        let mut s = 0x9e37_79b9u64;
+        // copy: 30 rounds of 7 MTP drafts, ~0.88 conditional acceptance
+        let mut cp = Plan::new(SpecCost::default()).with_attn(16, 1024, true);
+        cp.n = 32600;
+        let cyc = [0.95, 0.9, 0.5, 0.97, 0.3, 0.9, 0.95, 0.6, 0.92];
+        for r in 0..30 {
+            let rows: Vec<(Src, f64)> = (0..7).map(|i| (Src::Mtp, cyc[(r + i) % cyc.len()])).collect();
+            let mut j = 0;
+            while j < 7 && rng(&mut s) > 0.12 { j += 1; }
+            cp.update(&rows, j);
+        }
+        // incl. drafts whose MTP prob falls in a bin the history never saw (< 0.2)
+        let copy_rounds: [&[f64]; 5] = [&[0.95, 0.9, 0.95, 0.9, 0.97, 0.9, 0.95], &[0.9, 0.3, 0.95, 0.9, 0.9, 0.95, 0.9],
+                                        &[0.5, 0.9, 0.9, 0.6, 0.9, 0.95, 0.9], &[0.15, 0.95, 0.9, 0.9, 0.5, 0.9, 0.9],
+                                        &[0.9, 0.15, 0.9, 0.9, 0.9, 0.9, 0.9]];
+        let dc: Vec<usize> = copy_rounds.iter().map(|pr| round_depth(&cp, pr)).collect();
+        // prose: 60 rounds of 1..2 drafts, accepted with probability ~ the MTP prob (overall ~0.5)
+        let mut pp = Plan::new(SpecCost::default()).with_attn(16, 1024, false);
+        pp.n = 32560;
+        let (mut acc, mut tot) = (0, 0);
+        for r in 0..60 {
+            let k = 1 + r % 2;
+            let rows: Vec<(Src, f64)> = (0..k).map(|_| (Src::Mtp, 0.1 + 0.85 * rng(&mut s))).collect();
+            let mut j = 0;
+            while j < k && rng(&mut s) < rows[j].1 { j += 1; }
+            acc += j; tot += (j + 1).min(k);
+            pp.update(&rows, j);
+        }
+        let prose_rounds: [&[f64]; 4] = [&[0.5, 0.4, 0.5, 0.5, 0.5, 0.5, 0.5], &[0.6, 0.5, 0.3, 0.5, 0.5, 0.5, 0.5],
+                                         &[0.3, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6], &[0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55]];
+        let dp: Vec<usize> = prose_rounds.iter().map(|pr| round_depth(&pp, pr)).collect();
+        println!("copy 32K q8: ew {:?} cal {:?} -> depths {:?}", cp.ew, cp.cal_m, dc);
+        println!("prose 32K bf16 (acceptance {:.2}): ew {:?} cal {:?} -> depths {:?}", acc as f64 / tot as f64, pp.ew, pp.cal_m, dp);
+        assert!(dc.iter().all(|&d| d >= 5), "copy regime not deep: {:?}", dc);
+        assert!(dp.iter().all(|&d| d <= 2), "prose regime not shallow: {:?}", dp);
+        // a fresh plan (no history) with a low-prob first draft: stays cautious at 32K
+        let mut f = Plan::new(SpecCost::default()).with_attn(16, 1024, false);
+        f.n = 32560;
+        assert!(round_depth(&f, &[0.2; 7]) <= 1);
     }
 
     /// Short contexts: the attention term barely moves the plan (same depth as the context-blind planner).

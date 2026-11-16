@@ -172,6 +172,10 @@ pub fn main(a: &Args) {
     });
     // its RAM joins the 12 GB plan (keep formula) like the draft table's
     if let Some(c) = &hist_cfg { opt.history_bytes = c.budget_bytes; }
+    // combined MTP + context drafts ([gateway] mtp_ctx_draft, default 0 = off): only with MTP and spec_depth = auto
+    let mcd = conf.cfg.gateway.mtp_ctx_draft;
+    opt.mtp_ctx_draft = if opt.mtp && opt.spec_auto { mcd } else { 0 };
+    if mcd > 0 && opt.mtp_ctx_draft == 0 { eprintln!("mtp_ctx_draft {} ignored: needs MTP with spec_depth = auto", mcd); }
     if !opt.spec_auto && !fh_ctx && opt.draft_table.is_some() { eprintln!("draft_table ignored: only used with spec_depth = auto or 12 GB context drafts"); opt.draft_table = None; }
     // batched decode (model batch.rs): up to N requests decode together, each in its own engine slot (KV + MTP KV +
     // DeltaNet state per slot); needs MTP with spec depth >= 2 or auto; refused with the drafter / 12 GB mode / dumps

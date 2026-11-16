@@ -30,9 +30,19 @@
 //! prefills the prompt prefix FRESH (one prefill per prompt), saves a snapshot, runs dflash2 straight on from that live
 //! state (tail + N tokens), then restores the snapshot for its own plain row. Tokens are compared with the MTP engine's
 //! plain row and with the DFlash2 engine's plain row. SD_EXACT_DFLASH2_ONLY=1: skip the MTP engine (no MTP rows).
+//! Context drafts (bench only): SD_EXACT_CTX_DRAFT=d (1..=7) opens the MTP engine with `QwenOptions.ctx_draft = d`
+//! (the hold save of d + 1 rows + the CPU lookup index; plain / MTP decode do not use them) and adds a row
+//! "ctx draft d" per prompt after the MTP rows: `feed_stream_ctx` from the same restored snapshot + tail, n-gram lookup
+//! drafts only (draft table off, `set_draft_source(None)`), the lookup history = the prompt prefix. Reports acceptance,
+//! passes, accepted drafts per pass (0..7), tokens per pass and lookup drafts proposed / accepted; tokens must equal
+//! plain. It also adds the row "mtp auto + ctx draft d" after the MTP rows (engine opened with `mtp_ctx_draft = d`):
+//! the MTP auto loop (context-aware planner) with `CtxSource` as its draft source (lookup up to d drafts, history = the
+//! snapshot prefix + tail, over a fresh draft table): per round the lookup run or the MTP chain, whichever the
+//! planner expects to give more tokens per ms.
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
+use streamdense_model::ctx_draft::{CtxDrafter, CtxSource};
 use streamdense_model::draft_table::DraftTable;
 use streamdense_model::spec::DraftOverride;
 use streamdense_model::spec_deep::SpecMode;
@@ -107,6 +117,12 @@ fn mtp_exact_27b_per_position() {
         assert!(p.join("config.json").exists() && p.join("model.safetensors").exists(), "SD_EXACT_DFLASH2={}: no config.json + model.safetensors", p.display());
     }
     assert!(!df2_only || df2_dir.is_some(), "SD_EXACT_DFLASH2_ONLY=1 needs SD_EXACT_DFLASH2=DIR");
+    // SD_EXACT_CTX_DRAFT=d: context-draft rows (bench only), d drafts max per verify pass
+    let ctx_d: usize = std::env::var("SD_EXACT_CTX_DRAFT").ok().filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap_or_else(|_| panic!("SD_EXACT_CTX_DRAFT={}: want 1..=7", s))).unwrap_or(0);
+    assert!(ctx_d <= 7, "SD_EXACT_CTX_DRAFT={}: want 1..=7", ctx_d);
+    assert!(ctx_d == 0 || bench, "SD_EXACT_CTX_DRAFT needs SD_EXACT_BENCH=1");
+    assert!(ctx_d == 0 || !df2_only, "SD_EXACT_CTX_DRAFT needs the MTP engine (not with SD_EXACT_DFLASH2_ONLY=1)");
     let prompts: Vec<(String, Vec<u32>)> = match &pfile {
         Some(p) => {
             let ids: Vec<u32> = std::fs::read_to_string(p).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
@@ -134,13 +150,15 @@ fn mtp_exact_27b_per_position() {
         cap, prefill_exact, max_ctx, kv, mtp: true, spec_depth: 7, spec_auto: true, activity: true, activity_batch: true, read_mask: true,
         draft_vocab: std::path::Path::new(&vk).exists().then(|| vk.clone().into()),
         draft_table: Some(sdir.join("draft_table")),
+        ctx_draft: ctx_d,
+        mtp_ctx_draft: ctx_d,
         ..Default::default()
     };
     let t_open = Instant::now();
     let e = QwenEngine::open(&d, opt).unwrap();
-    eprintln!("kv {:?}; open {:.1} s; verify_fused {} verify_mixers {} decode_fused {} gemv {} prefill_exact {} draft_vocab {}",
+    eprintln!("kv {:?}; open {:.1} s; verify_fused {} verify_mixers {} decode_fused {} gemv {} prefill_exact {} draft_vocab {} ctx_draft {}",
               e.opt.kv, t_open.elapsed().as_secs_f64(), e.opt.verify_fused, e.opt.verify_mixers, e.opt.decode_fused, e.opt.gemv.name(),
-              e.opt.prefill_exact, e.opt.draft_vocab.is_some());
+              e.opt.prefill_exact, e.opt.draft_vocab.is_some(), e.opt.ctx_draft);
     let v = e.w.lm_head.rows;
     let modes = [SpecMode::Fixed(2), SpecMode::Fixed(4), SpecMode::Fixed(7), SpecMode::Auto { max: 7 }];
     let mut table: Vec<String> = vec![];
@@ -194,13 +212,22 @@ fn mtp_exact_27b_per_position() {
             eprintln!("{}", line_p);
             table.push(line_p);
             plain_toks.push(tp.clone());
-            for (label, ctx_cost) in [("mtp auto (old, context-blind)", "0"), ("mtp auto (context-aware)", "1")] {
+            let mut runs: Vec<(String, &str, bool)> = vec![("mtp auto (old, context-blind)".into(), "0", false), ("mtp auto (context-aware)".into(), "1", false)];
+            if ctx_d > 0 { runs.push((format!("mtp auto + ctx draft {}", ctx_d), "1", true)); }
+            for (i, (label, ctx_cost, combined)) in runs.iter().enumerate() {
+                let (label, ctx_cost) = (label.as_str(), *ctx_cost);
                 std::env::set_var("SD_SPEC_CTX_COST", ctx_cost);
                 // a fresh, empty draft table per run: neither run learns from the other's continuation
-                let tdir = sdir.join(format!("draft_table_bench_{}", ctx_cost));
+                let tdir = sdir.join(format!("draft_table_bench_{}", i));
                 let _ = std::fs::remove_dir_all(&tdir);
-                e.set_draft_source(Some(Box::new(DraftTable::open(&tdir, e.opt.draft_table_bytes).unwrap())));
+                let dt = Box::new(DraftTable::open(&tdir, e.opt.draft_table_bytes).unwrap());
                 let feed = start();
+                if *combined {
+                    // combined MTP + context drafts: the lookup (history = the KV: the snapshot prefix) over the table
+                    let mut cs = CtxSource::new(ctx_d, Some(dt));
+                    if snap.is_some() { cs.cx.set_history(&ids[..pl - SNAP_TAIL]); }
+                    e.set_draft_source(Some(Box::new(cs)));
+                } else { e.set_draft_source(Some(dt)); }
                 let mut tm: Vec<u32> = vec![];
                 let (mut s0, mut s1) = (None, None);
                 let tw = Instant::now();
@@ -219,12 +246,43 @@ fn mtp_exact_27b_per_position() {
                                      (tm.len() - 1) as f64 / dec_m, wall_m, tm.len() as f64 / wall_m,
                                      r.accepted as f64 / drafts.max(1) as f64, r.accepted, drafts, r.passes, st.stop_reason, r.depth_hist);
                 eprintln!("{}\ntokens equal plain vs {}: {} ({} vs {} tokens)", line_m, label, tp == tm, tp.len(), tm.len());
+                eprintln!("{}: drafts mtp {} (acc {}), lookup / table {} (acc {}), pad {} (acc {}), accepted per pass (0..7) {:?}, tokens per pass {:.2}",
+                          label, r.drafts_mtp, r.acc_mtp, r.drafts_table, r.acc_table, r.drafts_pad, r.acc_pad, r.accept_hist, r.tokens_per_pass);
                 table.push(line_m);
                 if tp != tm { bad += 1; }
                 e.set_draft_source(None);
                 let _ = std::fs::remove_dir_all(&tdir);
             }
             std::env::remove_var("SD_SPEC_CTX_COST");
+            if ctx_d > 0 {
+                // context drafts alone: lookup over prompt + output, no draft table
+                e.set_draft_source(None);
+                let mut cx = CtxDrafter::new();
+                let feed = start();
+                if snap.is_some() { cx.set_history(&ids[..pl - SNAP_TAIL]); }
+                let label = format!("ctx draft {}", ctx_d);
+                let mut tc: Vec<u32> = vec![];
+                let (mut s0, mut s1) = (None, None);
+                let tw = Instant::now();
+                let (st, cs) = e.feed_stream_ctx(feed, n, &[], &mut |t| {
+                    let now = Instant::now();
+                    if s0.is_none() { s0 = Some(now); }
+                    s1 = Some(now);
+                    tc.push(t);
+                    true
+                }, &mut cx).unwrap();
+                let wall_c = tw.elapsed().as_secs_f64();
+                let dec_c = s1.unwrap().duration_since(s0.unwrap()).as_secs_f64();
+                let line_c = format!("| {} | {} | {} | {:.2} s | {:.2} tok/s | {:.2} s | {:.2} tok/s | {:.3} ({} / {}) | {} ({}) | {:?} |", name, label, tc.len(), dec_c,
+                                     (tc.len() - 1) as f64 / dec_c, wall_c, tc.len() as f64 / wall_c, cs.acceptance(), cs.accepted, cs.drafted,
+                                     cs.passes, st.stop_reason, cs.accept_hist);
+                eprintln!("{}\n{}: passes {} (drafted {}), tokens per pass {:.2}, lookup drafts proposed {} accepted {}, table {:?}, history {:?}, rows per pass (K 1..8) {:?}, verify {:.1} ms + replay {:.1} ms GPU, draft CPU {:.1} ms",
+                          line_c, label, cs.passes, cs.drafted_passes, cs.tokens_per_pass(), cs.lookup_drafts, cs.lookup_acc,
+                          (cs.table_drafts, cs.table_acc), (cs.history_drafts, cs.history_acc), cs.k_hist, cs.verify_ms, cs.replay_ms, cs.draft_cpu_ms);
+                eprintln!("tokens equal plain vs {}: {} ({} vs {} tokens)", label, tp == tc, tp.len(), tc.len());
+                table.push(line_c);
+                if tp != tc { bad += 1; }
+            }
             if let Some(sp) = &snap { let _ = std::fs::remove_file(sp); }
             continue;
         }
@@ -326,7 +384,7 @@ fn mtp_exact_27b_per_position() {
             peak = format!("{} (MTP engine); DFlash2 engine: process peak {:.2} GB (includes the MTP engine's peak if that was higher)", peak, pk);
         }
         print_bench(&table, &peak);
-        assert_eq!(bad, 0, "{} rows: MTP / DFlash2 tokens differ from plain greedy", bad);
+        assert_eq!(bad, 0, "{} rows: MTP / ctx draft / DFlash2 tokens differ from plain greedy", bad);
         return;
     }
     println!("\n| prompt | depth | positions | N paths (single / two-pass / split-K) | min plain margin | logits bit-identical | hf bit-identical | tokens identical | acceptance | verify rows used (row 0..7) | first mismatch | time |");
@@ -337,7 +395,7 @@ fn mtp_exact_27b_per_position() {
 }
 
 fn print_bench(table: &[String], peak: &str) {
-    println!("\n| prompt | mode | tokens | decode s (first to last token) | decode tok/s (tokens - 1) | wall s incl. {} tail | wall tok/s | acceptance (accepted / drafts) | passes (stop) | real drafts per pass (0..7); dflash2: accepted per pass (0..7) |", SNAP_TAIL);
+    println!("\n| prompt | mode | tokens | decode s (first to last token) | decode tok/s (tokens - 1) | wall s incl. {} tail | wall tok/s | acceptance (accepted / drafts) | passes (stop) | real drafts per pass (0..7); dflash2 / ctx draft: accepted per pass (0..7) |", SNAP_TAIL);
     println!("|---|---|---|---|---|---|---|---|---|---|");
     for l in table { println!("{}", l); }
     println!("{}", peak);

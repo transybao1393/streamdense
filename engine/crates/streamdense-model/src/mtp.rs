@@ -219,7 +219,6 @@ impl QwenEngine {
         let hb = cfg.hidden * BF;
         let io = self.io();
         let p0 = self.pos();
-        self.pf_begin(); // q8-conversion prototype (no-op unless SD_PF_Q8CONV=1 with --kv q8)
         let ch = self.chunks(ids.len());
         let mut inflight: std::collections::VecDeque<streamdense_metal::CmdBuf> = Default::default();
         let mut hf_last = io.hf;
@@ -267,9 +266,7 @@ impl QwenEngine {
             if last { hf_last = io.hf + (k - 1) * hb; }
         }
         for cb in &inflight { let w = wait(cb); if res.is_ok() { res = w; } }
-        if res.is_err() { self.pf_on.set(false); }
         res?;
-        self.pf_end();
         self.rm_prefill_end();
         Ok((self.ctrl_read().tok[0], hf_last))
     }

@@ -26,7 +26,7 @@ use crate::mtp::CONF_BYTES;
 use crate::qwen_engine::{QwenEngine, StreamStats};
 use crate::qwen_layers::{encode_head_batch, encode_layer_batch, PassIo, SeqRows};
 use crate::spec::{DraftOverride, Oracle, SpecResult};
-use crate::spec_deep::{mtp_prob, Plan, Src, SpecMode, MIN_PREFIX, TAIL};
+use crate::spec_deep::{mtp_prob, Plan, Src, SpecMode, TAIL};
 
 /// Most sequence slots an engine allocates (`QwenOptions.seqs`).
 pub const SEQS_MAX: usize = 4;
@@ -111,6 +111,7 @@ impl QwenEngine {
                                hist: vec![], plan: self.new_plan(), oracle: Oracle::new(ov), t_dec: Instant::now() };
         if self.pos() + ids.len() > self.opt.max_ctx { s.finish("ctx_full"); return Ok(s); }
         let tp = Instant::now();
+        let p0 = self.pos();
         let (t1, hf) = self.prefill_mtp(ids)?;
         self.mtp_first_draft(t1, hf, 0)?;
         let ms = self.mtp_s().as_ref().ok_or("batch: MTP is off")?;
@@ -121,7 +122,7 @@ impl QwenEngine {
             if let Some(src) = self.draft_src.borrow_mut().as_mut() {
                 let mut seq = ids.to_vec();
                 seq.push(t1);
-                src.begin_sequence(&seq);
+                src.begin_at(p0, &seq);
             }
         }
         s.st.prefill_s = tp.elapsed().as_secs_f64();
@@ -204,13 +205,7 @@ impl QwenEngine {
                 let s = &*seqs[w.i];
                 let n = w.drafts.len();
                 let go_on = n < w.cap && match s.mode {
-                    SpecMode::Auto { .. } => {
-                        let mut qq = w.qs.clone();
-                        for t in n + 1..=w.cap { qq.push(s.plan.q_m(t, None)); }
-                        let pre: f64 = w.qs.iter().product();
-                        let (b, _) = s.plan.best(&qq, w.cap, &|d| d.max(n) - 1);
-                        b > n && pre >= MIN_PREFIX
-                    }
+                    SpecMode::Auto { .. } => s.plan.go_on(&w.qs, w.cap),
                     SpecMode::Fixed(_) => true,
                 };
                 w.chaining = go_on;

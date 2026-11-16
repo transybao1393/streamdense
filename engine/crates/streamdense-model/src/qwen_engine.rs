@@ -120,6 +120,11 @@ pub struct QwenOptions {
     /// accepted rows are replayed in place: no second state copy. Adds the hold save ((d + 1) x replay row, 7.9 MB at
     /// d = 7 on the 27B) and, with a draft table, its RAM budget to the plan (so the 12 GB keep formula counts them).
     pub ctx_draft: usize,
+    /// combined MTP + context drafts (ctx_draft.rs `CtxSource`): in the MTP auto loop (spec_auto) each round takes the
+    /// context-lookup run (up to this many drafts, capped by spec_depth) or the MTP chain, whichever the planner expects
+    /// to give more tokens per ms; the engine's draft table, if any, stays a fallback source. Same verify / replay as
+    /// MTP (lossless). CPU lookup index only (~100 B per context token, `lookup_bytes`). 0 = off (default).
+    pub mtp_ctx_draft: usize,
     /// fused K-row verify matmuls (verify_fused_q4.metal, 2026-11-03): exact passes of 3..=8 rows with the Mma family
     /// and no read mask run `vf_gemv` / `vf_swiglu` (bit-identical to the Mma / MmaD kernels; synthetic 27B K = 8
     /// matmul pass 122.4 -> 94.0 ms). K <= 2, read-masked passes and the compact CDown keep today's kernels. Adds the
@@ -167,7 +172,7 @@ impl Default for QwenOptions {
                       draft_vocab: None, spec_auto: false, spec_cost: Default::default(), draft_table: None,
                       draft_table_bytes: crate::spec_deep::DRAFT_TABLE_BYTES, activity: true, activity_batch: false, live_cap: 0, read_mask: false, ffn_select: false,
                       ffn_compact: None, ffn_stream_tokens: 0, ffn_stream_slots: 2, ffn_stream_host: false, ffn_stream_fast: false,
-                      decode_fused: false, ctx_draft: 0, verify_fused: false, verify_mixers: false, history_bytes: 0, gate_hold: false, ffn_x_capture: false,
+                      decode_fused: false, ctx_draft: 0, mtp_ctx_draft: 0, verify_fused: false, verify_mixers: false, history_bytes: 0, gate_hold: false, ffn_x_capture: false,
                       dflash: None, dflash_log_taps: false, dflash2: None, seqs: 1 }
     }
 }
@@ -252,11 +257,6 @@ fn weight_regions(cfg: &QwenConfig, mtp: bool) -> usize {
     main + if mtp { 4 + per(LayerKind::Attention) } else { 0 }
 }
 
-/// q8-conversion prototype switch (bench / env only, default off): `SD_PF_Q8CONV=1` with `--kv q8` and the fast prefill on =
-/// fast bf16 prefill of a prompt that starts at position 0, then one in-place conversion of its KV to q8, then q8
-/// decode. Prefills that start at pos > 0 take today's exact q8 prefill.
-pub fn pf_q8conv() -> bool { std::env::var("SD_PF_Q8CONV").map(|v| v == "1").unwrap_or(false) }
-
 fn layout(cfg: &QwenConfig, opt: &QwenOptions) -> Result<Layout, String> {
     if !KS.contains(&opt.prefill_k) { return Err(format!("prefill_k {} not in {:?}", opt.prefill_k, KS)); }
     if opt.max_ctx == 0 { return Err("max_ctx = 0".into()); }
@@ -274,6 +274,9 @@ fn layout(cfg: &QwenConfig, opt: &QwenOptions) -> Result<Layout, String> {
     }
     // MTP verify needs 2 rows (deep verify d + 1, and 4 MTP emb rows for the chained drafts); fast prefill passes have
     // up to prefill_t rows (po / pml / logits stay at 8 rows)
+    if opt.mtp_ctx_draft > 0 && (!opt.mtp || opt.mtp_ctx_draft > crate::spec_deep::SPEC_DEPTH_MAX) {
+        return Err(format!("mtp_ctx_draft {}: needs MTP, 1..={}", opt.mtp_ctx_draft, crate::spec_deep::SPEC_DEPTH_MAX));
+    }
     if opt.ctx_draft > crate::spec_deep::SPEC_DEPTH_MAX {
         return Err(format!("ctx_draft {} not in 0..={}", opt.ctx_draft, crate::spec_deep::SPEC_DEPTH_MAX));
     }
@@ -321,10 +324,6 @@ fn layout(cfg: &QwenConfig, opt: &QwenOptions) -> Result<Layout, String> {
     let n = cfg.kv_heads * opt.max_ctx * cfg.head_dim;
     let (kv_vals, kv_sb) = match opt.kv {
         KvFormat::Bf16 => (n * 2, 0),
-        // q8-conversion prototype (pf_q8conv): q8 KV whose K / V regions are bf16-sized, so the fast (bf16) prefill can write
-        // them and `pf_convert` turns them into q8 in place (vals in the first half, scales in ks / vs as usual)
-        // (scales in the same region after the n q8 bytes: n / 8 bytes <= n, so peak RAM = the bf16 KV's)
-        KvFormat::Q8 if pf_q8conv() && !opt.prefill_exact => (n * 2, 0),
         KvFormat::Q8 => (n, cfg.kv_heads * opt.max_ctx * (cfg.head_dim / 32) * 4),
     };
     let copies = if opt.mtp { 2 } else { 1 };
@@ -363,9 +362,8 @@ fn layout(cfg: &QwenConfig, opt: &QwenOptions) -> Result<Layout, String> {
     if opt.seqs == 0 || opt.seqs > crate::batch::SEQS_MAX { return Err(format!("seqs {} not in 1..={}", opt.seqs, crate::batch::SEQS_MAX)); }
     if opt.seqs > 1 {
         if !opt.mtp { return Err("seqs > 1 (batched decode) needs MTP (--mtp)".into()); }
-        if opt.dump.is_some() || opt.read_mask || opt.ffn_select || opt.dflash.is_some() || opt.dflash2.is_some() || opt.ctx_draft > 0 || opt.ffn_stream_tokens > 0
-            || (opt.kv == KvFormat::Q8 && pf_q8conv() && !opt.prefill_exact) {
-            return Err("seqs > 1: no dump, read mask, ffn select, DFlash, context drafts, streamed prefill or SD_PF_Q8CONV".into());
+        if opt.dump.is_some() || opt.read_mask || opt.ffn_select || opt.dflash.is_some() || opt.dflash2.is_some() || opt.ctx_draft > 0 || opt.ffn_stream_tokens > 0 {
+            return Err("seqs > 1: no dump, read mask, ffn select, DFlash, context drafts or streamed prefill".into());
         }
     }
     let act_bytes = if opt.activity { crate::activity::sizes(cfg) } else { (0, 0) };
@@ -445,6 +443,9 @@ fn plan_budget(idx: &SafeIndex, cfg: &QwenConfig, opt: &QwenOptions) -> Result<(
     }
     if lay.hold_bytes > 0 && opt.ctx_draft == 0 && lay.dflash.is_none() && lay.dflash2.is_none() {
         bud.add("margin gate: DeltaNet hold save (1 row)", lay.hold_bytes as u64);
+    }
+    if opt.mtp_ctx_draft > 0 && opt.ctx_draft == 0 {
+        bud.add(&format!("MTP + context drafts: lookup index (CPU, {} ctx)", opt.max_ctx), crate::ctx_draft::lookup_bytes(opt.max_ctx) as u64);
     }
     if lay.hold_bytes > 0 && opt.ctx_draft > 0 {
         bud.add(&format!("context drafts: DeltaNet hold save (ctx_draft {}: {} rows)", opt.ctx_draft, opt.ctx_draft + 1), lay.hold_bytes as u64);
@@ -578,9 +579,6 @@ pub struct QwenEngine {
     pub(crate) dflash: Option<crate::dflash::DFlash>,
     /// DFlash2 drafter (Some with opt.dflash2; dflash2.rs)
     pub(crate) dflash2: Option<crate::dflash2::DFlash2>,
-    /// q8-conversion prototype: bf16 views of `kv` (Some when pf_q8conv is on) and "a converting fast prefill is running"
-    pub(crate) pf_bf: Option<Vec<Option<KvRef>>>,
-    pub(crate) pf_on: Cell<bool>,
     /// batch.rs fused MTP draft step: arena offsets of (cat [seqs][2H], residual [seqs][H], normed [seqs][H]); seqs > 1
     pub(crate) bmtp: Option<(usize, usize, usize)>,
 }
@@ -644,8 +642,7 @@ impl QwenEngine {
         let kv_ref = |arena: &mut Arena, name: &str| -> Result<KvRef, String> {
             let k = arena.alloc(&format!("kv:{}.k", name), lay.kv_vals)?.off;
             let v = arena.alloc(&format!("kv:{}.v", name), lay.kv_vals)?.off;
-            let conv = q8 && lay.kv_sb == 0; // pf_q8conv layout: [q8 vals n | scales n / 8 | unused] in a 2n region
-            let (ksb, vsb) = if conv { (k + lay.kv_vals / 2, v + lay.kv_vals / 2) } else if q8 {
+            let (ksb, vsb) = if q8 {
                 (arena.alloc(&format!("kv:{}.ks", name), lay.kv_sb)?.off, arena.alloc(&format!("kv:{}.vs", name), lay.kv_sb)?.off)
             } else { (dummy, dummy) };
             Ok(KvRef { k, v, ksb, vsb, q8, max_ctx: opt.max_ctx })
@@ -655,10 +652,6 @@ impl QwenEngine {
             kv.push(if cfg.kinds[l] == LayerKind::Attention { Some(kv_ref(&mut arena, &l.to_string())?) } else { None });
         }
         let mtp_kv = if opt.mtp { Some(kv_ref(&mut arena, "mtp")?) } else { None };
-        let pf_bf = (q8 && pf_q8conv() && !opt.prefill_exact).then(|| {
-            eprintln!("pf_q8conv: fast bf16 prefill from pos 0, then in-place KV -> q8 (prototype)");
-            kv.iter().map(|r: &Option<KvRef>| r.map(|r| KvRef { q8: false, ..r })).collect::<Vec<_>>()
-        });
 
         // ---- DeltaNet state (both copies; the kernels pick ctrl.role, plain mode stays at role 0)
         let dn_s = arena.alloc("st:dn.S", lay.s_bytes)?;
@@ -765,7 +758,10 @@ impl QwenEngine {
         });
         if act.is_some() { reader.counts = Some(embed_counts.clone()); }
         let reader = Arc::new(reader);
-        let draft_src = crate::spec_deep::open_draft_table(&opt)?;
+        let mut draft_src = crate::spec_deep::open_draft_table(&opt)?;
+        if opt.mtp_ctx_draft > 0 {
+            draft_src = Some(Box::new(crate::ctx_draft::CtxSource::new(opt.mtp_ctx_draft, draft_src)));
+        }
         let activity = act.map(|a| {
             let down = w.layers.iter().map(|lw| lw.ffn.down).collect();
             let mtp_down = w.mtp.as_ref().map(|m| m.layer.ffn.down);
@@ -799,7 +795,7 @@ impl QwenEngine {
                                tmax: lay.tmax, nch_max: lay.nch_max, slot_bytes: lay.slot_bytes, ctx_hold, monitor, load_s,
                                loaded_bytes: loaded, budget_report: report,
                                draft_src: std::cell::RefCell::new(draft_src), activity, rm, cfc, cst,
-                               ahead: std::cell::RefCell::new(None), zc: std::cell::OnceCell::new(), dflash, dflash2, pf_bf, pf_on: Cell::new(false),
+                               ahead: std::cell::RefCell::new(None), zc: std::cell::OnceCell::new(), dflash, dflash2,
                                bmtp: bmtp_off };
         debug_assert_eq!(lay.slot_bytes, lay.tmax * lay.row_bytes);
         {   // RoPE inverse frequencies (config only)
@@ -1025,82 +1021,9 @@ impl QwenEngine {
     /// off in dump mode (dumps are stepwise).
     pub fn fast_prefill(&self) -> bool { !self.opt.prefill_exact && self.dumper.is_none() }
 
-    /// the KV refs of the main layers for the next pass (bf16 views while a converting prefill runs).
+    /// the KV refs of the main layers for the next pass.
     pub(crate) fn kv_at(&self, l: usize) -> Option<&KvRef> {
-        if self.pf_on.get() { if let Some(v) = &self.pf_bf { return v[l].as_ref(); } }
         self.kv()[l].as_ref()
-    }
-
-    /// start a converting prefill when the prototype is on and the prompt starts at position 0.
-    pub(crate) fn pf_begin(&self) -> bool {
-        let on = self.pf_bf.is_some() && self.sl().pos.get() == 0 && self.dumper.is_none();
-        self.pf_on.set(on);
-        on
-    }
-
-    /// after a converting prefill (nothing in flight): KV rows 0..pos of every main attention layer, bf16 ->
-    /// q8 in place, with the same arithmetic as `attn_prep_q8` (per 32-dim group: fp16 scale = (max - min) / 255, fp16
-    /// bias = min, q = clamp(rint((x - bias) / scale), 0, 255)); one CPU thread per K / V region. The MTP layer's KV
-    /// is written by exact (<= 8-row) passes and is already q8.
-    pub(crate) fn pf_end(&self) {
-        if !self.pf_on.replace(false) { return; }
-        let t0 = Instant::now();
-        let n = self.sl().pos.get();
-        let (hd, nkv) = (self.cfg.head_dim, self.cfg.kv_heads);
-        let base = self.arena.base() as usize;
-        let mut jobs = vec![];
-        for r in self.kv().iter().flatten() { jobs.push((r.k, r.ksb, r.max_ctx)); jobs.push((r.v, r.vsb, r.max_ctx)); }
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let (next, jobs) = (&next, &jobs);
-        std::thread::scope(|sc| {
-            for _ in 0..8.min(jobs.len()) {
-                sc.spawn(move || loop {
-                    let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if j >= jobs.len() { break; }
-                    let (vals, sb, mc) = jobs[j];
-                    // scales may lie inside the bf16 data still to be read (conv layout): keep them aside, write last
-                    let mut sbuf = vec![0u16; 2 * nkv * n * (hd / 32)];
-                    unsafe {
-                    let src = (base + vals) as *const u16;
-                    let dst = (base + vals) as *mut u8;
-                    let sbp = (base + sb) as *mut u16;
-                    // ascending element order: byte e (q8) only overlaps bf16 elements <= e already read
-                    for h in 0..nkv {
-                        for p in 0..n {
-                            for g in 0..hd / 32 {
-                                let e0 = (h * mc + p) * hd + g * 32;
-                                let mut x = [0f32; 32];
-                                for (i, xi) in x.iter_mut().enumerate() { *xi = streamdense_core::bf16_to_f32(std::ptr::read(src.add(e0 + i))); }
-                                let (mut lo, mut hi) = (x[0], x[0]);
-                                for &xi in &x[1..] { lo = lo.min(xi); hi = hi.max(xi); }
-                                let sc16 = streamdense_core::f16::f32_to_f16((hi - lo).max(1e-8) / 255.0);
-                                let lo16 = streamdense_core::f16::f32_to_f16(lo);
-                                let scv = streamdense_core::f16::f16_to_f32(sc16);
-                                let scf = if scv > 0.0 { scv } else { 1.0 };
-                                let lof = streamdense_core::f16::f16_to_f32(lo16);
-                                for (i, &xi) in x.iter().enumerate() {
-                                    std::ptr::write(dst.add(e0 + i), ((xi - lof) / scf).round_ties_even().clamp(0.0, 255.0) as u8);
-                                }
-                                let gi = (h * n + p) * (hd / 32) + g;
-                                sbuf[2 * gi] = sc16;
-                                sbuf[2 * gi + 1] = lo16;
-                            }
-                        }
-                    }
-                    for h in 0..nkv {
-                        for p in 0..n {
-                            for g in 0..hd / 32 {
-                                let (gi, gs) = ((h * n + p) * (hd / 32) + g, (h * mc + p) * (hd / 32) + g);
-                                std::ptr::write(sbp.add(2 * gs), sbuf[2 * gi]);
-                                std::ptr::write(sbp.add(2 * gs + 1), sbuf[2 * gi + 1]);
-                            }
-                        }
-                    }
-                    }
-                });
-            }
-        });
-        eprintln!("pf_q8conv: converted {} rows x {} regions to q8 in {:.3} s", n, jobs.len(), t0.elapsed().as_secs_f64());
     }
 
     /// Chunk sizes for n rows. Exact: prefill_k chunks, the remainder in 4 / 2 / 1 (K-invariance keeps it bit-exact).
@@ -1144,7 +1067,6 @@ impl QwenEngine {
             self.rm_prefill_end();
             return Ok(t);
         }
-        self.pf_begin();
         let ch = self.chunks(ids.len());
         let mut inflight: VecDeque<CmdBuf> = VecDeque::new();
         // The arena is not hazard-tracked: with two chunk CBs in flight, CB c+1 could start on the GPU before CB c
@@ -1160,7 +1082,6 @@ impl QwenEngine {
             let last = ci + 1 == ch.len();
             if let Err(e) = self.encode_pass(&cb, k, slot, last as usize, false) {
                 for cb in &inflight { wait(cb)?; }
-                self.pf_on.set(false);
                 return Err(e);
             }
             cb_signal(&cb, &order, ci as u64 + 1);
@@ -1168,7 +1089,6 @@ impl QwenEngine {
             inflight.push_back(cb);
         }
         for cb in &inflight { wait(cb)?; }
-        self.pf_end();
         self.rm_prefill_end();
         Ok(self.ctrl_read().tok[0])
     }

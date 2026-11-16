@@ -57,11 +57,16 @@ pub struct Gateway {
     /// decoding on the real 27B in this engine. Full mode only, refused with `drafter`; turns MTP and snapshots off;
     /// the whole budget must fit `[ram] cap_gb` / --abort-gb; the weights must match `[dflash2] expected_sha256`.
     pub dflash2: String,
+    /// combined MTP + context drafts (engine `QwenOptions.mtp_ctx_draft`, ctx_draft.rs `CtxSource`): with MTP and
+    /// spec_depth = "auto", each verify pass takes the context-lookup run (up to this many drafts) or the MTP chain,
+    /// whichever the planner expects to give more tokens per ms. 0 = off (default). Output identical to plain decode.
+    pub mtp_ctx_draft: usize,
 }
 impl Default for Gateway {
     fn default() -> Self {
         Gateway { model: "models/qwen38_27b_mlx4".into(), port: 8898, max_ctx: 8192, kv: "bf16".into(), mtp: true, spec_depth: SpecDepth::N(1), gemv: "mma".into(),
-                  draft_vocab: String::new(), draft_table: String::new(), verify_fused: false, drafter: String::new(), dflash2: String::new() }
+                  draft_vocab: String::new(), draft_table: String::new(), verify_fused: false, drafter: String::new(), dflash2: String::new(),
+                  mtp_ctx_draft: 0 }
     }
 }
 
@@ -363,6 +368,7 @@ fn validate(c: &Config) -> Result<(), String> {
     if let SpecDepth::N(d) = c.gateway.spec_depth {
         if !(1..=7).contains(&d) { return Err(format!("gateway.spec_depth = {}: want 1..=7 or \"auto\"", d)); }
     }
+    if c.gateway.mtp_ctx_draft > 7 { return Err(format!("gateway.mtp_ctx_draft = {}: want 0..=7", c.gateway.mtp_ctx_draft)); }
     if !["mma", "old"].contains(&c.gateway.gemv.as_str()) { return Err(format!("gateway.gemv = {:?}: want \"mma\" or \"old\"", c.gateway.gemv)); }
     let e = &c.dflash2.expected_sha256;
     if e.len() != 64 || !e.chars().all(|c| c.is_ascii_hexdigit()) { return Err(format!("dflash2.expected_sha256 = {:?}: want 64 hex digits", e)); }
@@ -562,6 +568,9 @@ mod tests {
         assert!(parse_str("[history]\nbudget_mb = 0.1\n").unwrap_err().contains("budget_mb"));
         assert!(parse_str("[history]\nfoo = 1\n").is_err());
         assert!(parse_str("[gateway]\nverify_fused = true\n").unwrap().gateway.verify_fused);
+        assert_eq!(c.gateway.mtp_ctx_draft, 0, "the repo file keeps mtp_ctx_draft off");
+        assert_eq!(parse_str("[gateway]\nmtp_ctx_draft = 7\n").unwrap().gateway.mtp_ctx_draft, 7);
+        assert!(parse_str("[gateway]\nmtp_ctx_draft = 8\n").is_err());
         assert!(parse_str("[forheader]\nverify_fused = true\n").unwrap().forheader.verify_fused);
     }
     #[test]

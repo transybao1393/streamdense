@@ -8,8 +8,12 @@
 //!   drafts   lookup: the most recent earlier occurrence of the longest suffix n-gram (n = 4..1) of context + t, its
 //!            continuation (self-overlapping, LZ77 style) up to d tokens; table: `DraftSource::propose`. The source and
 //!            d come from argmax E(d) / T(d): E = 1 + sum of prefix acceptance products (per-draft conditional rates,
-//!            EWMA-calibrated per match-length bin and depth / per table confidence bin), T = the cost model's pass ms
-//!            for K = d + 1 (`QwenOptions.spec_cost`) + the replay. Deterministic (no timings), only speed depends on it.
+//!            EWMA-calibrated per match-length bin and depth / per table confidence bin), T = the MTP planner's pass
+//!            cost for K = d + 1 (`QwenOptions.spec_cost` + the attention over the p keys, spec_deep `Plan::pass`) +
+//!            the replay. Deterministic (no timings), only speed depends on it.
+//! Combined with MTP (`QwenOptions.mtp_ctx_draft`, `CtxSource`): the same lookup is the draft source of the MTP auto
+//! loop (spec_deep `spec_loop_pipe`), which per round takes the lookup run or the MTP chain, whichever has the higher
+//! expected tokens per ms; the verify / replay are the MTP loop's own (exactness unchanged).
 //!   verify   d = 0: the plain K = 1 decode pass (state updated in place). d >= 1: a HOLD pass of K rows: the DeltaNet
 //!            state is only read (dn_conv ck = DN_HOLD, dn_recur_hold) and the raw in_proj columns [qkv | b | a] of all
 //!            K rows are saved (dn_save_all, `QwenOptions.ctx_draft + 1` rows: 0.99 MB per row on the 27B).
@@ -40,7 +44,7 @@ use crate::mtp::path_pos;
 use crate::qwen_config::QwenConfig;
 use crate::qwen_engine::{KvFormat, QwenEngine, StreamStats};
 use crate::qwen_layers::{encode_head, encode_layer, PassIo};
-use crate::spec_deep::{replay_row_bytes, SpecCost, SPEC_DEPTH_MAX};
+use crate::spec_deep::{replay_row_bytes, DraftSource, SPEC_DEPTH_MAX};
 
 /// Longest n-gram the lookup keys on (then the match is extended backwards up to `MAXM` to bin it).
 const NG: usize = 4;
@@ -193,9 +197,67 @@ impl CtxDrafter {
     }
 }
 
-/// argmax over d in 0..=q.len() of E(d) / T(d): (d, ratio).
-fn best(q: &[f64], cost: &SpecCost) -> (usize, f64) {
-    let t = |d: usize| cost.pass_ms[d.min(7)] + if d > 0 { REPLAY_MS } else { 0.0 };
+/// The context lookup as the draft source of the MTP auto loop (`QwenOptions.mtp_ctx_draft`): proposes the lookup
+/// continuation (up to `max` tokens) with the running product of its calibrated conditional acceptance (`CtxDrafter`
+/// cal per match-length bin and depth) as confidence, or the inner source's proposal (the draft table) when that one
+/// expects more accepted tokens (sum of confidences). The planner (spec_deep `Plan`) then compares it with the MTP
+/// chain per round. Calibration: every round the last lookup run is checked against the verified tokens a_0..a_je
+/// (exact greedy tokens whichever drafts were verified) up to its first miss. The history follows the KV: `begin_at`
+/// keeps it up to the feed's start position, `observe` appends the fed tokens. Drafts only: never affects the output.
+pub struct CtxSource {
+    pub cx: CtxDrafter,
+    max: usize,
+    inner: Option<Box<dyn DraftSource>>,
+    /// last lookup run (tokens) and its match-length bin
+    last: Vec<u32>,
+    last_bin: usize,
+}
+impl CtxSource {
+    pub fn new(max: usize, inner: Option<Box<dyn DraftSource>>) -> CtxSource {
+        CtxSource { cx: CtxDrafter::new(), max: max.min(SPEC_DEPTH_MAX), inner, last: vec![], last_bin: 0 }
+    }
+}
+impl DraftSource for CtxSource {
+    fn propose(&mut self, tail: &[u32], max: usize) -> Vec<(u32, f32)> {
+        let inner = self.inner.as_mut().map(|s| s.propose(tail, max)).unwrap_or_default();
+        self.last.clear();
+        let Some(&pending) = tail.last() else { return inner };
+        let (m, toks) = self.cx.lookup(pending, max.min(self.max));
+        let b = mbin(m);
+        let mut c = 1.0;
+        let look: Vec<(u32, f32)> = toks.iter().enumerate().map(|(i, &t)| { c *= self.cx.cal[b][i]; (t, c as f32) }).collect();
+        self.last = toks;
+        self.last_bin = b;
+        let sum = |v: &[(u32, f32)]| v.iter().map(|x| x.1 as f64).sum::<f64>();
+        if sum(&look) >= sum(&inner) { look } else { inner }
+    }
+    fn observe(&mut self, tail: &[u32], accepted: &[u32], top3: &[[u32; 3]]) {
+        // conditional acceptance of the lookup run vs the verified greedy tokens a_i = top3[i][0], up to the first miss
+        let b = self.last_bin;
+        for (i, (&t, r)) in self.last.iter().zip(top3).enumerate() {
+            let ok = t == r[0];
+            let c = &mut self.cx.cal[b][i];
+            *c += EW * (ok as u8 as f64 - *c);
+            if !ok { break; }
+        }
+        self.last.clear();
+        if let Some(&pending) = tail.last() { self.cx.push(&[pending]); }
+        self.cx.push(accepted);
+        if let Some(s) = self.inner.as_mut() { s.observe(tail, accepted, top3); }
+    }
+    fn begin_sequence(&mut self, seq: &[u32]) { self.begin_at(0, seq) }
+    fn begin_at(&mut self, pos: usize, seq: &[u32]) {
+        // keep the history of the KV before the feed (a continuation), drop anything past it
+        if self.cx.history().len() > pos { let h = self.cx.history()[..pos].to_vec(); self.cx.set_history(&h); }
+        self.cx.push(&seq[..seq.len().saturating_sub(1)]);
+        self.last.clear();
+        if let Some(s) = self.inner.as_mut() { s.begin_at(pos, seq); }
+    }
+    fn flush(&mut self) { if let Some(s) = self.inner.as_mut() { s.flush(); } }
+}
+
+/// argmax over d in 0..=q.len() of E(d) / t(d) (t = ms of a round with d drafts): (d, ratio).
+fn best(q: &[f64], t: &dyn Fn(usize) -> f64) -> (usize, f64) {
     let (mut e, mut pr) = (1.0, 1.0);
     let mut b = (0, e / t(0));
     for d in 1..=q.len() {
@@ -279,7 +341,8 @@ impl QwenEngine {
     fn ctx_loop(&self, mut pending: u32, dmax: usize, hold: usize, n_new: usize, stop: &[u32], on_tok: &mut dyn FnMut(u32) -> bool,
                 cx: &mut CtxDrafter, st: &mut StreamStats, cs: &mut CtxStats) -> Result<(), String> {
         let max_ctx = self.opt.max_ctx;
-        let cost = self.opt.spec_cost.clone();
+        // round cost: the MTP planner's context-aware pass cost (matmuls + attention over the KV) for K = d + 1, + the replay
+        let mut plan = self.new_plan();
         let ahead = self.rm.is_none() && self.dumper.is_none();
         let mut src_b = self.draft_src.borrow_mut();
         if let Some(s) = src_b.as_mut() {
@@ -301,12 +364,14 @@ impl QwenEngine {
             if p + 1 > max_ctx { st.stop_reason = "ctx_full"; break; }
             // ---- drafts (CPU)
             let tc = Instant::now();
+            plan.n = p;
+            let cost = |d: usize| plan.pass(d + 1) + if d > 0 { REPLAY_MS } else { 0.0 };
             let left = n_new.saturating_sub(st.gen).max(1);
             let cap = dmax.min(max_ctx - p - 1).min(left - 1);
             let h = cx.history();
             let mut tail: Vec<u32> = h[h.len().saturating_sub(TAIL - 1)..].to_vec();
             tail.push(pending);
-            let mut pick: (usize, f64, Src, Vec<u32>, Vec<f64>, Vec<u8>) = (0, 1.0 / cost.pass_ms[0], Src::Lookup, vec![], vec![], vec![]);
+            let mut pick: (usize, f64, Src, Vec<u32>, Vec<f64>, Vec<u8>) = (0, 1.0 / cost(0), Src::Lookup, vec![], vec![], vec![]);
             if cap > 0 {
                 let (m, toks) = cx.lookup(pending, cap);
                 if !toks.is_empty() {

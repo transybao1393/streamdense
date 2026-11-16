@@ -652,3 +652,69 @@ fn q8_kv_mtp_equals_plain() {
         assert!(ok && runs > 0 && acc > 0 && rej > 0, "q8 KV ({} prefill): MTP != plain", if exact { "exact" } else { "fast" });
     }
 }
+
+/// Combined MTP + context drafts (`QwenOptions.mtp_ctx_draft`, ctx_draft.rs `CtxSource` as the auto loop's draft
+/// source): == plain greedy of the same engine in tokens and in the recorded per-position top-1 / top-2 logits (bit
+/// for bit), bf16 and q8 KV, real head and oracle MTP drafts, on repeat-heavy prompts (x + plain reply + x: the
+/// lookup proposes the reply-to-be) incl. two whose decode crosses position 1024, a repeated chunk, the ref prompts
+/// and ctx1k; lookup drafts must be
+/// verified and some accepted. Then sessions (continuations: the lookup history follows the KV across turns, a turn
+/// repeating an earlier one, stops, cancel) == plain.
+#[test]
+fn mtp_ctx_draft_equals_plain() {
+    let Some(dir) = model_dir() else { return; };
+    let ps = prompts();
+    let chunk = |n: usize, k: u32| -> Vec<u32> { (0..n as u32).map(|i| (i * 71 + k * 13) % 1500 + 20).collect() };
+    let rep = |c: Vec<u32>, times: usize| -> Vec<u32> { c.iter().cycle().take(c.len() * times).copied().collect() };
+    for kv in [streamdense_model::KvFormat::Bf16, streamdense_model::KvFormat::Q8] {
+        let eng = QwenEngine::open(&dir, QwenOptions { max_ctx: 2048, mtp: true, spec_depth: 7, spec_auto: true, kv, mtp_ctx_draft: 7,
+                                                       ..Default::default() }).expect("open tiny");
+        // repeat-heavy = x + plain reply to x + x (the context holds the reply-to-be: the lookup's runs get accepted)
+        let heavy = |x: &[u32], n: usize| -> Vec<u32> {
+            let g = eng.generate(x, n, false).unwrap().tokens;
+            x.iter().chain(g.iter()).chain(x.iter()).copied().collect()
+        };
+        let mut cases: Vec<(String, Vec<u32>, usize)> = vec![
+            ("rep40x8".into(), rep(chunk(40, 1), 8), 96),
+            ("heavy syn".into(), heavy(&chunk(50, 3), 64), 64),
+            ("heavy 1008".into(), heavy(&chunk(480, 4), 48), 64), // 1008 prompt tokens: decode crosses 1024
+        ];
+        if let Some(c) = get(&ps, "code") { cases.push(("heavy code".into(), heavy(c, 64), 64)); }
+        if let Some(c) = get(&ps, "ctx1k") { cases.push(("heavy ctx1k".into(), heavy(&c[..480], 48), 64)); }
+        for id in ["short", "math", "ctx1k"] { if let Some(p) = get(&ps, id) { cases.push((id.into(), p.clone(), 64)); } }
+        let rec = |p: usize, n: usize| -> Vec<(u32, u32, u32)> {
+            (p - 1..p - 1 + n).map(|i| { let (t, a, b) = eng.rec_token(i); (t, a.to_bits(), b.to_bits()) }).collect()
+        };
+        let (mut ok, mut drafts, mut acc, mut mtp) = (true, 0usize, 0usize, 0usize);
+        for (id, p, n) in &cases {
+            let g = eng.generate(p, *n, false).unwrap();
+            let gr = rec(p.len(), g.tokens.len());
+            let seq: Vec<u32> = p.iter().chain(g.tokens.iter()).copied().collect();
+            for (name, ov) in [("head", DraftOverride::None), ("o0.7", DraftOverride::Oracle { seq: seq.clone(), p: 0.7, seed: 5 })] {
+                let r = generate_spec_mode(&eng, p, g.tokens.len(), SpecMode::Auto { max: 7 }, ov).unwrap();
+                let eq = r.tokens == g.tokens && rec(p.len(), r.tokens.len()) == gr;
+                println!("  {:?} {:9} {} (P {}, {} new): == plain {} | passes {:3} {:.2} tok/pass lookup/table drafts {} (acc {}) mtp {} (acc {}) pad {} depth {:?}",
+                         kv, id, name, p.len(), g.tokens.len(), eq, r.passes, r.tokens_per_pass, r.drafts_table, r.acc_table, r.drafts_mtp, r.acc_mtp,
+                         r.drafts_pad, r.depth_hist);
+                ok &= eq;
+                drafts += r.drafts_table;
+                acc += r.acc_table;
+                mtp += r.drafts_mtp;
+            }
+        }
+        // sessions: continuations keep the lookup history; turn 2 repeats turn 0's text
+        let u = user_turns();
+        let toks = vec![rep(u[0].clone(), 3), u[1].clone(), rep(u[0].clone(), 2), u[2].clone()];
+        let base = Script { toks: toks.clone(), nnew: vec![40, 30, 40, 25], stop: vec![vec![]; 4], cancel: vec![None; 4] };
+        let (probe, _) = session(&eng, &base, &vec![Mode::Plain; 4]);
+        let s = Script { stop: vec![vec![], vec![probe[1].tokens[5]], vec![], vec![]], cancel: vec![None, None, None, Some(7)], ..base };
+        let (plain, _) = session(&eng, &s, &vec![Mode::Plain; 4]);
+        let (t, _) = session(&eng, &s, &vec![Mode::Spec(DraftOverride::None, SpecMode::Auto { max: 7 }); 4]);
+        let eq = t.iter().zip(&plain).all(|(a, b)| a.tokens == b.tokens && a.reason == b.reason && a.pos == b.pos);
+        println!("  {:?} session (4 turns, stop + cancel): == plain {}", kv, eq);
+        ok &= eq;
+        println!("{:?} KV: lookup/table drafts {} accepted {}, mtp drafts {}", kv, drafts, acc, mtp);
+        assert!(ok, "{:?} KV: MTP + ctx draft != plain", kv);
+        assert!(drafts > 0 && acc > 0, "{:?} KV: lookup drafts never verified / accepted ({} / {})", kv, drafts, acc);
+    }
+}
