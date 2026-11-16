@@ -183,6 +183,35 @@ pub fn sdpa_vec_max_n() -> usize {
     *V.get_or_init(|| std::env::var("SD_SDPA_VEC_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(SDPA_VEC_MAX_N))
 }
 
+/// Stats only (no effect on any dispatch): verify passes whose rows straddle an attention path boundary inside one
+/// dispatch. A pass of `k` rows at host position `pos` has row N from pos + 1 to pos + k (`attn_sdpa_rows`).
+/// `two_pass`: bf16 KV, rows on both sides of `sdpa_two_pass_min()` (pos + 1 < B <= pos + k).
+/// `split_k`: bf16 KV, rows on both sides of the split-K limit lim = `sdpa_vec_max_n().min(8192)` (pos + 1 <= lim < pos + k).
+/// `chunk`: the pass's split-K rows (every row with q8 KV; rows with N > lim with bf16) end in different 256-key
+/// chunks (`ATTN_CHUNK`), i.e. their last keys N - 1 are not in the same chunk. q8 KV: `two_pass` / `split_k` stay 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttnStraddle { pub passes: usize, pub two_pass: usize, pub split_k: usize, pub chunk: usize }
+impl AttnStraddle {
+    pub fn note(&mut self, pos: usize, k: usize, q8: bool) {
+        if k == 0 { return; }
+        self.passes += 1;
+        let (lo, hi) = (pos + 1, pos + k);
+        let lim = if q8 { 0 } else {
+            let b = sdpa_two_pass_min();
+            if lo < b && hi >= b { self.two_pass += 1; }
+            let lim = sdpa_vec_max_n().min(8192);
+            if lo <= lim && hi > lim { self.split_k += 1; }
+            lim
+        };
+        let s = lo.max(lim + 1); // first split-K row's N
+        let c = crate::qwen_engine::ATTN_CHUNK;
+        if s <= hi && (s - 1) / c != (hi - 1) / c { self.chunk += 1; }
+    }
+    pub fn add(&mut self, o: &AttnStraddle) {
+        self.passes += o.passes; self.two_pass += o.two_pass; self.split_k += o.split_k; self.chunk += o.chunk;
+    }
+}
+
 /// Every kernel the encoders here use, both matmul families (build these pipelines before encoding).
 pub fn qwen_pipelines() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = Vec::new();
@@ -1399,4 +1428,22 @@ pub fn encode_head_batch(e: &Enc, cfg: &QwenConfig, w: &Weights, io: &PassIo, se
             .groups((s.k, 1), 1024);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod straddle_tests {
+    use super::AttnStraddle;
+    #[test]
+    fn attn_straddle_counts() {
+        let (b, lim) = (super::sdpa_two_pass_min(), super::sdpa_vec_max_n().min(8192));
+        let mut s = AttnStraddle::default();
+        s.note(b - 2, 2, false);   // N = b-1, b: straddles b
+        s.note(b - 1, 8, false);   // N = b..: no
+        s.note(lim - 1, 2, false); // N = lim, lim+1: straddles lim; split-K row lim+1 only: no chunk edge
+        s.note(lim + 250, 8, false); // N = lim+251..lim+258: split-K rows cross a 256 edge (lim % 256 == 0)
+        s.note(250, 8, true);      // q8: N = 251..258 cross the 256 edge
+        s.note(0, 4, true);        // q8: N = 1..4 same chunk
+        let want_chunk = if lim % 256 == 0 { 2 } else { s.chunk };
+        assert_eq!((s.passes, s.two_pass, s.split_k, s.chunk), (6, 1, 1, want_chunk));
+    }
 }

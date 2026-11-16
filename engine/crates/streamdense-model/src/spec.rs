@@ -105,6 +105,8 @@ pub struct SpecResult {
     /// spec_deep pipelined loop: depth policy ("3", "auto7"); passes by real draft rows (pads excluded) 0..=max
     pub mode: String,
     pub depth_hist: Vec<usize>,
+    /// spec_deep / batch: verify passes straddling an attention path boundary (stats only)
+    pub straddle: crate::qwen_layers::AttnStraddle,
     /// draft rows verified / accepted by source: MTP head, draft table, padding (spare rows of a pass encoded ahead)
     pub drafts_mtp: usize,
     pub drafts_table: usize,

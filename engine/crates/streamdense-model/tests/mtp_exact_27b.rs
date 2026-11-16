@@ -60,6 +60,14 @@ const PROMPTS: [(&str, &[u32]); 4] = [
     ("repeat", &[248045, 846, 198, 37436, 279, 2614, 1500, 6681, 4097, 2942, 11, 799, 791, 1500, 25, 561, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]),
 ];
 
+/// One line per run: verify passes whose rows straddle an attention path boundary inside one dispatch
+/// (`AttnStraddle`: 1024 = single / two-pass switch, lim = split-K switch, both bf16 KV only; chunk = split-K rows in
+/// different 256-key chunks, every row with q8 KV).
+fn straddle_line(name: &str, label: &str, s: &streamdense_model::qwen_layers::AttnStraddle) -> String {
+    format!("{} {}: straddle: passes {}, straddling {} {}, straddling {} {}, crossing a 256-key chunk edge (split-K rows) {}", name, label, s.passes,
+            streamdense_model::qwen_layers::sdpa_two_pass_min(), s.two_pass, streamdense_model::qwen_layers::sdpa_vec_max_n().min(8192), s.split_k, s.chunk)
+}
+
 fn fnv(b: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &x in b { h ^= x as u64; h = h.wrapping_mul(0x100000001b3); }
@@ -248,6 +256,7 @@ fn mtp_exact_27b_per_position() {
                 eprintln!("{}\ntokens equal plain vs {}: {} ({} vs {} tokens)", line_m, label, tp == tm, tp.len(), tm.len());
                 eprintln!("{}: drafts mtp {} (acc {}), lookup / table {} (acc {}), pad {} (acc {}), accepted per pass (0..7) {:?}, tokens per pass {:.2}",
                           label, r.drafts_mtp, r.acc_mtp, r.drafts_table, r.acc_table, r.drafts_pad, r.acc_pad, r.accept_hist, r.tokens_per_pass);
+                eprintln!("{}", straddle_line(name, label, &r.straddle));
                 table.push(line_m);
                 if tp != tm { bad += 1; }
                 e.set_draft_source(None);
@@ -280,6 +289,7 @@ fn mtp_exact_27b_per_position() {
                           line_c, label, cs.passes, cs.drafted_passes, cs.tokens_per_pass(), cs.lookup_drafts, cs.lookup_acc,
                           (cs.table_drafts, cs.table_acc), (cs.history_drafts, cs.history_acc), cs.k_hist, cs.verify_ms, cs.replay_ms, cs.draft_cpu_ms);
                 eprintln!("tokens equal plain vs {}: {} ({} vs {} tokens)", label, tp == tc, tp.len(), tc.len());
+                eprintln!("{}", straddle_line(name, &label, &cs.straddle));
                 table.push(line_c);
                 if tp != tc { bad += 1; }
             }
@@ -369,6 +379,7 @@ fn mtp_exact_27b_per_position() {
                                name, m.name(), cmp - 1, paths[0], paths[1], paths[2], minm, lsame, cmp - 1, hsame, cmp - 1, tok_same, cmp, r.accepted as f64 / (r.drafts_mtp + r.drafts_table + r.drafts_pad).max(1) as f64, r.accepted,
                                r.drafts_mtp + r.drafts_table + r.drafts_pad, r.passes, rowhist, fm, wall, st.stop_reason);
             eprintln!("{}", line);
+            eprintln!("{}", straddle_line(name, &m.name(), &r.straddle));
             table.push(line);
         }
         let _ = std::fs::remove_file(&path);

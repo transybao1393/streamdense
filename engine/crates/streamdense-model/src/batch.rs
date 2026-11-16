@@ -300,6 +300,7 @@ impl QwenEngine {
             let mut j = 0;
             while j < kd && a[j] == w.drafts[j] && !self.is_eos(a[j]) { j += 1; }
             s.r.passes += 1;
+            s.r.straddle.note(p, k, self.opt.kv == crate::qwen_engine::KvFormat::Q8);
             if act.len() > 1 { s.batched += 1; }
             s.r.accepted += j;
             if j < kd { s.r.rejects += 1; }

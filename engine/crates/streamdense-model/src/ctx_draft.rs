@@ -97,6 +97,8 @@ pub struct CtxStats {
     /// accept_hist[j] = passes with j drafts accepted; k_hist[k - 1] = passes of k rows
     pub accept_hist: [usize; SPEC_DEPTH_MAX + 1],
     pub k_hist: [usize; SPEC_DEPTH_MAX + 1],
+    /// verify passes straddling an attention path boundary (stats only)
+    pub straddle: crate::qwen_layers::AttnStraddle,
     /// GPU ms: verify passes, replays; passes that used a buffer encoded ahead
     pub verify_ms: f64,
     pub replay_ms: f64,
@@ -111,6 +113,7 @@ impl CtxStats {
         self.table_drafts += o.table_drafts; self.table_acc += o.table_acc;
         self.history_drafts += o.history_drafts; self.history_acc += o.history_acc;
         for i in 0..=SPEC_DEPTH_MAX { self.accept_hist[i] += o.accept_hist[i]; self.k_hist[i] += o.k_hist[i]; }
+        self.straddle.add(&o.straddle);
         self.verify_ms += o.verify_ms; self.replay_ms += o.replay_ms; self.preencoded += o.preencoded; self.draft_cpu_ms += o.draft_cpu_ms;
     }
     /// accepted / drafted (0 when nothing was drafted)
@@ -446,6 +449,7 @@ impl QwenEngine {
             let mut j = 0;
             while j < nd && a[j] == drafts[j] && !self.is_eos(a[j]) { j += 1; }
             cs.passes += 1;
+            cs.straddle.note(p, k, self.opt.kv == KvFormat::Q8);
             cs.k_hist[k - 1] += 1;
             cs.accept_hist[j] += 1;
             if nd > 0 {

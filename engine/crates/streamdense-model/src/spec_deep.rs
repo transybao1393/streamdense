@@ -208,6 +208,7 @@ impl QwenEngine {
             let mut j = 0;
             while j < depth && a[j] == drafts[j] && !self.is_eos(a[j]) { j += 1; }
             r.passes += 1;
+            r.straddle.note(p, k, self.opt.kv == KvFormat::Q8);
             r.accepted += j;
             if j < depth { r.rejects += 1; }
             r.accept_hist[j] += 1;
@@ -885,6 +886,7 @@ impl QwenEngine {
             let mut j = 0;
             while j < kd && a[j] == drafts[j] && !self.is_eos(a[j]) { j += 1; }
             r.passes += 1;
+            r.straddle.note(p, k, self.opt.kv == KvFormat::Q8);
             r.accepted += j;
             if j < kd { r.rejects += 1; }
             let nreal = rows.iter().filter(|x| x.0 != Src::Pad).count();
