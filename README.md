@@ -85,6 +85,20 @@ Qwen3.8-27B, MLX 4-bit, greedy decode on a Mac mini M4 Pro (48 GB), one model pr
   DFlash2 (optional drafter, off by default) at long context, output identical to plain: 15.17 tok/s at ~12,200
   (bf16 KV, plain 12.65, peak 16.66 GB) and 11.09 tok/s at ~32,560 (8-bit KV, plain 11.81, peak 17.06 GB). Its
   drafter sees only the last 2,048 positions, so acceptance drops to 0.24–0.29; MTP stays the default.
+
+  For comparison, the Unsloth GGUF of the same model at the same size (`unsloth/Qwen3.8-27B-GGUF`, UD-IQ4_XS,
+  14.35 GB) in llama.cpp (build 12110, Metal, flash attention, weights loaded into RAM, greedy, no speculative
+  decoding), same prompts and machine:
+
+  | Prompt | KV | llama.cpp (GGUF) | streamdense plain | streamdense best | Peak RAM (GGUF / ours) |
+  |---|---|---|---|---|---|
+  | ~12,200 summarize | 16-bit | 8.88 tok/s | 12.86 tok/s | 16.48 tok/s (MTP) | 16.29 / 16.13 GB |
+  | ~32,560 summarize | 16-bit | 8.43 tok/s | 11.39 tok/s | 14.34 tok/s (MTP) | 17.66 / 17.58 GB |
+  | ~32,560 summarize | 8-bit | 8.81 tok/s | 11.30 tok/s | 14.82 tok/s (MTP) | 16.66 / 16.57 GB |
+  | ~32,560 edit | 8-bit | 8.98 tok/s | 12.41 tok/s | 35.50 tok/s (context drafts) | 16.66 / 16.58 GB |
+
+  llama.cpp decodes at about 0.7x our plain speed and uses the same RAM; its prompt read (72–79 tok/s, 426–455 s
+  at 32K) is about the same as ours. Its tokenizer gives the same token ids. llama.cpp's own MTP mode was not tested.
 - Prompt reading (prefill) runs at about 75–80 tok/s cold. With KV prefix reuse, follow-up turns of a Claude Code
   session start in 0.4–1.5 s, and a new session that restores a snapshot of the shared system prompt starts in 0.66 s.
 - Decode is memory-bandwidth bound: a full-model pass reads about 15 GB of weights, two thirds of it FFN.
