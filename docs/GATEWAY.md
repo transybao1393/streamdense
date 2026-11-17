@@ -65,6 +65,107 @@ from (`--json` for scripts). Search order: `$SD_CONFIG`, `./streamdense.toml`, t
 `~/.config/streamdense/config.toml`; no file means the same built-in values. Unknown keys are an error. Precedence:
 CLI flag > config > default.
 
+### Profiles
+
+A profile is a named set of defaults for one kind of use, applied **under** the file's explicit values; flags win over
+both (flag > file > profile > built-in). Turn one on in the file or per run:
+
+```toml
+[profile]
+name = "coding"
+```
+
+```sh
+streamdense up --profile coding        # also: streamdense gateway --profile coding, streamdense config --profile coding
+```
+
+`--profile NAME` replaces the file's name (`--profile ""` = none). An unknown name is refused with the list of known
+ones. `streamdense up` prints the active profile and every value it set (keys the file overrides are listed), the
+gateway prints the same line at start and puts `{"name", "set", "overridden"}` under `profile` in its session-start
+log line (`"session": "gateway_start"`); `/health` carries the name. Profiles hold no paths: keep the model, draft
+table / vocab, snapshot and watcher dirs in the file. Write only what differs from the profile; every explicit key
+(even one equal to the built-in default) wins over it.
+
+`coding` (local coding agents: long tool loops, file writes / edits; the 48 GB machine):
+
+| key | value | why |
+|---|---|---|
+| `[ram] cap_gb` / `swap_gb` / `margin_gb` / `nice` | 18 / 7 / 0 / 10 | 32K q8 run peaks ~17.2 GB |
+| `[gateway] max_ctx` | 32768 | sessions reach 18K+ tokens |
+| `kv` | `q8` | 32K KV 1.21 GB instead of 2.15 |
+| `mtp`, `spec_depth` | on, `auto` | |
+| `mtp_ctx_draft` | 7 | MTP + context drafts: tool calls that copy context text |
+| `verify_fused` | true | bit-identical fused matmuls for every 3..8-row check pass (see below) |
+| `rewind_gb` | 0.62 | 4 rewind checkpoints (0.154 GB each on the 27B) |
+| `gemv` | `mma` | |
+| `startup_cap_gb` | 17.5 | startup estimate limit (`--cap`), under the 18 GB live cap |
+| `think` | false | |
+| `cut_tool_call` | `length` | a tool call cut by max_tokens is reported as `max_tokens`, not as a complete call (N6, below) |
+| `ckpt_reply_start` | true | rewind checkpoint at each reply start: an edit of the last reply re-reads only from there (N7, below) |
+| `ckpt_system` | true | pinned rewind checkpoint at the end of the system turn (system + tools): a compacted history rewinds there (N8, below) |
+| `[snapshots] max_disk_gb` / `min_free_disk_gb` | 8 / 12 | |
+| `evict_for_save` / `evict_for_save_min_tokens` | true / 2048 | a switch / idle save of the live chat evicts old files first instead of being skipped by the disk floor (N8) |
+| `stable_ensure` | true | each new system + tools prefix is saved (eviction first) and the live one is never deleted by the disk policy (N8) |
+
+New keys used by profiles (also usable without one): `[gateway] startup_cap_gb` (default 17.0, the former built-in
+`--cap` default; `--cap` wins) and `[gateway] think` (default false; `--think` / `--no-think` win).
+
+`[gateway] cut_tool_call` (N6, default `"tool_use"` = the former behaviour): what a reply cut by the token limit
+(max_tokens, or the context end after some output) inside an unfinished tool call (`<tool_call>` / `<function=..>`
+with no `</function>` yet) returns. `"tool_use"`: the call is closed and returned as a complete `tool_use` with its
+truncated arguments (valid JSON, a value cut mid-line), stop_reason `tool_use`, so a client runs or rejects a broken
+call and the model tends to retry the same long write forever. `"length"`: stop_reason `max_tokens` (OpenAI
+`finish_reason: "length"` through an OpenAI-compatible proxy); a JSON reply drops the partial call (the text and any
+complete calls before it stay); a streamed reply has already sent the call's `tool_use` block from its name on, so that
+block is closed as it is (partial `input_json_delta`) and the message ends with `max_tokens`, as the Anthropic API does.
+The request log gets `tool_cut: {"name", "chars"}` (chars of the call body written). The client's max_tokens is
+honoured exactly. Seen in one coding session: 10 of 19 replies stopped `{engine: "length", finish: "tool_use"}`, file
+writes cut mid-line and retried.
+
+`[gateway] ckpt_reply_start` (N7, default false): one more rewind checkpoint per request, at the start of the reply
+(after the last prompt message, before the generation prompt), storing every prompt message, the tools, the thinking
+flag and the render's ids. A later request whose messages before that point are the same rewinds there even when it
+changes the assistant message that follows (a client that appends text to the previous reply) and the engine holds the
+model's own reply tokens there (matched by messages, `msg-equal`). The newest reply-start checkpoint is kept by the
+retention (never the first one evicted among unpinned checkpoints); the request log's `ckpts` entries carry `reply`.
+Seen in one coding session: an edit of the previous reply fell back to a checkpoint 12,674 tokens earlier (169.8 s
+to first token).
+
+N8 (all default off = the former behaviour; on in `coding`). Seen in one coding session with the disk near the floor
+(12.8 GB free, floor 12 GB): (1) a short side request of the client (2 messages, no tools) replaced the ~20K-token main
+chat; the switch save was skipped ("disk low: 12.77 GB free < min_free_disk_gb 12.00 + 1.05 GB"), so the chat came back
+from the 1,642-token shared prefix only: 17,591 tokens re-read, 204.5 s. The disk policy had deleted a file just before,
+but it stops once free >= the floor, not floor + the new file, so the save was still refused; and the size estimate was
+the largest file (1.38 GB), even for a 1.9K-token prefix (~0.22 GB). (2) After the client changed its tool list and
+compacted the history, the new system + tools prefix had no file (its save skipped the same way) and no checkpoint
+covered it: 9,118 tokens re-read from 0 (104.5 s) instead of from the 1,872-token boundary.
+
+* `[snapshots] evict_for_save` + `evict_for_save_min_tokens`: a switch save or idle save of a live state of at least that
+  many tokens that the floor would block deletes files first (`snap_tier::room_plan`: non-stable files lowest score
+  first, then stable prefixes unused for a day, then the other stable prefixes; never the live chat's newest file or
+  its stable prefix) until free >= floor + the new file's estimate, then saves. Nothing is deleted when even all
+  candidates would not make room (the save is skipped, as before). The log names every evicted file (kind, tokens, GB,
+  age) and free before / after. Sizes are estimated by token count (`Tiers::est_bytes_for`: the smallest known file of
+  >= n tokens, else the largest scaled by tokens), with either N8 snapshot key on.
+* `[snapshots] stable_ensure`: a new system + tools prefix (the stable cut) is saved with the same eviction first; the
+  live lineage's stable prefix file is never deleted by the disk policy (file / byte caps, disk floor) or by eviction
+  first. With `ckpt_system`, a request that lands exactly on that boundary (rewind to the system checkpoint) saves the
+  missing file there without feeding.
+* `[gateway] ckpt_system`: a rewind checkpoint at the end of the system turn (through its `<|im_end|>`), storing the
+  leading system messages, the tools and the thinking flag (matched by those + the token prefix). Slot policy with the
+  4 slots of `rewind_gb = 0.62`: the system checkpoint (flag `sys`, `#` in `reuse_why` / `ckpts`), the last
+  instruction start (pinned, `*`), the newest reply start (`^`) are never chosen by the cost retention, which leaves
+  one floating slot for the last-turn start / prompt end / followup base (geometric cost as before). One system
+  checkpoint per lineage; after a lineage switch the old lineage's slots are dormant and reused first, the system one
+  last of the unpinned (oldest first otherwise), and one dormant pin of another lineage is kept, as before. With fewer
+  than 4 slots the system checkpoint is an ordinary one.
+
+Why `verify_fused` is in `coding` (2026-11-17, from one 56-request coding session at 32K / q8 / MTP auto + context
+drafts): decode was 310 s of the session's 508 s, in 1,776 check passes of ~8 rows (5.2 tokens per pass, 174 ms per
+pass). Fused verify is bit-identical (tiny-model checks, and 101/101 identical texts on the 27B in earlier runs);
+earlier 27B measurements: MTP auto 24.4 -> 27.2 tok/s, ~15 ms less per 8-row pass. Expected on that session: about
+27-32 s less decode (~9-10%). Not yet measured on the 27B with this exact setup.
+
 ## Point Claude Code at it
 
 ```sh
@@ -206,6 +307,10 @@ in streamdense.toml:
 | hot | RAM copy in the gateway process | only while live footprint + copy + `hot_headroom_gb` (1.0) <= `[ram] cap_gb`, total <= `hot_gb` (1.0); dropped first (LRU) when the footprint rises; the CPU heap limit moves by the copy size. None in 12 GB mode (no spare RAM). On the 27B (peak ~15.9 GB of 16) this is normally empty |
 | warm | `.sdsnap` file on SSD | restore reads it into the engine (~0.4-0.7 s measured on the 27B; faster when pre-read into the file cache) |
 | cold | deleted | score = last use + 600 s per hit (max 6) + 1800 s for a stable prefix; lowest first when over a cap or under the disk floor |
+
+Disk floor: a save is skipped while free disk < `min_free_disk_gb` + the file's estimate (after deleting files down to the
+floor); with `evict_for_save` / `stable_ensure` (N8, Profiles above) switch / idle saves of the live chat and new stable
+prefixes delete old files first until the new file fits above the floor (`/health` `snapshots.disk` shows both keys).
 
 Index `tiers.json` in the snapshot dir keeps kind (stable / roll / idle), session keys, hits and last use across restarts.
 Sessions: project = system turn (system prompt + tools), conversation = + the first user turn.

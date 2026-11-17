@@ -65,14 +65,29 @@ kernel void argmax_b(device const float* logits [[buffer(0)]], device SdCtrl* ct
     }
 }
 
-// ---- banned ids (gateway `format: plan`): logits[t][ban[1 + i]] = -inf for i < min(ban[0], 31), before argmax_b.
-// ban = u32 [n, id0 .. id30] (128 B). Ids >= V are skipped. Threadgroup = row t, 32 threads. Only dispatched when n > 0,
-// so an unbanned pass is the same command stream as before; a banned id can never be the argmax (lossless greedy over
-// the allowed ids: when no banned id would win, tok / top1 are unchanged).
+// ---- banned ids (gateway `format: plan`, tool_choice none): logits[t][ban[1 + i]] = -inf for i < n, before argmax_b.
+// ban = u32 [h, id0 .. id222] (896 B), n = min(h & 0x7fffffff, 223). Ids >= V are skipped. Threadgroup = row t (any
+// thread count). Only dispatched when h > 0, so an unbanned pass is the same command stream as before; a banned id
+// can never be the argmax (lossless greedy over the allowed ids: when no banned id would win, tok / top1 are unchanged).
+// ALLOW mode (h bit 31, gateway tool-name constraint): the list is the only ids allowed: every other logit of the row is
+// -inf (the listed ones keep their values), so the argmax is the greedy pick among the listed ids.
+constant uint BAN_N = 223;
 kernel void ban_logits(device float* logits [[buffer(0)]], device const uint* ban [[buffer(1)]], constant uint& V [[buffer(2)]],
-                       uint t [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]]) {
-    uint n = min(ban[0], 31u);
-    if (i < n) { uint id = ban[1 + i]; if (id < V) logits[t * V + id] = -INFINITY; }
+                       uint t [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]],
+                       uint nt [[threads_per_threadgroup]]) {
+    uint h = ban[0];
+    uint n = min(h & 0x7fffffffu, BAN_N);
+    device float* row = logits + (ulong)t * V;
+    if ((h & 0x80000000u) == 0) {
+        for (uint j = i; j < n; j += nt) { uint id = ban[1 + j]; if (id < V) row[id] = -INFINITY; }
+        return;
+    }
+    threadgroup float keep[BAN_N];
+    for (uint j = i; j < n; j += nt) { uint id = ban[1 + j]; keep[j] = id < V ? row[id] : -INFINITY; }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    for (uint j = i; j < V; j += nt) row[j] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint j = i; j < n; j += nt) { uint id = ban[1 + j]; if (id < V) row[id] = keep[j]; }
 }
 
 // ---- top-32 per row + logsumexp (teacher-forced check). 1024 threads per threadgroup, threadgroup = row t.

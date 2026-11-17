@@ -310,6 +310,7 @@ impl QwenEngine {
             s.r.depth_hist[kd.min(dmax)] += 1;
             s.r.drafts_mtp += kd;
             s.r.acc_mtp += j;
+            if kd > 0 { s.r.passes_mtp += 1; } else { s.r.passes_nodraft += 1; }
             s.plan.update(&w.rows, j);
             let mut used = 0;
             for &t in &a[..=j] {

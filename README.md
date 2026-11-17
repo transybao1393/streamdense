@@ -201,6 +201,13 @@ max_ctx 8192, MTP, speculative depth, matmul family), `[watcher]`, `[snapshots]`
 engine aborts itself above it.
 
 `streamdense config` prints the resolved values and where they came from; command-line flags override the file.
+
+Profiles: `[profile] name = "coding"` (or `streamdense up --profile coding`) applies a named set of defaults under the
+file's explicit values (flags still win). `coding` = 32K context, 8-bit KV, MTP auto + context drafts, fused verify,
+4 rewind checkpoints (one pinned at the end of the system + tools turn), 18 GB cap (17.5 GB startup estimate),
+thinking off, snapshot files capped at 8 GB, saves of the live chat and of each new system + tools prefix evict old
+files first instead of being skipped by the free-disk floor. See
+[docs/GATEWAY.md](docs/GATEWAY.md#profiles).
 Search order: `$SD_CONFIG`, `./streamdense.toml`, the repo root, `~/.config/streamdense/config.toml`.
 
 ## App

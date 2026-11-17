@@ -24,6 +24,7 @@ pub mod planner;
 pub mod server;
 pub mod snap;
 pub mod snap_tier;
+pub mod toolctl;
 pub mod worker;
 
 pub use snap::{CacheHook, SnapTarget};
@@ -47,12 +48,15 @@ pub struct GatewayConfig {
     pub log: Option<String>,
     /// Extra fields for the health endpoint.
     pub info: Value,
+    /// Process peak footprint tracker (the CLI's footprint monitor): /health + every request-log line. None = the
+    /// backend's (`Backend::peak_footprint`), else the peak of the footprints read at request ends.
+    pub peak: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Default for GatewayConfig {
     fn default() -> Self {
         GatewayConfig { host: "127.0.0.1".into(), port: DEFAULT_PORT, model_name: MODEL_NAME.into(),
-            worker: WorkerConfig { think: false, mtp: true, fold: None }, log: None, info: Value::Null }
+            worker: WorkerConfig { think: false, mtp: true, fold: None, ..Default::default() }, log: None, info: Value::Null, peak: None }
     }
 }
 
@@ -90,8 +94,8 @@ pub fn serve_ext<'a, B: Backend + ?Sized>(eng: &'a B, tk: Arc<Tokenizer>, cfg: G
     let (tx, rx) = mpsc::channel();
     let gate = Arc::new(worker::WarmGate::default());
     let sh = Arc::new(server::Shared {
-        tk: tk.clone(), model_name: cfg.model_name.clone(), max_ctx: eng.max_ctx(), think: cfg.worker.think,
-        jobs: Mutex::new(tx), log: server::Logger::new(cfg.log.as_deref())?, info: cfg.info.clone(), activity: eng.activity(), ext: ext.ext, mode: eng.mode_info(), peak: eng.peak_footprint(), tiers,
+        tk: tk.clone(), model_name: cfg.model_name.clone(), max_ctx: eng.max_ctx(), think: cfg.worker.think, cut_tool_call: cfg.worker.cut_tool_call,
+        jobs: Mutex::new(tx), log: server::Logger::new(cfg.log.as_deref())?, info: cfg.info.clone(), activity: eng.activity(), ext: ext.ext, mode: eng.mode_info(), peak: eng.peak_footprint().or(cfg.peak.clone()), tiers,
         warm: gate.clone(), awake: awake::Awake::start(awake::LINGER),
     });
     std::thread::spawn(move || server::accept_loop(listener, sh));

@@ -37,7 +37,7 @@ fn tmp(name: &str) -> PathBuf {
 fn cfg() -> TierConfig {
     TierConfig { max_files: 8, max_bytes: 1 << 30, min_free: 0, idle: Some(Duration::from_millis(40)), idle_save: true, idle_save_min: 1, preread: true,
                  preread_files: 4, preread_bytes: 1 << 30, hot_bytes: 1 << 30, hot_headroom: 0, ram_cap: 1 << 40, per_conv: true, index: true,
-                 hot_stable: true, switch_save: true, switch_save_min: 8 }
+                 hot_stable: true, switch_save: true, switch_save_min: 8, evict_for_save: false, evict_for_save_min: 2048, stable_ensure: false }
 }
 
 fn hook(dir: &Path, model: &str, c: TierConfig) -> CacheHook {
@@ -198,7 +198,7 @@ fn start_cfg(dir: PathBuf, log: String, idle: Duration) -> Option<u16> {
         let mut c = cfg();
         c.idle = Some(idle);
         let h: Box<dyn SnapshotHook<QwenEngine>> = Box::new(hook(&dir, &model, c));
-        let gc = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: false, fold: Some(vocab) }, ..Default::default() };
+        let gc = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: false, fold: Some(vocab), ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve(&eng, tk, gc, Some(h), |p| { tx.send(p).unwrap(); }).unwrap();
     });
     Some(rx.recv_timeout(Duration::from_secs(120)).unwrap())

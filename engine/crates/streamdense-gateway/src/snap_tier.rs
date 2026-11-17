@@ -46,12 +46,16 @@
 //! `worker::static_prefix_len`) is a stable prefix of its own: tag `StableTag::plan_static` (lane `plan-static`, no
 //! project, shared by every project): it and the facts cut of a project coexist; a newer static cut replaces only an
 //! older static one.
+//! Eviction first (N8, `evict_for_save` / `stable_ensure`, off by default): switch / idle saves of the live chat (>=
+//! `evict_for_save_min` tokens) and new stable prefixes delete files in `room_plan` order until the file fits above the
+//! floor (`make_room`) instead of being skipped; the live chat's newest file and its stable prefix are `protected`
+//! from both that and the disk policy. Sizes estimated by token count (`est_bytes_for`).
 //! Helper heap: index (~200 B / file) + one 4 MB read buffer while pre-reading + the token list of the live state.
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -100,6 +104,14 @@ pub struct TierConfig {
     /// save the live state before another conversation's request replaces it (>= `switch_save_min` tokens new)
     pub switch_save: bool,
     pub switch_save_min: usize,
+    /// eviction first (`[snapshots] evict_for_save`): a switch / idle save of a live state >= `evict_for_save_min`
+    /// tokens deletes the lowest-score files (`room_plan`; never the protected ones) instead of being skipped by the
+    /// free-disk floor; sizes estimated by token count (`est_bytes_for`)
+    pub evict_for_save: bool,
+    pub evict_for_save_min: usize,
+    /// stable prefix always on disk (`[snapshots] stable_ensure`): stable saves evict first, and the live lineage's
+    /// stable prefix file is never deleted by the disk policy
+    pub stable_ensure: bool,
 }
 
 impl TierConfig {
@@ -107,7 +119,7 @@ impl TierConfig {
     pub fn legacy(max_files: usize, max_bytes: u64) -> TierConfig {
         TierConfig { max_files: max_files.max(1), max_bytes, min_free: 0, idle: None, idle_save: false, idle_save_min: 256, preread: false,
                      preread_files: 0, preread_bytes: 0, hot_bytes: 0, hot_headroom: 0, ram_cap: 0, per_conv: false, index: false,
-                     hot_stable: false, switch_save: false, switch_save_min: 64 }
+                     hot_stable: false, switch_save: false, switch_save_min: 64, evict_for_save: false, evict_for_save_min: 2048, stable_ensure: false }
     }
     /// From `[snapshots]` + the live RAM cap in bytes (`[ram] cap_gb` / --abort-gb).
     pub fn from_config(s: &streamdense_core::config::Snapshots, ram_cap: u64) -> TierConfig {
@@ -115,7 +127,8 @@ impl TierConfig {
         TierConfig { max_files: s.max_files.max(1), max_bytes: gb(s.max_disk_gb), min_free: gb(s.min_free_disk_gb), idle: Some(Duration::from_secs_f64(s.idle_s)),
                      idle_save: s.idle_save, idle_save_min: s.idle_save_min_tokens, preread: s.preread, preread_files: s.preread_files,
                      preread_bytes: gb(s.preread_gb), hot_bytes: gb(s.hot_gb), hot_headroom: gb(s.hot_headroom_gb), ram_cap, per_conv: true, index: true,
-                     hot_stable: s.hot_stable, switch_save: s.switch_save, switch_save_min: s.switch_save_min_tokens }
+                     hot_stable: s.hot_stable, switch_save: s.switch_save, switch_save_min: s.switch_save_min_tokens,
+                     evict_for_save: s.evict_for_save, evict_for_save_min: s.evict_for_save_min_tokens, stable_ensure: s.stable_ensure }
     }
 }
 
@@ -336,6 +349,9 @@ pub struct Tiers {
     pub live_project: Option<u64>,
     /// the longest stable file that is a prefix of the live state (file name)
     pub live_stable: Option<String>,
+    /// tests: a fake free-disk figure used instead of statvfs (a save takes its bytes, a deletion gives them back);
+    /// shared so a test can move it between requests while the gateway owns the hook
+    pub fake_free: Option<Arc<AtomicU64>>,
     dirty: bool,
 }
 
@@ -343,7 +359,7 @@ impl Tiers {
     /// Open over the cache dir: load the index, add files it does not know (keys from their headers), drop stale rows.
     pub fn open(dir: &Path, cfg: TierConfig) -> Tiers {
         let mut t = Tiers { cfg, dir: dir.to_path_buf(), entries: HashMap::new(), hot: vec![], shared: Arc::new(TierShared::default()), c: Counters::default(),
-                            since: Counters::default(), steps: vec![], idle_from: None, last_block: None, preread: None, paged: HashMap::new(), live: None, live_project: None, live_stable: None, dirty: false };
+                            since: Counters::default(), steps: vec![], idle_from: None, last_block: None, preread: None, paged: HashMap::new(), live: None, live_project: None, live_stable: None, fake_free: None, dirty: false };
         let idx = if t.cfg.index { std::fs::read_to_string(dir.join(INDEX_FILE)).ok() } else { None };
         if let Some(s) = idx {
             if let Ok(v) = serde_json::from_str::<Value>(&s) {
@@ -412,9 +428,12 @@ impl Tiers {
         // the static planner cut belongs to no project (shared by all)
         let project = if tag.is_some_and(|g| g.stat) { 0 } else { project };
         self.entries.insert(name.clone(), Entry { n: tokens.len(), bytes, kind, project, conv, last_use: now, created: now,
-                                                   hits: old.map(|o| o.hits).unwrap_or(0), blocks: blocks.clone(), tag });
+                                                   hits: old.as_ref().map(|o| o.hits).unwrap_or(0), blocks: blocks.clone(), tag });
         self.paged.insert(name.clone(), Instant::now()); // just written: in the file cache
         self.c.saves += 1;
+        if let Some(f) = &self.fake_free { let d = bytes.saturating_sub(old.as_ref().map_or(0, |o| o.bytes)); let _ = f.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x.saturating_sub(d))); }
+        // the prefix a request just read is its lineage's: protected from the disk policy from now on
+        if kind == Kind::Stable && self.cfg.stable_ensure { self.live_stable = Some(name.clone()); }
         self.dirty = true;
         let mut gone = vec![];
         if kind != Kind::Stable {
@@ -452,10 +471,13 @@ impl Tiers {
         let p = self.dir.join(name);
         let ok = std::fs::remove_file(&p).is_ok() || !p.exists();
         if ok {
-            if let Some(e) = self.entries.remove(name) { if why != "replaced" && why != "superseded" { self.c.evicted += 1; self.c.evicted_bytes += e.bytes; } }
+            if let Some(e) = self.entries.remove(name) {
+                if why != "replaced" && why != "superseded" { self.c.evicted += 1; self.c.evicted_bytes += e.bytes; }
+                if let Some(f) = &self.fake_free { f.fetch_add(e.bytes, Ordering::SeqCst); }
+            }
             self.paged.remove(name);
             self.dirty = true;
-            if why != "replaced" { eprintln!("gateway: snapshot tiers: deleted {} ({})", p.display(), why); }
+            eprintln!("gateway: snapshot tiers: deleted {} ({})", p.display(), why);
         }
         ok
     }
@@ -466,11 +488,12 @@ impl Tiers {
     pub fn evict(&mut self, keep: Option<&str>) -> Vec<String> {
         self.sync_dir();
         let now = now_unix();
-        let mut order: Vec<(String, (bool, f64), u64)> = self.entries.iter().filter(|(k, _)| Some(k.as_str()) != keep)
+        let protect = self.protected();
+        let mut order: Vec<(String, (bool, f64), u64)> = self.entries.iter().filter(|(k, _)| Some(k.as_str()) != keep && !protect.contains(k))
             .map(|(k, e)| (k.clone(), (e.kind == Kind::Stable && now - e.last_use < STABLE_PROTECT_S, e.score()), e.bytes)).collect();
         order.sort_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)));
         let (mut n, mut bytes) = self.usage();
-        let mut free = if self.cfg.min_free > 0 { disk_free(&self.dir) } else { None };
+        let mut free = if self.cfg.min_free > 0 { self.free() } else { None };
         let mut gone = vec![];
         for (k, _, b) in order {
             let low = free.is_some_and(|f| f < self.cfg.min_free);
@@ -488,10 +511,10 @@ impl Tiers {
     /// May a file of about `est` bytes be written now? (frees cold files first when the disk is low)
     pub fn disk_ok(&mut self, est: u64) -> Result<(), String> {
         if self.cfg.min_free == 0 { return Ok(()); }
-        let Some(f) = disk_free(&self.dir) else { return Ok(()) };
+        let Some(f) = self.free() else { return Ok(()) };
         if f >= self.cfg.min_free + est { return Ok(()); }
         self.evict(None);
-        let f = disk_free(&self.dir).unwrap_or(f);
+        let f = self.free().unwrap_or(f);
         if f >= self.cfg.min_free + est { return Ok(()); }
         self.c.saves_skipped_disk += 1;
         Err(format!("disk low: {:.2} GB free < min_free_disk_gb {:.2} + {:.2} GB (save skipped)", f as f64 / 1e9, self.cfg.min_free as f64 / 1e9, est as f64 / 1e9))
@@ -499,6 +522,72 @@ impl Tiers {
 
     /// Size estimate of the next file: the largest file we know (a fresh cache: 0).
     pub fn est_bytes(&self) -> u64 { self.entries.values().map(|e| e.bytes).max().unwrap_or(0) }
+
+    /// Size estimate of a file of `n` tokens (sizes grow with the token count): the smallest known file of >= n
+    /// tokens, else the largest known file scaled by n / its tokens (an overestimate: its fixed part scales too);
+    /// a fresh cache: 0. A 1.9K-token stable prefix is no longer charged the 1.4 GB of a 20K-token state.
+    pub fn est_bytes_for(&self, n: usize) -> u64 {
+        let known = || self.entries.values().filter(|e| e.n > 0 && e.bytes > 0);
+        if let Some(e) = known().filter(|e| e.n >= n).min_by_key(|e| e.n) { return e.bytes; }
+        known().max_by_key(|e| e.n).map_or(0, |e| (e.bytes as f64 * n as f64 / e.n as f64).ceil() as u64)
+    }
+
+    /// Free bytes on the cache disk (`fake_free` in tests).
+    pub fn free(&self) -> Option<u64> { match &self.fake_free { Some(f) => Some(f.load(Ordering::SeqCst)), None => disk_free(&self.dir) } }
+
+    /// Files the disk policy must not delete: with `stable_ensure` the live lineage's stable prefix; with
+    /// `evict_for_save` also the newest file of the live conversation (a request of another conversation runs: its
+    /// saves never take the state that conversation comes back to).
+    pub fn protected(&self) -> Vec<String> {
+        let mut p = vec![];
+        if self.cfg.stable_ensure { if let Some(s) = &self.live_stable { p.push(s.clone()); } }
+        if self.cfg.evict_for_save {
+            if let Some((conv, _)) = self.live {
+                if let Some((k, _)) = self.entries.iter().filter(|(_, e)| e.conv == conv && e.kind != Kind::Stable).max_by_key(|(_, e)| e.n) { p.push(k.clone()); }
+            }
+        }
+        p
+    }
+
+    /// Eviction first: make `est` bytes of room above the `min_free` floor for a save of `n` tokens (`what`: kind,
+    /// for the log) by deleting files in `room_plan` order, never `protect` (+ `protected()`). Ok(deleted names) when
+    /// the floor holds after it (nothing deleted when it held already); Err (nothing deleted, counted as skipped)
+    /// when deleting every candidate could not make the room.
+    pub fn make_room(&mut self, est: u64, n: usize, what: &str, protect: &[String]) -> Result<Vec<String>, String> {
+        if self.cfg.min_free == 0 { return Ok(vec![]); }
+        self.sync_dir();
+        let Some(f) = self.free() else { return Ok(vec![]) };
+        let need = self.cfg.min_free + est;
+        if f >= need { return Ok(vec![]); }
+        let mut keep = self.protected();
+        keep.extend(protect.iter().cloned());
+        let now = now_unix();
+        let cands: Vec<RoomCand> = self.entries.iter().filter(|(k, _)| !keep.contains(k))
+            .map(|(k, e)| RoomCand { name: k.clone(), stable: e.kind == Kind::Stable, score: e.score(), bytes: e.bytes, age_s: now - e.last_use }).collect();
+        let gb = |b: u64| b as f64 / 1e9;
+        let Some(plan) = room_plan(&cands, f, need) else {
+            self.c.saves_skipped_disk += 1;
+            let all: u64 = cands.iter().map(|c| c.bytes).sum();
+            return Err(format!("disk low: {:.2} GB free < min_free_disk_gb {:.2} + {:.2} GB, and deleting every other file ({} files, {:.2} GB; {} protected) cannot make room (save skipped)",
+                               gb(f), gb(self.cfg.min_free), gb(est), cands.len(), gb(all), keep.len()));
+        };
+        let mut gone = vec![];
+        let mut desc = vec![];
+        for name in plan {
+            let e = self.entries.get(&name).cloned();
+            if self.remove(&name, "room for a save (eviction first)") {
+                if let Some(e) = e { desc.push(format!("{} ({}, {} tokens, {:.2} GB, age {:.0} s)", name, e.kind.as_str(), e.n, gb(e.bytes), (now - e.last_use).max(0.0))); }
+                gone.push(name);
+            }
+        }
+        let f2 = self.free().unwrap_or(f);
+        eprintln!("gateway: snapshot tiers: eviction first for a {} save ({} tokens, est {:.2} GB): free {:.2} -> {:.2} GB (floor {:.2}); evicted {}",
+                  what, n, gb(est), gb(f), gb(f2), gb(self.cfg.min_free), desc.join(", "));
+        if f2 >= need { Ok(gone) } else {
+            self.c.saves_skipped_disk += 1;
+            Err(format!("disk low after eviction first: {:.2} GB free < min_free_disk_gb {:.2} + {:.2} GB (save skipped)", gb(f2), gb(self.cfg.min_free), gb(est)))
+        }
+    }
 
     /// A warm file was restored.
     pub fn hit_warm(&mut self, path: &Path) {
@@ -773,7 +862,7 @@ impl Tiers {
             "dir": self.dir.display().to_string(),
             "warm": {"files": n, "gb": gb(bytes), "max_files": self.cfg.max_files, "max_gb": gb(self.cfg.max_bytes), "kinds": kinds},
             "hot": {"copies": self.hot.len(), "kinds": {"stable": hot_stable, "conv": self.hot.len() - hot_stable}, "gb": gb(self.hot_bytes()), "max_gb": gb(self.cfg.hot_bytes), "headroom_gb": gb(self.cfg.hot_headroom), "ram_cap_gb": gb(self.cfg.ram_cap)},
-            "disk": {"free_gb": disk_free(&self.dir).map(gb), "min_free_gb": gb(self.cfg.min_free)},
+            "disk": {"free_gb": self.free().map(gb), "min_free_gb": gb(self.cfg.min_free), "evict_for_save": self.cfg.evict_for_save, "stable_ensure": self.cfg.stable_ensure},
             "hits": {"hot": c.hit_hot, "warm": c.hit_warm, "miss": c.miss},
             "saves": c.saves, "switch_saves": c.switch_saves, "superseded": c.superseded, "stable": stables, "saves_skipped_disk": c.saves_skipped_disk, "evicted": c.evicted, "evicted_gb": gb(c.evicted_bytes),
             "hot_admitted": c.hot_admitted, "hot_refused": c.hot_refused, "hot_dropped": c.hot_dropped,
@@ -791,7 +880,30 @@ impl Drop for Tiers {
     fn drop(&mut self) { while !self.hot.is_empty() { self.drop_hot(0); } }
 }
 
-fn file_name(p: &Path) -> String { p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default() }
+/// A file eviction first may delete (`room_plan`).
+#[derive(Clone, Debug)]
+pub struct RoomCand { pub name: String, pub stable: bool, pub score: f64, pub bytes: u64, pub age_s: f64 }
+
+/// Eviction-first order: which files to delete so that `free` + their bytes >= `need`. Non-stable files first, then
+/// stable prefixes unused for `STABLE_PROTECT_S`, then the other stable prefixes; lowest score (oldest, fewest hits)
+/// first within each group; stop as soon as the room is there. None (delete nothing) when all of them together are
+/// not enough. Some(empty) when `free` >= `need` already.
+pub fn room_plan(cands: &[RoomCand], free: u64, need: u64) -> Option<Vec<String>> {
+    if free >= need { return Some(vec![]); }
+    let mut order: Vec<&RoomCand> = cands.iter().collect();
+    let group = |c: &RoomCand| if !c.stable { 0 } else if c.age_s >= STABLE_PROTECT_S { 1 } else { 2 };
+    order.sort_by(|a, b| group(a).cmp(&group(b)).then(a.score.total_cmp(&b.score)));
+    let mut f = free;
+    let mut out = vec![];
+    for c in order {
+        if f >= need { break; }
+        f += c.bytes;
+        out.push(c.name.clone());
+    }
+    if f >= need { Some(out) } else { None }
+}
+
+pub fn file_name(p: &Path) -> String { p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default() }
 
 #[cfg(test)]
 mod tests {
@@ -1189,6 +1301,80 @@ mod tests {
         // the live state's stable prefix (idle step 2b's source) is found exactly
         t.job_end(Some(&call));
         assert_eq!(t.live_stable_file().map(|x| x.1), Some(sys.len()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn cand(name: &str, stable: bool, score: f64, gb: u64, age_s: f64) -> RoomCand { RoomCand { name: name.into(), stable, score, bytes: gb, age_s } }
+
+    #[test]
+    fn room_plan_order_and_refusal() {
+        // fake disk in units of 10 MB: free 1277, floor 1200 + est 105 -> need 1305 (the logged shape: 12.77 GB free <
+        // 12.00 + 1.05 GB)
+        let c = vec![cand("stable_old", true, 10.0, 2, 2e5), cand("stable_new", true, 5.0, 2, 10.0),
+                     cand("roll_b", false, 300.0, 14, 50.0), cand("roll_a", false, 100.0, 3, 900.0), cand("idle_c", false, 200.0, 20, 60.0)];
+        // lowest score non-stable first, stop once the room is there (28 short: 3 + 20 is not enough, + 14 is)
+        assert_eq!(room_plan(&c, 1277, 1305), Some(vec!["roll_a".to_string(), "idle_c".to_string(), "roll_b".to_string()]));
+        assert_eq!(room_plan(&c, 1277, 1300), Some(vec!["roll_a".to_string(), "idle_c".to_string()]));
+        // already enough: nothing
+        assert_eq!(room_plan(&c, 1400, 1305), Some(vec![]));
+        // every non-stable file is not enough: the stale stable prefix (unused > STABLE_PROTECT_S) goes before a fresh one
+        assert_eq!(room_plan(&c, 1260, 1298), Some(vec!["roll_a".into(), "idle_c".into(), "roll_b".into(), "stable_old".into()]));
+        // all of them cannot make the room: None (nothing is deleted for nothing)
+        assert_eq!(room_plan(&c, 100, 1305), None);
+        assert_eq!(room_plan(&[], 1277, 1305), None);
+    }
+
+    #[test]
+    fn eviction_first_fake_disk() {
+        let d = tmp("evict_first");
+        let mut cfg = hot_cfg(32, 1 << 40);
+        cfg.min_free = 12_000; cfg.evict_for_save = true; cfg.stable_ensure = true; cfg.evict_for_save_min = 100;
+        let mut t = Tiers::open(&d, cfg);
+        let ff = Arc::new(AtomicU64::new(20_000));
+        t.fake_free = Some(ff.clone());
+        let set = |v: u64| ff.store(v, Ordering::SeqCst);
+        let get = || ff.load(Ordering::SeqCst);
+        let main = toks(1, 2, 400);
+        let sys = &main[..71];
+        // the main conversation's stable prefix + an old file of another conversation + an old file of a third one
+        let ps = file(&d, "main_stable", 300);
+        t.saved_tagged(&ps, sys, Kind::Stable, None);
+        assert_eq!(t.live_stable.as_deref(), Some("main_stable.sdsnap"), "stable_ensure: the new prefix is the lineage's");
+        let po = file(&d, "other", 1500);
+        t.saved(&po, &toks(4, 5, 300), Kind::Roll);
+        std::thread::sleep(Duration::from_millis(5));
+        let px = file(&d, "third", 1600);
+        t.saved(&px, &toks(6, 7, 320), Kind::Roll);
+        let pm = file(&d, "main_roll", 1000);
+        t.saved(&pm, &main[..250], Kind::Roll);
+        assert_eq!(get(), 20_000 - 300 - 1500 - 1600 - 1000);
+        t.job_end(Some(&main));
+        assert_eq!(t.live_stable.as_deref(), Some("main_stable.sdsnap"));
+        // size estimate by tokens: 400 tokens -> the largest known (320 tokens, 1600 B) scaled; 71 tokens -> the stable file
+        assert_eq!(t.est_bytes_for(400), 2000);
+        assert_eq!(t.est_bytes_for(71), 300);
+        assert_eq!(t.est_bytes_for(260), 1500);
+        assert_eq!(t.est_bytes(), 1600, "the old estimate: the largest file");
+        // the floor blocks a 2000 B save (15600 free >= 12000 + 2000 holds) -> lower the fake free under the floor
+        set(12_500);
+        // disk_ok (the former rule) skips; eviction first deletes the lowest-score unprotected files and saves
+        let gone = t.make_room(2000, 400, "switch", &[]).unwrap();
+        assert_eq!(gone, vec!["other.sdsnap".to_string()], "oldest first; enough after one");
+        assert!(!po.exists() && px.exists() && ps.exists() && pm.exists(), "live stable prefix + live conv newest kept");
+        assert_eq!(get(), 14_000);
+        // not enough even after deleting every unprotected file: nothing deleted, counted skipped
+        set(5_000);
+        let skipped = t.c.saves_skipped_disk;
+        let e = t.make_room(2000, 400, "idle", &[]).unwrap_err();
+        assert!(e.contains("cannot make room") && px.exists(), "{}", e);
+        assert_eq!(t.c.saves_skipped_disk, skipped + 1);
+        // the disk policy (after a save) never deletes the protected files either
+        set(11_000);
+        let gone = t.evict(None);
+        assert!(gone.contains(&"third.sdsnap".to_string()) && ps.exists() && pm.exists(), "{:?}", gone);
+        // without stable_ensure / evict_for_save nothing is protected (the former policy)
+        t.cfg.stable_ensure = false; t.cfg.evict_for_save = false;
+        assert!(t.protected().is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

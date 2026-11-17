@@ -164,6 +164,12 @@ pub struct QwenOptions {
     /// live at once and decode together in one batched verify pass (`QwenEngine::batch_round`). Needs MTP; no dump,
     /// read mask, ffn select, DFlash, context drafts, streamed prefill or the q8-conversion prototype.
     pub seqs: usize,
+    /// rewind checkpoints (rewind.rs, 2026-11-17): RAM for in-arena copies of the DeltaNet state + conv at earlier
+    /// positions of the live sequence, so a request that rewrites an earlier message rewinds to the last checkpoint
+    /// before the change instead of a reset + snapshot restore. K = bytes / (one S + conv copy) (27B: 153.9 MB each).
+    /// A budget row. 0 = off (default). Forced off with DFlash / DFlash2 / the compact FFN (their extra state is not
+    /// checkpointed).
+    pub rewind_bytes: u64,
 }
 impl Default for QwenOptions {
     fn default() -> Self {
@@ -173,7 +179,7 @@ impl Default for QwenOptions {
                       draft_table_bytes: crate::spec_deep::DRAFT_TABLE_BYTES, activity: true, activity_batch: false, live_cap: 0, read_mask: false, ffn_select: false,
                       ffn_compact: None, ffn_stream_tokens: 0, ffn_stream_slots: 2, ffn_stream_host: false, ffn_stream_fast: false,
                       decode_fused: false, ctx_draft: 0, mtp_ctx_draft: 0, verify_fused: false, verify_mixers: false, history_bytes: 0, gate_hold: false, ffn_x_capture: false,
-                      dflash: None, dflash_log_taps: false, dflash2: None, seqs: 1 }
+                      dflash: None, dflash_log_taps: false, dflash2: None, seqs: 1, rewind_bytes: 0 }
     }
 }
 
@@ -248,6 +254,7 @@ struct Layout {
     dflash2: Option<crate::dflash2::Df2Plan>, // DFlash2 drafter plan (opt.dflash2), None when off
     regions: usize,  // arena regions (weights + ours), for the alignment slack row
     seq_bytes: usize, // one extra sequence slot (opt.seqs > 1, batch.rs)
+    rewind_k: usize,  // rewind checkpoints (rewind.rs), 0 = off
 }
 
 fn weight_regions(cfg: &QwenConfig, mtp: bool) -> usize {
@@ -380,7 +387,10 @@ fn layout(cfg: &QwenConfig, opt: &QwenOptions) -> Result<Layout, String> {
     let regions = regions + extra * ((cfg.n_attention() + opt.mtp as usize) * kv_regions + 2 + (replay_bytes > 0) as usize + seq_sc.len());
     let seq_bytes = (cfg.n_attention() + opt.mtp as usize) * 2 * (kv_vals + kv_sb) + s_bytes + conv_bytes + replay_bytes
         + seq_sc.iter().map(|x| x.1).sum::<usize>();
-    Ok(Layout { keep, tmax, nch_max, row_bytes, slot_bytes, scratch, kv_vals, kv_sb, dump_bytes, s_bytes, conv_bytes, replay_bytes, hold_bytes, act_bytes, rm_bytes, dflash: df, dflash2: df2, regions, seq_bytes })
+    // rewind checkpoints: off where the engine holds state they do not cover (drafter context, compact FFN sums)
+    let rewind_k = if df.is_some() || df2.is_some() || opt.ffn_compact.is_some() { 0 } else { crate::rewind::ckpt_count(cfg, opt.rewind_bytes) };
+    let regions = regions + (rewind_k > 0) as usize;
+    Ok(Layout { keep, tmax, nch_max, row_bytes, slot_bytes, scratch, kv_vals, kv_sb, dump_bytes, s_bytes, conv_bytes, replay_bytes, hold_bytes, act_bytes, rm_bytes, dflash: df, dflash2: df2, regions, seq_bytes, rewind_k })
 }
 
 /// Dump region for one k = 1 pass: the largest per-layer capture set (plan 9.3 names, as `qwen_layers` captures
@@ -483,6 +493,10 @@ fn plan_budget(idx: &SafeIndex, cfg: &QwenConfig, opt: &QwenOptions) -> Result<(
                          opt.seqs, lay.seq_bytes as f64 / 1e9), ((opt.seqs - 1) * lay.seq_bytes) as u64);
     }
     if let Some(k) = &lay.keep { bud.add(&format!("MTP draft vocab keep-list ({} ids)", k.len()), (k.len() * 4) as u64); }
+    if lay.rewind_k > 0 {
+        let per = crate::rewind::ckpt_bytes(cfg);
+        bud.add(&format!("rewind checkpoints ({} x DeltaNet state + conv, {:.3} GB each)", lay.rewind_k, per as f64 / 1e9), (lay.rewind_k * per) as u64);
+    }
     bud.add(&format!("arena alignment slack ({} regions)", lay.regions), (lay.regions * ALIGN) as u64);
     Ok((bud, lay))
 }
@@ -496,10 +510,11 @@ struct PendState { cbs: HashMap<u64, SendCb>, committed: u64, closed: bool }
 #[derive(Default)]
 struct Pending { m: Mutex<PendState>, cv: Condvar }
 
-/// Bytes of each slot's ctrl region: the `SdCtrl` block, then the banned-id list u32 [n, id0 .. id30] at `BAN_OFF`.
-pub const CTRL_REGION: usize = 256;
+/// Bytes of each slot's ctrl region: the `SdCtrl` block, then the banned-id list u32 [h, id0 .. id222] at `BAN_OFF`
+/// (h = count, bit 31 = allow-list mode: `set_allow`). Must match head_sample.metal `BAN_N`.
+pub const CTRL_REGION: usize = 1024;
 pub const BAN_OFF: usize = 128;
-pub const BAN_MAX: usize = 31;
+pub const BAN_MAX: usize = 223;
 const _: () = assert!(std::mem::size_of::<SdCtrl>() <= BAN_OFF && BAN_OFF + 4 * (BAN_MAX + 1) <= CTRL_REGION);
 
 /// The arena regions one decode sequence owns (batching, batch.rs): KV per attention layer, MTP KV, DeltaNet state
@@ -581,6 +596,8 @@ pub struct QwenEngine {
     pub(crate) dflash2: Option<crate::dflash2::DFlash2>,
     /// batch.rs fused MTP draft step: arena offsets of (cat [seqs][2H], residual [seqs][H], normed [seqs][H]); seqs > 1
     pub(crate) bmtp: Option<(usize, usize, usize)>,
+    /// rewind checkpoints (Some with opt.rewind_bytes >= one checkpoint; rewind.rs)
+    pub(crate) rw: Option<crate::rewind::Rewind>,
 }
 
 impl QwenEngine {
@@ -659,6 +676,10 @@ impl QwenEngine {
         let dn = DnState { s: dn_s.off, conv: dn_conv.off, copies: if opt.mtp { 2 } else { 1 } };
         let dn_replay = if lay.replay_bytes > 0 { Some(arena.alloc("st:dn.replay", lay.replay_bytes)?) } else { None };
         let ctx_hold = if lay.hold_bytes > 0 { Some(arena.alloc("st:dn.hold", lay.hold_bytes)?) } else { None };
+        let rw = if lay.rewind_k > 0 {
+            let per = crate::rewind::ckpt_bytes(&cfg);
+            Some(crate::rewind::Rewind::new(arena.alloc("st:rewind", lay.rewind_k * per)?, per, lay.rewind_k, opt.seqs.max(1)))
+        } else { None };
         let dump_r = match &opt.dump { Some(_) => Some(arena.alloc("s:dump", lay.dump_bytes)?), None => None };
         let dumper = match (&opt.dump, dump_r) { (Some(d), Some(r)) => Some(Dumper::new(r, d.layers.clone())), _ => None };
         let act_r = if opt.activity {
@@ -796,7 +817,7 @@ impl QwenEngine {
                                loaded_bytes: loaded, budget_report: report,
                                draft_src: std::cell::RefCell::new(draft_src), activity, rm, cfc, cst,
                                ahead: std::cell::RefCell::new(None), zc: std::cell::OnceCell::new(), dflash, dflash2,
-                               bmtp: bmtp_off };
+                               bmtp: bmtp_off, rw };
         debug_assert_eq!(lay.slot_bytes, lay.tmax * lay.row_bytes);
         {   // RoPE inverse frequencies (config only)
             let cb = eng.gpu.command_buffer();
@@ -844,14 +865,21 @@ impl QwenEngine {
     /// Ban `ids` on the selected slot: from the next pass on, every head argmax (decode, prefill's last row, MTP / deep /
     /// DFlash / context-draft verify, batched verify) skips them (`ban_logits`: logit -inf). Empty = no ban (today's
     /// passes, no extra dispatch). Persists across `reset`; the caller clears it. At most `BAN_MAX` ids.
-    pub fn set_ban(&self, ids: &[u32]) -> Result<(), String> {
+    pub fn set_ban(&self, ids: &[u32]) -> Result<(), String> { self.set_ban_list(ids, false) }
+    /// Allow ONLY `ids` (1..=`BAN_MAX`) at every head argmax from the next pass on (gateway tool-name constraint): the
+    /// greedy pick among them (`ban_logits` allow mode). Cleared like a ban (`set_ban(&[])`).
+    pub fn set_allow(&self, ids: &[u32]) -> Result<(), String> {
+        if ids.is_empty() { return Err("allow: empty list".into()); }
+        self.set_ban_list(ids, true)
+    }
+    fn set_ban_list(&self, ids: &[u32], allow: bool) -> Result<(), String> {
         if ids.len() > BAN_MAX { return Err(format!("ban: {} ids > {}", ids.len(), BAN_MAX)); }
         // the GPU may still read the list of an in-flight pass of this slot: only change it between requests
         self.ahead.borrow_mut().take();
         let p = unsafe { self.arena.ptr(self.sl().ctrl).add(BAN_OFF) as *mut u32 };
         unsafe {
             for (i, &t) in ids.iter().enumerate() { std::ptr::write_volatile(p.add(1 + i), t); }
-            std::ptr::write_volatile(p, ids.len() as u32);
+            std::ptr::write_volatile(p, ids.len() as u32 | if allow && !ids.is_empty() { 0x8000_0000 } else { 0 });
         }
         Ok(())
     }
@@ -877,6 +905,7 @@ impl QwenEngine {
         c.pos = p as u32;
         c.mtp_len = p as u32;
         self.sl().pos.set(p);
+        self.ckpt_new_epoch();
     }
     /// rec[p] of the last pass that wrote it: (argmax token, bf16 top-1, top-2).
     pub fn rec_token(&self, p: usize) -> (u32, f32, f32) { self.rec_at(p) }
@@ -891,6 +920,7 @@ impl QwenEngine {
         self.arena.slice_mut::<u8>(self.sl().rec).fill(0);
         self.sl().pos.set(0);
         self.rm_reset();
+        self.ckpt_new_epoch();
     }
 
     /// One pass over `k` rows staged in `stage_slot`: embed_q4 → all layers → (head on the last `head_rows` rows) →

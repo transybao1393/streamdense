@@ -15,7 +15,7 @@ use streamdense_metal::{cb_signal, cb_wait, commit, wait, Enc, SdCtrl};
 use crate::embed::row_bytes;
 use crate::qwen_config::QwenConfig;
 use crate::qwen_engine::{QwenEngine, ATTN_CHUNK};
-use crate::qwen_layers::{encode_layer, gemv, gemv_d, mma_twin_nt, mma_use_twin, sdpa_vec_max_n, GemvImpl, KvRef, PassIo, MMA_SK};
+use crate::qwen_layers::{encode_layer, encode_layer_prefill, gemv, gemv_d, mma_twin_nt, mma_use_twin, sdpa_vec_max_n, GemvImpl, KvRef, PassIo, MMA_SK};
 use crate::weights::{MtpW, Q4b};
 
 /// Shader files the MTP path adds to `QWEN_SHADERS` (U17 / U18; head_pruned = the pruned-vocab draft head).
@@ -29,7 +29,7 @@ pub const CONF_BYTES: usize = 32;
 /// Pipelines used by `mtp.rs` / `spec.rs` (beyond `qwen_pipelines()`).
 pub fn pipelines() -> Vec<&'static str> {
     vec!["bf16_gemv_k1", "bf16_gemv_k2", "mtp_prep", "mtp_draft", "mtp_advance", "spec_decide", "select_row",
-         "embed_q4", "copy_bytes", "rmsnorm_b", "q4b_gemv_k1_m3", "spec_conf"]
+         "embed_q4", "copy_bytes", "rmsnorm_b", "q4b_gemv_k1_m3", "spec_conf", "bf16_gemv_g4"]
 }
 
 /// MTP scratch (arena offsets). `emb` [tmax][H] bf16 (spec mode: row 0 = emb(d), row 1 = emb(new t1)); `cat`
@@ -111,6 +111,15 @@ pub enum MtpRows {
 #[allow(clippy::too_many_arguments)]
 pub fn encode_mtp(e: &Enc, cfg: &QwenConfig, w: &MtpW, head: &Q4b, kv: &KvRef, io: &PassIo, ms: &MtpScratch,
                   rows: MtpRows, pos: usize, nch: usize, draft: bool) -> Result<(), String> {
+    encode_mtp_ex(e, cfg, w, head, kv, io, ms, rows, pos, nch, draft, None)
+}
+
+/// `encode_mtp` with `fc_h`: Some(off) = the fc output of these rows is already at arena offset `off` (the warm-up
+/// ran the fc over the whole chunk with `fc_rows`); the layer then runs on those rows (mtp_prep still writes mctrl;
+/// its cat rows are recomputed and unused).
+#[allow(clippy::too_many_arguments)]
+fn encode_mtp_ex(e: &Enc, cfg: &QwenConfig, w: &MtpW, head: &Q4b, kv: &KvRef, io: &PassIo, ms: &MtpScratch,
+                 rows: MtpRows, pos: usize, nch: usize, draft: bool, fc_h: Option<usize>) -> Result<(), String> {
     let h = cfg.hidden;
     let (k, emb, hf, t_arg) = match rows {
         MtpRows::Spec => (2, ms.emb, io.hf, 0usize),
@@ -122,15 +131,17 @@ pub fn encode_mtp(e: &Enc, cfg: &QwenConfig, w: &MtpW, head: &Q4b, kv: &KvRef, i
         .groups((k, 2), 1024);
     // fc: bf16 [H][2H], rows in pairs (K-invariant kernel)
     let c = 2 * h;
-    let mut t = 0;
-    while t < k {
-        let n = (k - t).min(2);
-        e.pso(if n == 2 { "bf16_gemv_k2" } else { "bf16_gemv_k1" })
-            .b(0, w.fc.off).b(1, ms.cat + t * c * BF).b(2, ms.h + t * h * BF).u(3, h as u32).u(4, c as u32)
-            .groups((h.div_ceil(32), 1), 256);
-        t += n;
+    if fc_h.is_none() {
+        let mut t = 0;
+        while t < k {
+            let n = (k - t).min(2);
+            e.pso(if n == 2 { "bf16_gemv_k2" } else { "bf16_gemv_k1" })
+                .b(0, w.fc.off).b(1, ms.cat + t * c * BF).b(2, ms.h + t * h * BF).u(3, h as u32).u(4, c as u32)
+                .groups((h.div_ceil(32), 1), 256);
+            t += n;
+        }
     }
-    let mio = PassIo { k, h: ms.h, ctrl: ms.mctrl, pos, nch_max: nch.max(1), ..*io };
+    let mio = PassIo { k, h: fc_h.unwrap_or(ms.h), ctrl: ms.mctrl, pos, nch_max: nch.max(1), ..*io };
     encode_layer(e, cfg, &w.layer, None, Some(kv), &mio, false, None, cfg.layers)?;
     if draft {
         e.pso("select_row").b(0, ms.h).b(1, ms.row).u(2, h as u32).b(3, ms.mctrl).threads((h, 1), 256);
@@ -177,6 +188,44 @@ pub fn head_pruned(e: &Enc, imp: GemvImpl, head: &Q4b, idx: usize, n: usize, x: 
     }
 }
 
+/// MTP prefill warm-up mode (`SD_MTP_WARM_V2`, read per prompt read; 2026-11-17).
+/// - `Old` (`0`): per <= 8-row block: fc as K = 2 GEMVs + the exact MTP layer (today's path before v2).
+/// - `Fc` (`fc`): the fc of the whole chunk in one `bf16_gemv_g4` grid dispatch (K-invariant: every row bit-equal to
+///   `Old`), then the exact MTP layer per <= 8-row block: MTP KV / drafts bit-identical to `Old`.
+/// - `V2` (`1`, default): `Fc`'s fc, and on fast prefill chunks (k > 8) the MTP layer as one fast prefill layer
+///   (`encode_layer_prefill`: 4-bit GEMMs + prefill attention) over all rows. Not bit-identical to `Old` (GEMM / flash
+///   summation order, like the target's own fast prefill): only MTP KV / acceptance can move, never output tokens.
+///   Exact passes (exact prefill mode, chunks of <= 8 rows) use `Fc` (bit-identical).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmMode { Old, Fc, V2 }
+
+pub fn warm_mode() -> WarmMode {
+    match std::env::var("SD_MTP_WARM_V2").as_deref().map(str::trim) {
+        Ok("0") => WarmMode::Old,
+        Ok("fc") => WarmMode::Fc,
+        _ => WarmMode::V2,
+    }
+}
+
+/// out [n][H] = fc . cat [n][2H] (bf16) for n rows: `bf16_gemv_g4` over the 4-row blocks (one dispatch), the tail
+/// as K = 2 / 1. Every row is bit-equal to the K = 1 / 2 GEMVs of `encode_mtp` (same body; gemv_bf16 tests).
+pub fn fc_rows(e: &Enc, cfg: &QwenConfig, w: &MtpW, cat: usize, out: usize, n: usize) {
+    let (h, c) = (cfg.hidden, 2 * cfg.hidden);
+    let nb = n / 4;
+    if nb > 0 {
+        e.pso("bf16_gemv_g4").b(0, w.fc.off).b(1, cat).b(2, out).u(3, h as u32).u(4, c as u32)
+            .groups((h.div_ceil(32), nb), 256);
+    }
+    let mut t = nb * 4;
+    while t < n {
+        let k = (n - t).min(2);
+        e.pso(if k == 2 { "bf16_gemv_k2" } else { "bf16_gemv_k1" })
+            .b(0, w.fc.off).b(1, cat + t * c * BF).b(2, out + t * h * BF).u(3, h as u32).u(4, c as u32)
+            .groups((h.div_ceil(32), 1), 256);
+        t += k;
+    }
+}
+
 /// Split n rows into kernel sizes (8 / 4 / 2 / 1, at most `max`): (offset, rows).
 pub(crate) fn splits(n: usize, max: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
@@ -204,7 +253,7 @@ impl QwenEngine {
     /// last MTP row (hf_last, emb(t1)) is `mtp_first_draft`'s job. If a plain turn left ctrl.mtp_len behind ctrl.pos,
     /// mtp_len is moved up to pos first (those MTP KV slots stay stale: lower acceptance only, output is exact).
     pub fn prefill_mtp(&self, ids: &[u32]) -> Result<(u32, usize), String> {
-        let (w, kv, ms) = self.mtp_parts()?;
+        let (_, _, ms) = self.mtp_parts()?;
         if ids.is_empty() { return Err("prefill_mtp: no tokens".into()); }
         if self.pos() + ids.len() > self.opt.max_ctx {
             return Err(format!("prefill_mtp: {} + {} tokens > max_ctx {}", self.pos(), ids.len(), self.opt.max_ctx));
@@ -215,10 +264,10 @@ impl QwenEngine {
             let c = self.ctrl();
             if c.mtp_len != c.pos { c.mtp_len = c.pos; }
         }
-        let cfg = &self.cfg;
-        let hb = cfg.hidden * BF;
+        let hb = self.cfg.hidden * BF;
         let io = self.io();
         let p0 = self.pos();
+        let mode = warm_mode();
         let ch = self.chunks(ids.len());
         let mut inflight: std::collections::VecDeque<streamdense_metal::CmdBuf> = Default::default();
         let mut hf_last = io.hf;
@@ -237,23 +286,7 @@ impl QwenEngine {
                 if ci > 0 { cb_wait(&cb, &order, ci as u64); }
                 self.encode_pass(&cb, k, slot, last as usize, false)?;
                 let e = Enc::new(&self.gpu, &cb, &self.buf);
-                let r = (|| -> Result<(), String> {
-                    if !last {
-                        e.pso("rmsnorm_b").b(0, io.h).b(1, self.w.final_norm.off).b(2, io.hf).u(3, cfg.hidden as u32)
-                            .f(4, cfg.eps).u(5, cfg.hidden as u32).groups((k, 1), 1024);
-                    }
-                    if m > 0 {
-                        e.pso("embed_q4").b(0, ms.stage + slot * ms.slot_bytes).b(1, ms.emb).u(2, m as u32);
-                        e.threads((cfg.hidden / 8, m), 64);
-                        for (o, s) in splits(m, self.tmax) {
-                            let pos = p0 + i + o;
-                            encode_mtp(&e, cfg, w, &self.w.lm_head, kv, &io, ms,
-                                       MtpRows::Direct { t: s, emb: ms.emb + o * hb, hf: io.hf + o * hb },
-                                       pos, self.nch_for(pos, s), false)?;
-                        }
-                    }
-                    Ok(())
-                })();
+                let r = self.encode_mtp_warm(&e, k, slot, p0 + i, last, m, mode);
                 e.end();
                 r?;
                 cb_signal(&cb, &order, ci as u64 + 1);
@@ -269,6 +302,52 @@ impl QwenEngine {
         res?;
         self.rm_prefill_end();
         Ok((self.ctrl_read().tok[0], hf_last))
+    }
+
+    /// MTP warm-up part of a prompt-read chunk of `k` rows at target position `p` (= ctrl.mtp_len: the invariant holds at
+    /// every chunk start), encoded after the target pass on `e`: final norm → hf (not `last`: the head did it), embed of
+    /// the `m` next-token rows staged in MTP stage `slot`, then the MTP rows (hf_p, emb(t_{p+1})) per `mode`
+    /// (`WarmMode`). ctrl.mtp_len += m.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_mtp_warm(&self, e: &Enc, k: usize, slot: usize, p: usize, last: bool, m: usize, mode: WarmMode)
+                                  -> Result<(), String> {
+        let (w, kv, ms) = self.mtp_parts()?;
+        let cfg = &self.cfg;
+        let hb = cfg.hidden * BF;
+        let io = self.io();
+        if !last {
+            e.pso("rmsnorm_b").b(0, io.h).b(1, self.w.final_norm.off).b(2, io.hf).u(3, cfg.hidden as u32)
+                .f(4, cfg.eps).u(5, cfg.hidden as u32).groups((k, 1), 1024);
+        }
+        if m == 0 { return Ok(()); }
+        e.pso("embed_q4").b(0, ms.stage + slot * ms.slot_bytes).b(1, ms.emb).u(2, m as u32);
+        e.threads((cfg.hidden / 8, m), 64);
+        let fast = !crate::qwen_layers::EXACT_KS.contains(&k) && self.fast_prefill();
+        if mode == WarmMode::V2 && fast {
+            // one fast MTP layer over all m rows (mctrl.pos = mtp_len = p; mtp_rows = m)
+            e.pso("mtp_prep").b(0, ms.emb).b(1, io.hf).b(2, w.pre_e.off).b(3, w.pre_h.off).b(4, ms.cat).b(5, io.ctrl)
+                .f(6, cfg.eps).u(7, cfg.hidden as u32).u(8, m as u32).b(9, ms.mctrl)
+                .groups((m, 2), 1024);
+            fc_rows(e, cfg, w, ms.cat, ms.h, m);
+            let mio = PassIo { k: m, h: ms.h, ctrl: ms.mctrl, pos: p, nch_max: self.nch_for(p, m), ..io };
+            encode_layer_prefill(e, cfg, &w.layer, None, Some(kv), &mio, cfg.layers)?;
+            e.pso("mtp_advance").b(0, io.ctrl).b(1, ms.mctrl).threads((1, 1), 1);
+            return Ok(());
+        }
+        let fc_all = mode != WarmMode::Old;
+        if fc_all {
+            // cat + fc for all m rows at once (rows bit-equal to the per-block fc); the blocks below reuse ms.h rows
+            e.pso("mtp_prep").b(0, ms.emb).b(1, io.hf).b(2, w.pre_e.off).b(3, w.pre_h.off).b(4, ms.cat).b(5, io.ctrl)
+                .f(6, cfg.eps).u(7, cfg.hidden as u32).u(8, m as u32).b(9, ms.mctrl)
+                .groups((m, 2), 1024);
+            fc_rows(e, cfg, w, ms.cat, ms.h, m);
+        }
+        for (o, s) in splits(m, self.tmax) {
+            let pos = p + o;
+            encode_mtp_ex(e, cfg, w, &self.w.lm_head, kv, &io, ms, MtpRows::Direct { t: s, emb: ms.emb + o * hb, hf: io.hf + o * hb },
+                          pos, self.nch_for(pos, s), false, fc_all.then_some(ms.h + o * hb))?;
+        }
+        Ok(())
     }
 
     /// The MTP row of the last fed position: (hf at `hf_off`, emb(t1)) → draft (ctrl.draft, mtp_len += 1). emb(t1)

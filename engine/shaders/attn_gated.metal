@@ -863,3 +863,157 @@ kernel void attn_flash(device const ushort* qr [[buffer(0)]], device const uchar
 AFL(false, "attn_flash_b16")
 AFL(true, "attn_flash_q8")
 #undef AFL
+
+// ---- attn_flash2_q8 (prefill, SD_ATTN_V2, default on; 2026-11-17): attn_flash_q8 reworked for throughput, same
+// buffers, causal contract, rounding of the epilogue and math. Changes vs attn_flash_q8:
+//   - Q (prescaled by 1/16: exact) is held as fp16 simdgroup fragments (bf16 -> fp16 is exact in the normal fp16 range),
+//     the staged K / V tiles are fp16 (as before), and the K^T / V fragments come from simdgroup_load (K^T with the
+//     transposed load) instead of per-element unpacks: S = Q K^T is fp16 x fp16 -> fp32, P V is fp32 P x fp16 V -> fp32.
+//     The products and fp32 accumulation are the same as attn_flash_q8's (fp32 x fp32 of the same fp16-exact values), so
+//     outputs match attn_flash_q8 almost everywhere (tests/attn_flash2.rs: 0 of 786k outputs differ at pos 0 / 5,
+//     max abs 1.2e-4 at pos 1000).
+//   - key blocks of BK = 24 keys (fewer barriers / softmax rounds per key), R = 2 8-row query tiles per threadgroup
+//     (2 * grp simdgroups share each staged K / V block, half the dequant work per row), O rescale skipped when no
+//     row's max moved (x * 1 is exact), causal mask only on blocks reaching past the tile's first row.
+//   Online softmax fp32 with max subtraction and fast::exp, ob = bf(o / l), ao = bf(ob * sigmoid_bf16(gate)).
+// Measured (27B shapes nh 24 / nkv 4, T = 128, M4 Pro): pos 2K 2.82 -> 1.62 ms, 8K 10.67 -> 6.30, 16K 21.5 -> 12.3,
+// 32K 42.5 -> 24.5 ms (2.4 -> 4.1-4.2 TFLOPS; MLX fp16 sdpa on the same shapes: 4.3-4.45).
+// Tried and dropped (tests/attn_flash2.rs history): fp16 P (+0-4%, 7% of outputs move by 1 ulp: accuracy loss),
+// BK 8 (-25%), BK 32 with K then V in one buffer (-10%), K stored transposed (=), register prefetch of the next block
+// (-5..-15%, register pressure), split-K over threadgroups + attn_reduce_gate (+0-3% at 8K-32K, 13 MB scratch).
+// Dispatch: groups (ceil(T / (8 R)), nkv) x (32 * grp * R) threads (grp * R <= 32).
+constant uint AF2_KS = AG_HD + 8;    // padded threadgroup row stride (half)
+template <uint BK, uint R>
+kernel void attn_flash2(device const ushort* qr [[buffer(0)]], device const uchar* Kc [[buffer(1)]],
+                        device const uchar* Vc [[buffer(2)]], device const ushort* p [[buffer(3)]],
+                        device ushort* ao [[buffer(4)]], device const SdCtrl* ctrl [[buffer(5)]],
+                        constant uint& maxctx [[buffer(6)]], constant uint& grp [[buffer(7)]],
+                        constant uint& p_stride [[buffer(8)]], constant uint& T [[buffer(9)]],
+                        device const half2* Ksb [[buffer(10)]], device const half2* Vsb [[buffer(11)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint2 ntgs [[threadgroups_per_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+#pragma METAL fp math_mode(safe)
+    constexpr uint HD = AG_HD, ND = AG_HD / 8, KS = AF2_KS, NJ = BK / 8;
+    threadgroup half tK[BK * KS];
+    threadgroup half tV[BK * KS];
+    const uint g = sg % grp, rt = sg / grp;
+    const uint tt0 = tg.x * 8 * R;                // first row of the threadgroup
+    const uint t0 = tt0 + rt * 8;                 // first row of this simdgroup
+    const uint kvh = tg.y, nh = ntgs.y * grp, h = kvh * grp + g, ntid = 32 * grp * R;
+    const uint pos = ctrl->pos;
+    const uint nkeys = pos + min(tt0 + 8 * R, T); // keys visible to the threadgroup's last row
+    // simdgroup 8x8 fragment coordinates of this lane (elements (fm, fn) and (fm, fn + 1))
+    const uint qid = lane / 4;
+    const uint fm = (qid & 4) + ((lane / 2) % 4);
+    const uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+    const uint trow = t0 + fm;
+    const bool rv = trow < T;
+    const uint qlim = pos + trow;                 // last key row fm may see
+    const uint mask_from = pos + tt0;             // blocks with a key past this one need the causal mask
+
+    simdgroup_half8x8 qf[ND];
+    simdgroup_float8x8 of[ND];
+    {
+        device const ushort* qp = qr + (trow * nh + h) * HD + fn;
+        AG_UNROLL for (uint d = 0; d < ND; d++) {
+            uint w = rv ? *(device const uint*)(qp + 8 * d) : 0u;
+            qf[d].thread_elements()[0] = half(AG_SCALE * as_type<float>(w << 16));
+            qf[d].thread_elements()[1] = half(AG_SCALE * as_type<float>(w & 0xffff0000u));
+            of[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    float m = -INFINITY, l = 0.0f;
+    const uint rbase = kvh * maxctx;
+    for (uint kb = 0; kb < nkeys; kb += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < BK * (HD / 8); i += ntid) {   // dequantize 8 codes of one 32-dim group to fp16
+            uint r = i / (HD / 8), c8 = (i % (HD / 8)) * 8, key = kb + r;
+            uint4 kv = 0, vv = 0;
+            if (key < nkeys) {                                // keys past the range are zero (never NaN garbage)
+                uint row = rbase + key;
+                uint2 kw = *(device const uint2*)(Kc + row * HD + c8);
+                uint2 vw = *(device const uint2*)(Vc + row * HD + c8);
+                float2 ks = float2(Ksb[row * AG_NG + c8 / 32]), vs = float2(Vsb[row * AG_NG + c8 / 32]);
+                AG_UNROLL for (uint w = 0; w < 2; w++) {
+                    half4 kh = half4(fma(float4(ks.x), float4(as_type<uchar4>(kw[w])), float4(ks.y)));
+                    half4 vh = half4(fma(float4(vs.x), float4(as_type<uchar4>(vw[w])), float4(vs.y)));
+                    kv[2 * w] = as_type<uint>(kh.xy); kv[2 * w + 1] = as_type<uint>(kh.zw);
+                    vv[2 * w] = as_type<uint>(vh.xy); vv[2 * w + 1] = as_type<uint>(vh.zw);
+                }
+            }
+            *(threadgroup uint4*)(tK + r * KS + c8) = kv;
+            *(threadgroup uint4*)(tV + r * KS + c8) = vv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 sf[NJ];
+        AG_UNROLL for (uint j = 0; j < NJ; j++) sf[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        AG_UNROLL for (uint d = 0; d < ND; d++) {
+            AG_UNROLL for (uint j = 0; j < NJ; j++) {
+                simdgroup_half8x8 kt;                         // K^T block: (dim, key)
+                simdgroup_load(kt, tK + 8 * j * KS + 8 * d, KS, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sf[j], qf[d], kt, sf[j]);
+            }
+        }
+        // online softmax over this block (row fm lives in lanes {x, x^1, x^8, x^9})
+        float mx = -INFINITY;
+        const bool msk = kb + BK > mask_from + 1;
+        AG_UNROLL for (uint j = 0; j < NJ; j++) {
+            AG_UNROLL for (uint i = 0; i < 2; i++) {
+                float sv = sf[j].thread_elements()[i];
+                if (msk) { uint key = kb + 8 * j + fn + i; sv = (rv && key > qlim) ? -INFINITY : sv; }
+                sf[j].thread_elements()[i] = sv;
+                mx = max(mx, sv);
+            }
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 8));
+        float mn = max(m, mx);                                // finite: key 0 is in the first block of every row
+        float fac = fast::exp(m - mn);
+        float rs = 0.0f;
+        AG_UNROLL for (uint j = 0; j < NJ; j++) {
+            AG_UNROLL for (uint i = 0; i < 2; i++) {
+                float pe = fast::exp(sf[j].thread_elements()[i] - mn);
+                sf[j].thread_elements()[i] = pe;
+                rs += pe;
+            }
+        }
+        rs += simd_shuffle_xor(rs, 1);
+        rs += simd_shuffle_xor(rs, 8);
+        l = l * fac + rs;
+        m = mn;
+        if (simd_any(fac != 1.0f)) {
+            AG_UNROLL for (uint d = 0; d < ND; d++) {
+                of[d].thread_elements()[0] *= fac;
+                of[d].thread_elements()[1] *= fac;
+            }
+        }
+        AG_UNROLL for (uint d = 0; d < ND; d++) {
+            AG_UNROLL for (uint j = 0; j < NJ; j++) {
+                simdgroup_half8x8 vf;                         // V block: (key, dim)
+                simdgroup_load(vf, tV + 8 * j * KS + 8 * d, KS);
+                simdgroup_multiply_accumulate(of[d], sf[j], vf, of[d]);
+            }
+        }
+    }
+    if (!rv) return;
+    device const ushort* gp = p + trow * p_stride + h * 2 * HD + HD + fn;
+    device ushort* out = ao + (trow * nh + h) * HD + fn;
+    AG_UNROLL for (uint d = 0; d < ND; d++) {
+        AG_UNROLL for (uint i = 0; i < 2; i++) {
+            float ob = bf(to_bf(of[d].thread_elements()[i] / l));
+            float gv = bf(gp[8 * d + i]);
+            float e = bf(to_bf(precise::exp(fabs(gv))));
+            float yy = bf(to_bf(1.0f / bf(to_bf(1.0f + e))));
+            float sgm = gv < 0.0f ? yy : bf(to_bf(1.0f - yy));
+            out[8 * d + i] = to_bf(ob * sgm);
+        }
+    }
+}
+#define AF2(BK_, R_, N_) template [[host_name(N_)]] kernel void attn_flash2<BK_, R_>(device const ushort*, \
+    device const uchar*, device const uchar*, device const ushort*, device ushort*, device const SdCtrl*, \
+    constant uint&, constant uint&, constant uint&, constant uint&, device const half2*, device const half2*, \
+    uint2, uint2, uint, uint, uint);
+AF2(24, 2, "attn_flash2_q8")      // the engine's (qwen_layers::encode_attn_prefill)
+AF2(24, 1, "attn_flash2_q8_r1")   // bench / tests only
+#undef AF2

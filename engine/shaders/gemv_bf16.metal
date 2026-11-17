@@ -87,3 +87,39 @@ kernel void bf16_gemv_k2(device const ushort* W [[buffer(0)]], device const usho
                          uint lane [[thread_index_in_simdgroup]]) {
     bgemv_body<2>(W, x, out, R, C, tg, sg, lane);
 }
+
+// Wider K (2026-11-17, MTP prefill warm-up v2): same body, so each row of a K = 4 / 8 dispatch is bit-equal to
+// a K = 1 dispatch on that row (the weight loads are shared by K rows: fc read once per K rows instead of per 2).
+kernel void bf16_gemv_k4(device const ushort* W [[buffer(0)]], device const ushort* x [[buffer(1)]],
+                         device ushort* out [[buffer(2)]], constant uint& R [[buffer(3)]], constant uint& C [[buffer(4)]],
+                         uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    bgemv_body<4>(W, x, out, R, C, tg, sg, lane);
+}
+
+kernel void bf16_gemv_k8(device const ushort* W [[buffer(0)]], device const ushort* x [[buffer(1)]],
+                         device ushort* out [[buffer(2)]], constant uint& R [[buffer(3)]], constant uint& C [[buffer(4)]],
+                         uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    bgemv_body<8>(W, x, out, R, C, tg, sg, lane);
+}
+
+// One dispatch for many rows: groups((ceil(R / 32), n / K), 256); token block g.y covers rows g.y K .. + K - 1 of x /
+// out (n % K == 0; the host sends a tail with the plain kernels). Same body: bit-equal per row to K = 1. Used by the
+// MTP warm-up (mtp.rs fc_rows). M4 Pro, fc 5120 x 10240, 128 rows: 64 x K = 2 dispatches 32-34 ms, 32 x K = 4 21-22,
+// 16 x K = 8 22-23, 8 x K = 16 46-48 (spills); one g4 grid 11.7-12.0 ms (g2 12.3, g8 12.1-12.4; token-major grid
+// order 17-28 ms: worse).
+template <uint K>
+static inline void bgemv_grid(device const ushort* W, device const ushort* x, device ushort* out, uint R, uint C,
+                              uint2 tg, uint sg, uint lane) {
+    ulong t0 = (ulong)tg.y * K;
+    bgemv_body<K>(W, x + t0 * C, out + t0 * R, R, C, tg.x, sg, lane);
+}
+
+kernel void bf16_gemv_g4(device const ushort* W [[buffer(0)]], device const ushort* x [[buffer(1)]],
+                         device ushort* out [[buffer(2)]], constant uint& R [[buffer(3)]], constant uint& C [[buffer(4)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    bgemv_grid<4>(W, x, out, R, C, tg, sg, lane);
+}
+

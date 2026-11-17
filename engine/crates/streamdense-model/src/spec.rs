@@ -114,6 +114,16 @@ pub struct SpecResult {
     pub acc_mtp: usize,
     pub acc_table: usize,
     pub acc_pad: usize,
+    /// combined MTP + context drafts (`QwenOptions.mtp_ctx_draft`, ctx_draft.rs `CtxSource`): verify passes by the
+    /// source of their real draft rows: source only (lookup / table run first), MTP chain + a source extension, MTP
+    /// only, no drafts (K = 1). Stats only.
+    pub passes_src: usize,
+    pub passes_mixed: usize,
+    pub passes_mtp: usize,
+    pub passes_nodraft: usize,
+    /// source draft rows (`drafts_table` / `acc_table`) that came from the context lookup (the rest: draft table)
+    pub drafts_lookup: usize,
+    pub acc_lookup: usize,
     /// per round: GPU idle ms between its command buffers (incl. the gap before its first) and wall ms
     pub idle_ms: Vec<f64>,
     pub round_ms: Vec<f64>,
@@ -125,6 +135,19 @@ pub struct SpecResult {
 }
 
 impl SpecResult {
+    /// Per-request stats of the combined MTP + context drafts (`QwenOptions.mtp_ctx_draft` > 0): passes by draft
+    /// source, context-lookup / table / MTP draft rows verified and accepted (gateway request log `ctx_draft`).
+    pub fn mtp_ctx_json(&self) -> serde_json::Value {
+        let tok = self.tokens.len().saturating_sub(1);
+        serde_json::json!({"mode": "mtp_ctx", "passes": self.passes, "passes_ctx": self.passes_src, "passes_mixed": self.passes_mixed,
+            "passes_mtp": self.passes_mtp, "passes_nodraft": self.passes_nodraft,
+            "drafted": self.drafts_lookup, "accepted": self.acc_lookup,
+            "acceptance": if self.drafts_lookup > 0 { self.acc_lookup as f64 / self.drafts_lookup as f64 } else { 0.0 },
+            "lookup": [self.drafts_lookup, self.acc_lookup],
+            "table": [self.drafts_table - self.drafts_lookup, self.acc_table - self.acc_lookup],
+            "mtp": [self.drafts_mtp, self.acc_mtp], "pad": [self.drafts_pad, self.acc_pad],
+            "tokens": tok, "tokens_per_pass": if self.passes > 0 { tok as f64 / self.passes as f64 } else { 0.0 }})
+    }
     pub(crate) fn finish(&mut self) {
         self.depth = self.depth.max(1);
         self.acceptance = if self.passes > 0 { self.accepted as f64 / self.passes as f64 } else { 0.0 };

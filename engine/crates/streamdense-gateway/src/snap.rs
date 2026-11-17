@@ -72,10 +72,19 @@ impl CacheHook {
     /// Save under the cache key + tier bookkeeping (disk floor checked first).
     fn save_kind<B: SnapTarget + ?Sized>(&mut self, b: &B, tokens: &[u32], kind: Kind) -> Result<PathBuf, String> { self.save_tagged(b, tokens, kind, None) }
     /// `save_kind` with the request's stable tag (project + lane: the supersede family of a stable prefix).
+    /// Disk floor: `Tiers::disk_ok` (the floor skips the save), or eviction first (`Tiers::make_room`) for a stable
+    /// prefix with `stable_ensure` and for a switch / idle save of >= `evict_for_save_min` tokens with `evict_for_save`.
     fn save_tagged<B: SnapTarget + ?Sized>(&mut self, b: &B, tokens: &[u32], kind: Kind, tag: Option<StableTag>) -> Result<PathBuf, String> {
         self.mode_ok(b)?;
-        self.tiers.disk_ok(self.tiers.est_bytes())?;
         let p = self.cache.path_for(b.engine(), tokens);
+        let c = &self.tiers.cfg;
+        let first = match kind {
+            Kind::Stable => c.stable_ensure,
+            Kind::Switch | Kind::Idle => c.evict_for_save && tokens.len() >= c.evict_for_save_min,
+            _ => false,
+        };
+        let est = if c.evict_for_save || c.stable_ensure { self.tiers.est_bytes_for(tokens.len()) } else { self.tiers.est_bytes() };
+        if first { self.tiers.make_room(est, tokens.len(), kind.as_str(), &[crate::snap_tier::file_name(&p)])?; } else { self.tiers.disk_ok(est)?; }
         b.save_snap(&p, tokens)?;
         self.tiers.saved_tagged(&p, tokens, kind, tag);
         Ok(p)
@@ -200,11 +209,18 @@ impl<B: SnapTarget + ?Sized> SnapshotHook<B> for CacheHook {
         Some(match r {
             Ok(t) if t.len() == n => SnapEvent { kind: "restore", tier: "warm", n, ms, bytes, error: None, src: src(n) },
             Ok(t) => SnapEvent { kind: "restore", tier: "warm", n, ms, bytes, error: Some(format!("restored {} tokens, wanted {}", t.len(), n)), src: src(n) },
-            Err(e) => { let _ = std::fs::remove_file(&p); SnapEvent { kind: "restore", tier: "warm", n, ms, bytes, error: Some(e), src: src(n) } }
+            Err(e) => { let _ = std::fs::remove_file(&p); eprintln!("gateway: snapshot tiers: deleted {} (restore failed: {})", p.display(), e); SnapEvent { kind: "restore", tier: "warm", n, ms, bytes, error: Some(e), src: src(n) } }
         })
     }
 
     fn has(&self, b: &B, tokens: &[u32]) -> bool { self.mode_ok(b).is_ok() && self.cache.path_for(b.engine(), tokens).exists() }
+
+    fn best_len(&self, b: &B, tokens: &[u32]) -> usize {
+        if self.mode_ok(b).is_err() { return 0; }
+        let warm = self.cache.longest_prefix(b.engine(), tokens).map_or(0, |w| w.1);
+        let hot = if b.hot_capable() { self.tiers.hot_best(tokens).map_or(0, |h| h.1) } else { 0 };
+        warm.max(hot)
+    }
 
     fn save(&mut self, b: &B, tokens: &[u32], stable: bool, tag: Option<StableTag>) -> Option<SnapEvent> {
         let kind = if stable { "save_stable" } else { "save_roll" };
@@ -233,6 +249,8 @@ impl<B: SnapTarget + ?Sized> SnapshotHook<B> for CacheHook {
 
     fn switch(&mut self, b: &B, live: &[u32], next: &[u32]) -> Option<SnapEvent> {
         if !self.tiers.cfg.switch_save || live.len() < STABLE_MIN || self.mode_ok(b).is_err() { return None; }
+        // N8: the index must describe the disk (a file deleted outside the tiers must not count as covering the state)
+        if self.tiers.cfg.evict_for_save || self.tiers.cfg.stable_ensure { self.tiers.sync_dir(); }
         let (project, conv) = crate::snap_tier::session_keys(live);
         // only a conversation state (past the system turn), and only when the next request is another conversation
         if conv == project || crate::snap_tier::session_keys(next).1 == conv { return None; }

@@ -9,8 +9,8 @@
 //! streamdense gateway ...   (Anthropic Messages API for Claude Code on the 27B engine, see src/gateway.rs)
 //! streamdense vocab keep --model DIR [--out FILE] [--drop cjk,ja,ko,tl,id,ms] [--drop-list FILE]   (pruned MTP draft vocab, src/vocab.rs)
 //! streamdense prompts spec [--out engine/refs/qwen38_spec_prompts.json]   (spec-bench default prompt set, src/prompts.rs)
-//! streamdense config [--json]   (resolved streamdense.toml + the file it came from, see src/up.rs)
-//! streamdense up [gateway args...]   (sd-watchdog + nice + gateway, all from streamdense.toml, see src/up.rs)
+//! streamdense config [--json] [--profile NAME]   (resolved streamdense.toml + the file it came from, see src/up.rs)
+//! streamdense up [--profile NAME] [gateway args...]   (sd-watchdog + nice + gateway, all from streamdense.toml, see src/up.rs)
 //! streamdense table stats DIR [--budget-mb 32]   (speculative draft table stats, see src/table.rs)
 //! streamdense watcher curve [--dir ~/.streamdense/watcher] [--out FILE.json]   (unload curve of the saved watcher profiles, src/watcher_curve.rs)
 //! streamdense mask-test --prompts FILE [--keep 0.95,0.9,0.8] [--max-tokens 64] [--out FILE.json]   (read mask on the real 27B: speed + agreement, src/mask_test.rs)
@@ -44,6 +44,16 @@ pub(crate) fn load_config() -> config::Loaded {
     config::load().unwrap_or_else(|e| { eprintln!("ERROR: {}", e); std::process::exit(2) })
 }
 
+/// `load_config` with `--profile NAME` from the command line (it replaces the file's `[profile] name`; "" = none).
+pub(crate) fn load_config_profile(a: &Args) -> config::Loaded {
+    config::load_profile(a.s("--profile").as_deref()).unwrap_or_else(|e| { eprintln!("ERROR: {}", e); std::process::exit(2) })
+}
+
+/// The profile line of a summary: `profile coding: key=value, ...` or `profile: none`.
+pub(crate) fn profile_line(c: &config::Loaded) -> String {
+    c.profile.as_ref().map(|p| p.line()).unwrap_or_else(|| "profile: none".into())
+}
+
 /// Base dir for relative paths in the config: the dir of a repo-style streamdense.toml, else the built-in repo root.
 pub(crate) fn config_root(c: &config::Loaded) -> std::path::PathBuf {
     match &c.source {
@@ -74,8 +84,8 @@ const USAGE: &str = "usage: streamdense <command> [options]
 commands:
   qwen budget|check|teacher|dump|bench|run|serve ...   Qwen3.8-27B engine (src/qwen.rs)
   gateway ...                Anthropic Messages API on the 27B engine (src/gateway.rs)
-  up [gateway args...]       sd-watchdog + nice + gateway from streamdense.toml (src/up.rs)
-  config [--json]            resolved streamdense.toml and its source
+  up [--profile NAME] [args]  sd-watchdog + nice + gateway from streamdense.toml (src/up.rs; profile: coding)
+  config [--json] [--profile NAME]  resolved streamdense.toml, its source and profile
   mask-test --prompts FILE   read mask on the real 27B (src/mask_test.rs)
   vocab keep --model DIR     pruned MTP draft vocab (src/vocab.rs)
   prompts spec               spec-bench default prompt set (src/prompts.rs)

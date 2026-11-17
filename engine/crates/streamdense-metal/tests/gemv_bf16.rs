@@ -11,14 +11,14 @@ use streamdense_metal::{commit, wait, Enc, Gpu};
 
 fn gpu() -> Gpu {
     let mut g = Gpu::from_shader_files(&["common_bf16", "gemv_bf16"]).expect("compile");
-    for k in ["bf16_gemv_k1", "bf16_gemv_k2"] { g.pipeline(k).unwrap(); }
+    for k in ["bf16_gemv_k1", "bf16_gemv_k2", "bf16_gemv_k4", "bf16_gemv_k8", "bf16_gemv_g4"] { g.pipeline(k).unwrap(); }
     g
 }
 
 fn gemv(g: &Gpu, ar: &Ar, w: usize, x: usize, out: usize, r: usize, c: usize, k: usize) {
     let cb = g.command_buffer();
     let e = Enc::new(g, &cb, &ar.buf);
-    e.pso(if k == 2 { "bf16_gemv_k2" } else { "bf16_gemv_k1" }).b(0, w).b(1, x).b(2, out).u(3, r as u32).u(4, c as u32);
+    e.pso(&format!("bf16_gemv_k{}", k)).b(0, w).b(1, x).b(2, out).u(3, r as u32).u(4, c as u32);
     e.groups((r.div_ceil(32), 1), 256);
     e.end();
     commit(&cb);
@@ -107,4 +107,89 @@ fn bf16_gemv_vs_mlx() {
         ok &= u1 == 0 && k2 == k1;
     }
     assert!(ok, "bf16_gemv vs MLX M = 1 mismatch");
+}
+
+/// MTP warm-up v2 (2026-11-17): K = 4 / 8 / 16 rows are bit-equal to K = 1 per row (the real fc shape and tails),
+/// the one-dispatch grid `bf16_gemv_g4` likewise, and the GPU time of 128 fc rows: 64 x K = 2 (today) vs 32 x K = 4 vs
+/// 16 x K = 8 vs one g4 grid (the MTP warm-up v2 fc).
+#[test]
+fn bf16_gemv_wide_k_kinv_and_time() {
+    let g = gpu();
+    let mut rng = Rng::new(23);
+    let mut ok = true;
+    for &(r, c) in &[(36, 1000), (100, 130), (5120, 10240)] {
+        let w = rng.bf_n(r * c, 0.05);
+        let x = rng.bf_n(16 * c, 1.0);
+        let mut ar = Ar::new(&g, (w.len() + x.len() + 32 * r) * 2 + (1 << 16));
+        let (wo, xo) = (ar.alloc_put(&w), ar.alloc_put(&x));
+        let out = ar.alloc(16 * r * 2);
+        let mut k1 = Vec::new();
+        for t in 0..16 {
+            ar.fill(out, 16 * r * 2, 0xff);
+            gemv(&g, &ar, wo, xo + t * c * 2, out, r, c, 1);
+            k1.extend(ar.get::<u16>(out, r));
+        }
+        for k in [4usize, 8] {
+            let mut got = Vec::new();
+            for t0 in (0..16).step_by(k) {
+                ar.fill(out, 16 * r * 2, 0xff);
+                gemv(&g, &ar, wo, xo + t0 * c * 2, out, r, c, k);
+                got.extend(ar.get::<u16>(out, k * r));
+            }
+            let eq = got == k1;
+            println!("  R {:5} C {:5}: K={:2} rows == K=1 rows {}", r, c, k, eq);
+            ok &= eq;
+        }
+        for k in [4usize] {
+            ar.fill(out, 16 * r * 2, 0xff);
+            let cb = g.command_buffer();
+            let e = Enc::new(&g, &cb, &ar.buf);
+            e.pso(&format!("bf16_gemv_g{}", k)).b(0, wo).b(1, xo).b(2, out).u(3, r as u32).u(4, c as u32);
+            e.groups((r.div_ceil(32), 16 / k), 256);
+            e.end();
+            commit(&cb);
+            wait(&cb).unwrap();
+            let eq = ar.get::<u16>(out, 16 * r) == k1;
+            println!("  R {:5} C {:5}: grid G={} 16 rows == K=1 rows {}", r, c, k, eq);
+            ok &= eq;
+        }
+    }
+    assert!(ok, "bf16_gemv wide K: not bit-equal to K = 1");
+    // timing: 128 rows of the real fc shape
+    let (r, c, n) = (5120usize, 10240usize, 128usize);
+    let w = rng.bf_n(r * c, 0.05);
+    let x = rng.bf_n(n * c, 1.0);
+    let mut ar = Ar::new(&g, (w.len() + x.len() + n * r) * 2 + (1 << 16));
+    let (wo, xo) = (ar.alloc_put(&w), ar.alloc_put(&x));
+    let out = ar.alloc(n * r * 2);
+    for k in [2usize, 4, 8] {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let cb = g.command_buffer();
+            let e = Enc::new(&g, &cb, &ar.buf);
+            for t0 in (0..n).step_by(k) {
+                e.pso(&format!("bf16_gemv_k{}", k)).b(0, wo).b(1, xo + t0 * c * 2).b(2, out + t0 * r * 2).u(3, r as u32).u(4, c as u32);
+                e.groups((r.div_ceil(32), 1), 256);
+            }
+            e.end();
+            commit(&cb);
+            wait(&cb).unwrap();
+            best = best.min(streamdense_metal::gpu_ms(&cb));
+        }
+        println!("  fc 5120 x 10240, {} rows as {} x K={:2}: {:.2} ms GPU (min of 5)", n, n / k, k, best);
+    }
+    for k in [4usize] {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let cb = g.command_buffer();
+            let e = Enc::new(&g, &cb, &ar.buf);
+            e.pso(&format!("bf16_gemv_g{}", k)).b(0, wo).b(1, xo).b(2, out).u(3, r as u32).u(4, c as u32);
+            e.groups((r.div_ceil(32), n / k), 256);
+            e.end();
+            commit(&cb);
+            wait(&cb).unwrap();
+            best = best.min(streamdense_metal::gpu_ms(&cb));
+        }
+        println!("  fc 5120 x 10240, {} rows as 1 grid dispatch G={}: {:.2} ms GPU (min of 5)", n, k, best);
+    }
 }

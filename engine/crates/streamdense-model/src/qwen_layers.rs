@@ -120,7 +120,7 @@ pub struct PassIo {
     /// N <= lim run va_sdpa (R = 1) instead of attn_sdpa_vec_b16 (bit-identical per row; 27B shapes, one layer: 4096
     /// keys 173 -> 120 µs, 8000 343 -> 210). None = attn_sdpa_vec_b16.
     pub va1: Option<usize>,
-    /// banned ids (gateway `format: plan`): arena offset of u32 [n, id0 .. id30]; Some (n > 0): `ban_logits` sets those
+    /// banned ids (gateway `format: plan`): arena offset of u32 [h, id0 .. id222] (bit 31 of h: allow-list mode); Some (h > 0): `ban_logits` sets those
     /// logits to -inf before every head argmax (decode, MTP / deep / DFlash / context-draft verify). None = today.
     pub ban: Option<usize>,
 }
@@ -1044,7 +1044,16 @@ pub const PREFILL_FLASH_MIN_T: usize = 17;
 /// are shared with `qwen_pipelines`).
 pub fn prefill_pipelines() -> Vec<&'static str> {
     vec!["dn_conv_pf", "dn_prep", "dn_recur_ck0", "rmsnorm_gated", "attn_prep_b16", "attn_prep_q8", "attn_flash_b16", "attn_flash_q8",
-         "attn_sdpa_vec_b16"]
+         "attn_flash2_q8", "attn_sdpa_vec_b16"]
+}
+
+/// `SD_ATTN_V2=0` selects the old 8-bit-KV prefill attention `attn_flash_q8`; default (unset or anything else) is
+/// `attn_flash2_q8` (attn_gated.metal; fp16 operands + simdgroup_load, 24-key blocks, 16-row tiles; 27B shapes T 128:
+/// 1.7x at 2K-32K keys; outputs equal attn_flash_q8's except rare last-bit differences, metal tests/attn_flash2.rs).
+/// Fast prefill only (encode_attn_prefill); decode / verify attention and the exact prefill path never use it.
+pub fn attn_v2() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("SD_ATTN_V2").map_or(true, |v| v.trim() != "0"))
 }
 
 fn check_prefill_t(t: usize) -> Result<(), String> {
@@ -1088,7 +1097,8 @@ pub fn encode_dn_prefill(e: &Enc, cfg: &QwenConfig, dw: &DnW, st: &DnState, io: 
 /// per-row mirror attn_sdpa_vec_b16 (small T, all rows' N = io.pos + t + 1 <= sdpa_vec_max_n()). Causal: row t sees
 /// keys 0 ..= pos + t. io.pos must be the host copy of ctrl.pos (as encode_attn).
 /// 8-bit KV (kv.q8): attn_prep_q8 (the decode path's KV writer: the same K / V values give the same q8 bytes and
-/// scale / min) and attn_flash_q8 (dequantizes the staged tiles to fp16) for every T (no per-row mirror for q8).
+/// scale / min) and attn_flash2_q8 (default; `attn_v2()`) or attn_flash_q8 (SD_ATTN_V2=0) for every T (no per-row
+/// mirror for q8; both dequantize the staged tiles to fp16).
 pub fn encode_attn_prefill(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io: &PassIo) -> Result<(), String> {
     let t = io.k;
     check_prefill_t(t)?;
@@ -1109,6 +1119,13 @@ pub fn encode_attn_prefill(e: &Enc, cfg: &QwenConfig, aw: &AttnW, kv: &KvRef, io
             .u(6, kv.max_ctx as u32).u(7, grp as u32).u(8, prow as u32).u(9, lim as u32)
             .u(10, sdpa_two_pass_min() as u32)
             .groups((nh, t), 1024);
+        return Ok(());
+    }
+    if kv.q8 && attn_v2() && grp <= 16 {
+        e.pso("attn_flash2_q8")
+            .b(0, io.cv).b(1, kv.k).b(2, kv.v).b(3, io.p).b(4, io.ao).b(5, io.ctrl)
+            .u(6, kv.max_ctx as u32).u(7, grp as u32).u(8, prow as u32).u(9, t as u32).b(10, kv.ksb).b(11, kv.vsb)
+            .groups((t.div_ceil(16), nkv), 64 * grp);
         return Ok(());
     }
     e.pso(if kv.q8 { "attn_flash_q8" } else { "attn_flash_b16" })
@@ -1210,7 +1227,7 @@ pub fn encode_head(e: &Enc, cfg: &QwenConfig, w: &Weights, io: &PassIo, rows: us
     let x0 = io.hf + (k - rows) * cfg.hidden * BF;
     mm(e, io, &w.lm_head, rows, 3, x0, io.logits, None);
     if let Some(b) = io.ban {
-        e.pso("ban_logits").b(0, io.logits).b(1, b).u(2, w.lm_head.rows as u32).groups((rows, 1), 32);
+        e.pso("ban_logits").b(0, io.logits).b(1, b).u(2, w.lm_head.rows as u32).groups((rows, 1), 256);
     }
     e.pso("argmax_b").b(0, io.logits).b(1, io.ctrl).b(2, io.rec).u(3, w.lm_head.rows as u32)
         .groups((rows, 1), 1024);
@@ -1422,7 +1439,7 @@ pub fn encode_head_batch(e: &Enc, cfg: &QwenConfig, w: &Weights, io: &PassIo, se
     for s in seqs {
         if let Some(b) = s.ban {
             e.pso("ban_logits").b(0, io.logits + s.row0 * w.lm_head.rows * F32).b(1, b).u(2, w.lm_head.rows as u32)
-                .groups((s.k, 1), 32);
+                .groups((s.k, 1), 256);
         }
         e.pso("argmax_b").b(0, io.logits + s.row0 * w.lm_head.rows * F32).b(1, s.ctrl).b(2, s.rec).u(3, w.lm_head.rows as u32)
             .groups((s.k, 1), 1024);

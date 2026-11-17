@@ -62,7 +62,7 @@ fn start_tiny_opt(dir: Option<std::path::PathBuf>, log: String) -> Option<u16> {
             let cache = SnapshotCache::open(dir, &CacheHook::model_id(&tiny)).unwrap();
             Box::new(CacheHook::new(cache, 8, 1 << 30)) as Box<dyn SnapshotHook<QwenEngine>>
         });
-        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab) }, ..Default::default() };
+        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab), ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve(&eng, tk, cfg, hook, |p| { tx.send(p).unwrap(); }).unwrap();
     });
     Some(rx.recv_timeout(Duration::from_secs(120)).unwrap())
@@ -167,7 +167,7 @@ fn start_slow(log: &str) -> Option<u16> {
     std::thread::spawn(move || {
         let tk = Arc::new(Tokenizer::from_path(TOK_DIR).unwrap());
         let eng = Slow { pos: Cell::new(0) };
-        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: false, fold: None }, ..Default::default() };
+        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: false, fold: None, ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve(&eng, tk, cfg, None, |p| { tx.send(p).unwrap(); }).unwrap();
     });
     Some(rx.recv_timeout(Duration::from_secs(60)).unwrap())

@@ -36,7 +36,7 @@ fn start(dir: std::path::PathBuf, log: String, max_files: usize) -> Option<u16> 
         let vocab = eng.cfg.vocab as u32;
         let cache = SnapshotCache::open(dir, &CacheHook::model_id(&tiny)).unwrap();
         let hook: Box<dyn SnapshotHook<QwenEngine>> = Box::new(CacheHook::new(cache, max_files, 1 << 30));
-        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab) }, ..Default::default() };
+        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab), ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve(&eng, tk, cfg, Some(hook), |p| { tx.send(p).unwrap(); }).unwrap();
     });
     Some(rx.recv_timeout(Duration::from_secs(120)).unwrap())

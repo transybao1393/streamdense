@@ -1,29 +1,33 @@
 //! streamdense config [--json]
 //!   Prints the resolved streamdense.toml values and the file they came from (or "built-in defaults").
 //!   --json: one JSON object {"source", "ram": {..}, "gateway": {.., "model_path"}, "watcher": {..}, "forheader": {..}} (read by the Swift app).
-//! streamdense up [gateway args...]
+//! streamdense up [--profile NAME] [gateway args...]
 //!   exec: sd-watchdog --cap-gb C --margin-gb M --swap-gb S -- nice -n N streamdense gateway --model .. --port ..
 //!         --max-ctx .. --abort-gb C --swap-gb S [--mtp] [--spec-depth N|auto] [--draft-table DIR] [gateway args...]
 //!   All values from streamdense.toml; a flag given in the extra args replaces the config value (--no-mtp drops --mtp).
+//!   Profile: `[profile] name` in the file or --profile NAME (wins; passed on to the gateway) = a named set of defaults
+//!   under the file's explicit values (streamdense-core config.rs PROFILES); the summary prints every value it set.
 //!   One-run state elsewhere: --watcher-dir DIR (or $SD_WATCHER_DIR) and --snapshot-dir DIR pass through to the gateway.
 //!   Stop: SIGTERM to this pid (sd-watchdog after the exec) is forwarded to the gateway (SIGINT after 3 s), or kill the process group.
-use crate::{config_root, load_config, Args};
+use crate::{config_root, load_config_profile, profile_line, Args};
 use serde_json::json;
 use std::os::unix::process::CommandExt;
 
 pub fn config_main(a: &Args) {
-    let c = load_config();
+    let c = load_config_profile(a);
     let model = config_root(&c).join(&c.cfg.gateway.model);
     let model = model.canonicalize().unwrap_or(model).display().to_string();
     if a.has("--json") {
         let mut g = serde_json::to_value(&c.cfg.gateway).unwrap();
         g["model_path"] = json!(model);
-        let o = json!({"source": c.source.as_ref().map(|p| p.display().to_string()), "ram": c.cfg.ram, "gateway": g, "watcher": c.cfg.watcher, "forheader": c.cfg.forheader});
+        let o = json!({"source": c.source.as_ref().map(|p| p.display().to_string()), "ram": c.cfg.ram, "gateway": g, "watcher": c.cfg.watcher, "forheader": c.cfg.forheader,
+                       "snapshots": c.cfg.snapshots, "profile": c.profile.as_ref().map(|p| p.json())});
         println!("{}", o);
         return;
     }
     let (r, g) = (&c.cfg.ram, &c.cfg.gateway);
     println!("source: {}", c.source_str());
+    println!("{}", profile_line(&c));
     println!("[ram]");
     println!("  cap_gb    = {}   (sd-watchdog --cap-gb, engine --abort-gb)", r.cap_gb);
     println!("  swap_gb   = {}   (sd-watchdog + engine --swap-gb)", r.swap_gb);
@@ -38,6 +42,9 @@ pub fn config_main(a: &Args) {
     println!("  spec_depth = {}   (MTP drafts verified per pass, or auto; gateway --spec-depth)", g.spec_depth.arg());
     println!("  draft_table = {:?}   (learning draft table for spec_depth auto, \"\" = off; gateway --draft-table)", g.draft_table);
     println!("  gemv      = {}   (matmul family of the exact passes: mma | old; gateway --gemv)", g.gemv);
+    println!("  kv / mtp_ctx_draft / verify_fused / rewind_gb = {} / {} / {} / {}", g.kv, g.mtp_ctx_draft, g.verify_fused, g.rewind_gb);
+    println!("  startup_cap_gb = {}   (startup estimate limit; gateway --cap) · think = {}   (gateway --think / --no-think)", g.startup_cap_gb, g.think);
+    println!("  cut_tool_call = {}   (tool call cut by max_tokens: tool_use | length) · ckpt_reply_start = {}   (rewind checkpoint at each reply start)", g.cut_tool_call, g.ckpt_reply_start);
     let w = &c.cfg.watcher;
     println!("[watcher]   (always on; GET /v1/streamdense/watcher)");
     println!("  mode      = {}   (observe | unload (reserved, observes until then))", w.mode);
@@ -61,7 +68,7 @@ pub fn config_main(a: &Args) {
 }
 
 pub fn up_main(a: &Args) {
-    let c = load_config();
+    let c = load_config_profile(a);
     let (r, g) = (&c.cfg.ram, &c.cfg.gateway);
     let extra: Vec<String> = a.0.iter().skip(2).cloned().collect();
     let ex = Args(extra.clone());
@@ -91,6 +98,8 @@ pub fn up_main(a: &Args) {
     eprintln!("cap {} GB · swap {} GB · ctx {} · model {} · port {}{}{} · config {}",
         cap, swap, show("--max-ctx"), show("--model"), show("--port"), if mtp && !fh { " · mtp" } else { "" },
         if fh { format!(" · 12 GB mode (research, cap {} GB{})", c.cfg.forheader.cap_gb, if c.cfg.forheader.mtp { ", mtp" } else { "" }) } else { String::new() }, c.source_str());
+    // the active profile and every value it set (file overrides listed); the gateway prints it again at start
+    eprintln!("{} · startup cap {} GB{}", profile_line(&c), ex.s("--cap").unwrap_or_else(|| g.startup_cap_gb.to_string()), if ex.has("--cap") { " (--cap)" } else { "" });
     // the watcher directory of this run (--watcher-dir > $SD_WATCHER_DIR > [watcher] dir): test / smoke runs keep the user's state untouched
     let wdir = ex.s("--watcher-dir").map(std::path::PathBuf::from).unwrap_or_else(|| crate::watcher::config_dir(&c.cfg.watcher.dir));
     eprintln!("watcher dir {}{}", wdir.display(), if ex.has("--watcher-dir") { " (--watcher-dir)" }

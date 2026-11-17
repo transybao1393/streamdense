@@ -23,6 +23,18 @@ pub struct ChatReq {
     pub plan: bool,
     /// `"streamdense": {"ban_ids": [..]}`: more token ids that can never be emitted (any format).
     pub ban_ids: Vec<u32>,
+    /// `tool_choice: {"type": "none"}` (or `"none"`): the tools stay in the prompt (same prefix as the calls with
+    /// tools) but the tool-call open token is banned like `format: plan` (lossless, worker.rs); any tool call in the
+    /// reply is dropped and a ban stop ends as "end_turn". Other `tool_choice` values: `tool_force`; auto = nothing.
+    pub tool_choice_none: bool,
+    /// `tool_choice: {"type": "any"}` (OpenAI "required") / `{"type": "tool", "name": X}` (OpenAI `{"type": "function",
+    /// "function": {"name": X}}`): the reply must be a tool call. The worker appends the template's tool-call opener
+    /// as forced prompt tokens (`ToolForce::prefix`); the model continues inside the call. None = auto / none.
+    pub tool_force: Option<ToolForce>,
+    /// `"streamdense": {"allowed_tools": [..]}`: the only tool names a call may use (the rendered tool list may be a
+    /// superset, e.g. the proxy's union of a conversation's tools, so the prompt prefix stays the same): the worker
+    /// constrains the name tokens of every call to them (greedy among the allowed names). None = no constraint.
+    pub allowed_tools: Option<Vec<String>>,
     /// Stop sequences (`stop_sequences`, or OpenAI-style `stop`: a string or an array): the reply ends as soon as its
     /// text contains one; the stop text is trimmed; stop_reason "stop_sequence".
     pub stop: Vec<String>,
@@ -33,7 +45,30 @@ pub struct ChatReq {
     pub lane_plan: bool,
 }
 
+/// Forced tool call (`ChatReq::tool_force`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolForce { Any, Tool(String) }
+
+impl ToolForce {
+    /// The forced start of the reply, in the Qwen3.8 template's tool-call format (`<tool_call>\n<function=NAME>\n
+    /// <parameter=...`): "any" stops right before the name (`=NAME>` is then chosen by the model, constrained to the
+    /// allowed names); a named tool includes the whole function line.
+    pub fn prefix(&self) -> String {
+        match self { ToolForce::Any => "<tool_call>\n<function".into(), ToolForce::Tool(n) => format!("<tool_call>\n<function={}>\n", n) }
+    }
+}
+
 impl ChatReq {
+    /// Tool names a call of this reply may use: `allowed_tools` (when given) within the rendered tools; with a forced
+    /// call and no `allowed_tools`, the rendered tools. None = unconstrained.
+    pub fn name_constraint(&self) -> Option<Vec<String>> {
+        let names = self.tool_names();
+        match (&self.allowed_tools, &self.tool_force) {
+            (Some(a), _) => Some(names.into_iter().filter(|n| a.contains(n)).collect()),
+            (None, Some(_)) => Some(names),
+            (None, None) => None,
+        }
+    }
     pub fn tool_schema(&self, name: &str) -> Option<&Value> { self.tools.iter().find(|t| t.name == name).map(|t| &t.parameters) }
     pub fn tool_names(&self) -> Vec<String> { self.tools.iter().map(|t| t.name.clone()).collect() }
     /// Project + lane of this request's stable prefix (None without a project header: the token-overlap fallback).
@@ -149,6 +184,21 @@ pub fn convert(body: &Value) -> Result<ChatReq, String> {
             .collect::<Option<Vec<u32>>>().ok_or("streamdense.ban_ids: must be an array of token ids")?,
         _ => return Err("streamdense.ban_ids: must be an array of token ids".into()),
     };
+    let tool_choice_none = match &body["tool_choice"] {
+        Value::String(t) => t == "none",
+        Value::Object(o) => o.get("type").and_then(|t| t.as_str()) == Some("none"),
+        _ => false,
+    };
+    let tool_force = parse_tool_force(&body["tool_choice"], &tools)?;
+    let allowed_tools = match &sd["allowed_tools"] {
+        Value::Null => None,
+        Value::Array(a) => Some(a.iter().map(|x| x.as_str().map(str::to_string)).collect::<Option<Vec<String>>>()
+            .ok_or("streamdense.allowed_tools: must be an array of tool names")?),
+        _ => return Err("streamdense.allowed_tools: must be an array of tool names".into()),
+    };
+    if let (Some(ToolForce::Tool(n)), Some(a)) = (&tool_force, &allowed_tools) {
+        if !a.contains(n) { return Err(format!("tool_choice: tool {:?} is not in streamdense.allowed_tools", n)); }
+    }
     let mut stop: Vec<String> = vec![];
     for key in ["stop_sequences", "stop"] {
         match &body[key] {
@@ -166,9 +216,31 @@ pub fn convert(body: &Value) -> Result<ChatReq, String> {
         max_tokens: body["max_tokens"].as_u64().unwrap_or(4096).max(1) as usize,
         stream: body["stream"].as_bool().unwrap_or(false),
         warm: body["max_tokens"].as_u64() == Some(0),
-        plan, ban_ids, stop,
+        plan, ban_ids, tool_choice_none, tool_force, allowed_tools, stop,
         project: None, lane_plan: false,
     })
+}
+
+/// `tool_choice` -> forced tool call: Anthropic `{"type": "any"}` / `{"type": "tool", "name": X}`, OpenAI-style
+/// `"required"` / `{"type": "function", "function": {"name": X}}` accepted too. auto / none / absent = None. A forced
+/// call needs tools; a named tool must be one of them.
+fn parse_tool_force(tc: &Value, tools: &[ToolDef]) -> Result<Option<ToolForce>, String> {
+    let f = match tc {
+        Value::String(t) if t == "any" || t == "required" => Some(ToolForce::Any),
+        Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
+            Some("any") | Some("required") => Some(ToolForce::Any),
+            Some("tool") => Some(ToolForce::Tool(o.get("name").and_then(|n| n.as_str()).ok_or("tool_choice.name: must be a string")?.to_string())),
+            Some("function") => Some(ToolForce::Tool(tc["function"]["name"].as_str().or_else(|| o.get("name").and_then(|n| n.as_str()))
+                .ok_or("tool_choice.function.name: must be a string")?.to_string())),
+            _ => None,
+        },
+        _ => None,
+    };
+    match &f {
+        Some(_) if tools.is_empty() => Err("tool_choice: a forced tool call needs tools".into()),
+        Some(ToolForce::Tool(n)) if !tools.iter().any(|t| &t.name == n) => Err(format!("tool_choice: no tool named {:?}", n)),
+        _ => Ok(f),
+    }
 }
 
 /// `x-streamdense-project` header value: exactly 16 hex digits -> the id (anything else: None).
@@ -209,12 +281,17 @@ pub fn text_delta(index: usize, text: &str) -> String {
 pub fn block_stop(index: usize) -> String { sse("content_block_stop", &json!({"type": "content_block_stop", "index": index})) }
 /// A whole tool_use block: start (empty input), one input_json_delta with the coerced arguments, stop.
 pub fn tool_use_block(index: usize, id: &str, name: &str, input: &Value) -> String {
-    let mut s = sse("content_block_start", &json!({"type": "content_block_start", "index": index,
-        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}));
-    s += &sse("content_block_delta", &json!({"type": "content_block_delta", "index": index,
-        "delta": {"type": "input_json_delta", "partial_json": input.to_string()}}));
-    s += &block_stop(index);
-    s
+    tool_use_start(index, id, name) + &input_json_delta(index, &input.to_string()) + &block_stop(index)
+}
+/// A tool_use block's start (empty input; the input follows as input_json_delta pieces, server.rs streams them).
+pub fn tool_use_start(index: usize, id: &str, name: &str) -> String {
+    sse("content_block_start", &json!({"type": "content_block_start", "index": index,
+        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}))
+}
+/// A piece of a tool_use block's JSON input (a block's pieces concatenate to its input JSON).
+pub fn input_json_delta(index: usize, partial: &str) -> String {
+    sse("content_block_delta", &json!({"type": "content_block_delta", "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial}}))
 }
 pub fn message_delta(stop_reason: &str, stop_sequence: Option<&str>, usage_v: Value) -> String {
     sse("message_delta", &json!({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence}, "usage": usage_v}))
@@ -296,7 +373,7 @@ mod tests {
         assert_eq!(r.msgs[4].content, "[error] boom");
         assert_eq!(r.msgs[5].content, "thanks");
         assert!(convert(&json!({"messages": []})).is_err());
-        assert!(!r.plan && r.ban_ids.is_empty() && r.stop.is_empty());
+        assert!(!r.plan && r.ban_ids.is_empty() && r.stop.is_empty() && !r.tool_choice_none);
         let p = convert(&json!({"messages": [{"role": "user", "content": "x"}], "streamdense": {"format": "plan", "ban_ids": [5, 7]},
             "stop_sequences": ["\n\n", ""], "stop": "END"})).unwrap();
         assert!(p.plan);
@@ -305,6 +382,62 @@ mod tests {
         assert!(convert(&json!({"messages": [{"role": "user", "content": "x"}], "streamdense": {"format": "json"}})).is_err());
         assert!(convert(&json!({"messages": [{"role": "user", "content": "x"}], "streamdense": {"ban_ids": ["a"]}})).is_err());
         assert!(convert(&json!({"messages": [{"role": "system", "content": "x"}]})).is_err());
+    }
+
+    #[test]
+    fn tool_choice_none_parsed() {
+        let tc = |c: Value| {
+            let mut b = fixture()["body"].clone();
+            b["tool_choice"] = c;
+            convert(&b).unwrap()
+        };
+        let r = tc(json!({"type": "none"}));
+        assert!(r.tool_choice_none && !r.plan && !r.tools.is_empty(), "tools stay rendered with tool_choice none");
+        assert!(tc(json!("none")).tool_choice_none);
+        for c in [Value::Null, json!({"type": "auto"}), json!({"type": "any"}), json!({"type": "tool", "name": "Bash"}), json!("auto")] {
+            assert!(!tc(c.clone()).tool_choice_none, "{}", c);
+        }
+    }
+
+    #[test]
+    fn tool_choice_forced_parsed() {
+        let tc = |c: Value| {
+            let mut b = fixture()["body"].clone();
+            b["tool_choice"] = c;
+            convert(&b)
+        };
+        let name = fixture()["body"]["tools"][0]["name"].as_str().unwrap().to_string();
+        for c in [json!({"type": "any"}), json!("required"), json!("any"), json!({"type": "required"})] {
+            let r = tc(c.clone()).unwrap();
+            assert_eq!(r.tool_force, Some(ToolForce::Any), "{}", c);
+            assert!(!r.tool_choice_none);
+            assert_eq!(r.name_constraint(), Some(r.tool_names()));
+        }
+        for c in [json!({"type": "tool", "name": name}), json!({"type": "function", "function": {"name": name}})] {
+            assert_eq!(tc(c.clone()).unwrap().tool_force, Some(ToolForce::Tool(name.clone())), "{}", c);
+        }
+        for c in [Value::Null, json!({"type": "auto"}), json!("auto"), json!({"type": "none"}), json!("none")] {
+            let r = tc(c.clone()).unwrap();
+            assert_eq!(r.tool_force, None, "{}", c);
+            assert_eq!(r.name_constraint(), None);
+        }
+        assert!(tc(json!({"type": "tool", "name": "NoSuchTool"})).is_err());
+        assert!(tc(json!({"type": "tool"})).is_err());
+        assert!(convert(&json!({"messages": [{"role": "user", "content": "x"}], "tool_choice": {"type": "any"}})).is_err(), "forced call without tools");
+        assert_eq!(ToolForce::Any.prefix(), "<tool_call>\n<function");
+        assert_eq!(ToolForce::Tool("Bash".into()).prefix(), "<tool_call>\n<function=Bash>\n");
+        // allowed_tools: names outside the rendered tools drop out; a forced tool must be allowed
+        let mut b = fixture()["body"].clone();
+        b["streamdense"] = json!({"allowed_tools": [name.clone(), "Ghost"]});
+        let r = convert(&b).unwrap();
+        assert_eq!(r.allowed_tools, Some(vec![name.clone(), "Ghost".to_string()]));
+        assert_eq!(r.name_constraint(), Some(vec![name.clone()]));
+        b["streamdense"] = json!({"allowed_tools": []});
+        b["tool_choice"] = json!({"type": "tool", "name": name});
+        assert!(convert(&b).is_err());
+        b["streamdense"] = json!({"allowed_tools": "x"});
+        b["tool_choice"] = Value::Null;
+        assert!(convert(&b).is_err());
     }
 
     #[test]

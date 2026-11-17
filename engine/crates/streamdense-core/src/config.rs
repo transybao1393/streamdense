@@ -62,14 +62,46 @@ pub struct Gateway {
     /// spec_depth = "auto", each verify pass takes the context-lookup run (up to this many drafts) or the MTP chain,
     /// whichever the planner expects to give more tokens per ms. 0 = off (default). Output identical to plain decode.
     pub mtp_ctx_draft: usize,
+    /// RAM for rewind checkpoints (engine `QwenOptions.rewind_bytes`, rewind.rs): in-arena copies of the DeltaNet
+    /// state + conv at earlier positions of the live chat, so a request that rewrites an earlier message re-reads
+    /// only from the last checkpoint before the change (no reset + snapshot restore). 27B: 0.154 GB per checkpoint,
+    /// 0.62 = 4. A budget row; lowered at startup if the budget would not fit the cap. 0 = off. Not in the 12 GB mode.
+    pub rewind_gb: f64,
+    /// startup estimate limit of the budget (gateway --cap): the engine refuses to open when its planned arena +
+    /// reserve exceed it (rewind checkpoints are lowered first). The live cap stays `[ram] cap_gb` (sd-watchdog +
+    /// --abort-gb). Default 17.0 (the former built-in --cap default).
+    pub startup_cap_gb: f64,
+    /// thinking (gateway --think / --no-think): when on, a request that asks for thinking gets the think block.
+    /// Default off.
+    pub think: bool,
+    /// A tool call cut by the token limit (max_tokens / context end while the model is inside `<tool_call>`):
+    /// "tool_use" (default, the former behaviour: the call is closed and returned with its truncated arguments,
+    /// stop_reason "tool_use") | "length" (stop_reason "max_tokens"; the partial call is dropped from a JSON reply, a
+    /// streamed tool_use block already open is closed; request log `tool_cut: {name, chars}`).
+    pub cut_tool_call: String,
+    /// Rewind checkpoint at the start of the reply (the prompt's last message end = where the assistant message
+    /// begins), matchable by messages: a later request whose messages before it are the same rewinds there even when
+    /// it edits that assistant message (and the engine holds the model's own reply tokens). The newest one is kept by
+    /// the retention. Default off.
+    pub ckpt_reply_start: bool,
+    /// Rewind checkpoint at the end of the system turn (system prompt + tools: the first `<|im_end|>`, the stable
+    /// prefix), matchable by tools + thinking flag + system messages, pinned while its lineage is live (one of the
+    /// rewind slots): a compacted history or a rewritten first message rewinds there instead of re-reading from 0.
+    /// With it, a request that lands exactly on that boundary (rewind / restore) saves the missing stable prefix file
+    /// there. Default off.
+    pub ckpt_system: bool,
 }
 impl Default for Gateway {
     fn default() -> Self {
         Gateway { model: "models/qwen38_27b_mlx4".into(), port: 8898, max_ctx: 8192, kv: "auto".into(), mtp: true, spec_depth: SpecDepth::N(1), gemv: "mma".into(),
                   draft_vocab: String::new(), draft_table: String::new(), verify_fused: false, drafter: String::new(), dflash2: String::new(),
-                  mtp_ctx_draft: 0 }
+                  mtp_ctx_draft: 0, rewind_gb: 0.62, startup_cap_gb: 17.0, think: false,
+                  cut_tool_call: "tool_use".into(), ckpt_reply_start: false, ckpt_system: false }
     }
 }
+
+/// `[gateway] cut_tool_call` values.
+pub const CUT_TOOL_CALL: [&str; 2] = ["tool_use", "length"];
 
 /// sha256 of the tested DFlash2 weights (models/dflash2_27b_q4/model.safetensors, 1,082,881,511 B).
 pub const DFLASH2_SHA256: &str = "ac61dedfd68c6524b71fd96cbe50a2e20749edfc0fbb25f964f61b93efcd022e";
@@ -208,12 +240,23 @@ pub struct Snapshots {
     /// so interleaved users each restore their own turn instead of re-reading it
     pub switch_save: bool,
     pub switch_save_min_tokens: usize,
+    /// eviction first: a switch save or idle save of a live conversation of at least `evict_for_save_min_tokens`
+    /// that the `min_free_disk_gb` floor would block deletes the lowest-score files (never the live conversation's
+    /// newest file or its stable prefix) until free disk >= floor + the file's estimated size, then saves; skipped
+    /// only when deleting every other file cannot make room. The size estimate is by token count (not the largest
+    /// file). Default off (the floor skips the save)
+    pub evict_for_save: bool,
+    pub evict_for_save_min_tokens: usize,
+    /// stable prefix always on disk: a new system + tools prefix is saved with the same eviction first, and the live
+    /// lineage's stable prefix file is never deleted by the disk policy. Default off
+    pub stable_ensure: bool,
 }
 impl Default for Snapshots {
     fn default() -> Self {
         Snapshots { max_disk_gb: 8.0, max_files: 32, min_free_disk_gb: 20.0, idle_s: 5.0, idle_save: true, idle_save_min_tokens: 256,
                     preread: true, preread_files: 2, preread_gb: 1.5, hot_gb: 1.0, hot_headroom_gb: 1.0,
-                    hot_stable: true, switch_save: true, switch_save_min_tokens: 64 }
+                    hot_stable: true, switch_save: true, switch_save_min_tokens: 64,
+                    evict_for_save: false, evict_for_save_min_tokens: 2048, stable_ensure: false }
     }
 }
 
@@ -312,9 +355,119 @@ mod auto_str {
     }
 }
 
+/// `[profile]`: a named set of defaults (`PROFILES`) applied BEFORE the file's explicit values; flags win over both.
+/// `name = ""` (default) = no profile. `--profile NAME` (up / gateway / config) replaces the file's name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Profile {
+    pub name: String,
+}
+
+/// Built-in profiles: (name, one-line purpose, TOML of the defaults it sets). A profile holds no paths (model,
+/// draft tables, snapshot dirs stay per install).
+pub const PROFILES: [(&str, &str, &str); 1] = [
+    ("coding", "local coding agent sessions on the 27B (long tool loops, file writes / edits)", CODING_PROFILE),
+];
+
+/// "coding": 32K context in 8-bit KV, MTP auto depth + context drafts (7), fused verify matmuls (bit-identical, every
+/// check pass of a coding session has 3..8 rows), 4 rewind checkpoints, startup estimate limit 17.5 GB under an 18 GB
+/// live cap, thinking off, snapshot files capped at 8 GB / 12 GB free disk, a tool call cut by max_tokens reported as
+/// "max_tokens" (not a complete tool_use), a rewind checkpoint at each reply start (edits of the last reply rewind there),
+/// a pinned rewind checkpoint at the end of the system turn (a compacted history rewinds there), saves of a live
+/// conversation >= 2048 tokens and of each new system + tools prefix evict old files first instead of being skipped
+/// by the free-disk floor, and the live system + tools prefix file is never deleted by the disk policy (N8).
+pub const CODING_PROFILE: &str = r#"
+[ram]
+cap_gb = 18.0
+swap_gb = 7.0
+margin_gb = 0.0
+nice = 10
+[gateway]
+max_ctx = 32768
+kv = "q8"
+mtp = true
+spec_depth = "auto"
+mtp_ctx_draft = 7
+verify_fused = true
+rewind_gb = 0.62
+gemv = "mma"
+startup_cap_gb = 17.5
+think = false
+cut_tool_call = "length"
+ckpt_reply_start = true
+ckpt_system = true
+[snapshots]
+max_disk_gb = 8.0
+min_free_disk_gb = 12.0
+evict_for_save = true
+evict_for_save_min_tokens = 2048
+stable_ensure = true
+"#;
+
+/// What a profile did to a loaded config: its name, the values it set (dotted key, value; the file did not set
+/// them) and the keys the file overrode (the file's value is in effect).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProfileApplied {
+    pub name: String,
+    pub set: Vec<(String, String)>,
+    pub overridden: Vec<String>,
+}
+
+impl ProfileApplied {
+    /// One line: `profile coding: ram.cap_gb=18, ... (file overrides: gateway.max_ctx)`.
+    pub fn line(&self) -> String {
+        let set: Vec<String> = self.set.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        format!("profile {}: {}{}", self.name, set.join(", "),
+                if self.overridden.is_empty() { String::new() } else { format!(" (file overrides: {})", self.overridden.join(", ")) })
+    }
+    pub fn json(&self) -> serde_json::Value {
+        let set: serde_json::Map<String, serde_json::Value> = self.set.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+        serde_json::json!({"name": self.name, "set": set, "overridden": self.overridden})
+    }
+}
+
+/// The TOML table of a built-in profile; an unknown name is an error that lists the known ones.
+pub fn profile_table(name: &str) -> Result<toml::Table, String> {
+    let (_, _, t) = PROFILES.iter().find(|p| p.0 == name)
+        .ok_or_else(|| format!("unknown profile {:?}: known profiles: {}", name, PROFILES.iter().map(|p| p.0).collect::<Vec<_>>().join(", ")))?;
+    toml::from_str::<toml::Table>(t).map_err(|e| format!("profile {}: {}", name, e))
+}
+
+/// `over` on top of `base`, table by table (scalars and arrays of `over` replace).
+fn merge(base: &mut toml::Table, over: &toml::Table) {
+    for (k, v) in over {
+        match (base.get_mut(k), v) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge(b, o),
+            _ => { base.insert(k.clone(), v.clone()); }
+        }
+    }
+}
+
+/// Leaf keys of a table as dotted paths with their values.
+fn leaves(t: &toml::Table, pre: &str, out: &mut Vec<(String, toml::Value)>) {
+    for (k, v) in t {
+        let key = if pre.is_empty() { k.clone() } else { format!("{}.{}", pre, k) };
+        match v { toml::Value::Table(s) => leaves(s, &key, out), _ => out.push((key, v.clone())) }
+    }
+}
+
+fn has_path(t: &toml::Table, key: &str) -> bool {
+    let mut cur = t;
+    let parts: Vec<&str> = key.split('.').collect();
+    for (i, p) in parts.iter().enumerate() {
+        match cur.get(*p) {
+            Some(toml::Value::Table(s)) if i + 1 < parts.len() => cur = s,
+            Some(_) if i + 1 == parts.len() => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub profile: Profile,
     pub ram: Ram,
     pub gateway: Gateway,
     pub watcher: Watcher,
@@ -329,6 +482,8 @@ pub struct Config {
 pub struct Loaded {
     pub cfg: Config,
     pub source: Option<PathBuf>,
+    /// the active profile and what it set (None = no profile)
+    pub profile: Option<ProfileApplied>,
 }
 
 impl Loaded {
@@ -344,17 +499,42 @@ impl Loaded {
 
 /// Parse one file; errors name the file (and, for unknown keys, the key and its line).
 pub fn parse_file(path: &Path) -> Result<Config, String> {
+    parse_file_profile(path, None).map(|(c, _)| c)
+}
+
+/// `parse_file` with a profile: `flag` (--profile) replaces the file's `[profile] name`.
+pub fn parse_file_profile(path: &Path, flag: Option<&str>) -> Result<(Config, Option<ProfileApplied>), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("config {}: {}", path.display(), e))?;
-    parse_str(&text).map_err(|e| format!("config {}: {}", path.display(), e))
+    parse_str_profile(&text, flag).map_err(|e| format!("config {}: {}", path.display(), e))
+}
+
+/// Parse with profiles: the file is checked as written first (unknown keys name their line), then the profile's
+/// defaults (`flag` > `[profile] name`; "" = none) go under the file's explicit values. Validation runs on the result.
+pub fn parse_str_profile(text: &str, flag: Option<&str>) -> Result<(Config, Option<ProfileApplied>), String> {
+    let plain: Config = toml::from_str(text).map_err(|e| e.to_string().trim_end().to_string())?;
+    let name = flag.map(str::to_string).unwrap_or_else(|| plain.profile.name.clone());
+    if name.is_empty() { validate(&plain)?; return Ok((plain, None)); }
+    let prof = profile_table(&name)?;
+    let file: toml::Table = toml::from_str::<toml::Table>(text).map_err(|e| e.to_string().trim_end().to_string())?;
+    let mut merged = prof.clone();
+    merge(&mut merged, &file);
+    let mut cfg: Config = toml::Value::Table(merged).try_into().map_err(|e: toml::de::Error| format!("profile {}: {}", name, e.to_string().trim_end()))?;
+    cfg.profile.name = name.clone();
+    validate(&cfg)?;
+    let mut lv = vec![];
+    leaves(&prof, "", &mut lv);
+    let mut ap = ProfileApplied { name, ..Default::default() };
+    for (k, v) in lv {
+        if has_path(&file, &k) { ap.overridden.push(k); } else { ap.set.push((k, match v { toml::Value::String(x) => x, o => o.to_string() })); }
+    }
+    Ok((cfg, Some(ap)))
 }
 
 /// `[gateway] kv` values (gateway --kv).
 pub const KV_FORMATS: [&str; 3] = ["auto", "bf16", "q8"];
 
 pub fn parse_str(text: &str) -> Result<Config, String> {
-    let cfg: Config = toml::from_str(text).map_err(|e| e.to_string().trim_end().to_string())?;
-    validate(&cfg)?;
-    Ok(cfg)
+    parse_str_profile(text, None).map(|(c, _)| c)
 }
 
 fn validate(c: &Config) -> Result<(), String> {
@@ -369,7 +549,10 @@ fn validate(c: &Config) -> Result<(), String> {
     if let SpecDepth::N(d) = c.gateway.spec_depth {
         if !(1..=7).contains(&d) { return Err(format!("gateway.spec_depth = {}: want 1..=7 or \"auto\"", d)); }
     }
+    if !(c.gateway.startup_cap_gb > 0.0 && c.gateway.startup_cap_gb.is_finite()) { return Err(format!("gateway.startup_cap_gb = {}: want > 0", c.gateway.startup_cap_gb)); }
+    if !(c.gateway.rewind_gb >= 0.0 && c.gateway.rewind_gb.is_finite()) { return Err(format!("gateway.rewind_gb = {}: want >= 0", c.gateway.rewind_gb)); }
     if c.gateway.mtp_ctx_draft > 7 { return Err(format!("gateway.mtp_ctx_draft = {}: want 0..=7", c.gateway.mtp_ctx_draft)); }
+    if !CUT_TOOL_CALL.contains(&c.gateway.cut_tool_call.as_str()) { return Err(format!("gateway.cut_tool_call = {:?}: want \"tool_use\" or \"length\"", c.gateway.cut_tool_call)); }
     if !["mma", "old"].contains(&c.gateway.gemv.as_str()) { return Err(format!("gateway.gemv = {:?}: want \"mma\" or \"old\"", c.gateway.gemv)); }
     let e = &c.dflash2.expected_sha256;
     if e.len() != 64 || !e.chars().all(|c| c.is_ascii_hexdigit()) { return Err(format!("dflash2.expected_sha256 = {:?}: want 64 hex digits", e)); }
@@ -442,11 +625,15 @@ pub fn find() -> Result<Option<PathBuf>, String> {
     Ok(None)
 }
 
-/// Find + parse; no file -> defaults.
-pub fn load() -> Result<Loaded, String> {
+/// Find + parse; no file -> defaults. A `[profile] name` in the file applies its profile.
+pub fn load() -> Result<Loaded, String> { load_profile(None) }
+
+/// `load` with `flag` (--profile NAME) replacing the file's `[profile] name` (also with no file: the profile over
+/// the built-in defaults).
+pub fn load_profile(flag: Option<&str>) -> Result<Loaded, String> {
     match find()? {
-        Some(p) => Ok(Loaded { cfg: parse_file(&p)?, source: Some(p) }),
-        None => Ok(Loaded { cfg: Config::default(), source: None }),
+        Some(p) => { let (cfg, profile) = parse_file_profile(&p, flag)?; Ok(Loaded { cfg, source: Some(p), profile }) }
+        None => { let (cfg, profile) = parse_str_profile("", flag)?; Ok(Loaded { cfg, source: None, profile }) }
     }
 }
 
@@ -589,5 +776,85 @@ mod tests {
             let e = parse_str(&format!("[snapshots]\n{}\n", bad)).unwrap_err();
             assert!(e.contains(key), "{:?}: {}", bad, e);
         }
+    }
+    #[test]
+    fn profile_coding() {
+        // no profile: unchanged defaults, nothing applied
+        let (c, ap) = parse_str_profile("", None).unwrap();
+        assert_eq!(c, Config::default());
+        assert!(ap.is_none());
+        // the N6 / N7 keys: built-in = the former behaviour; validated; a file value wins over the profile
+        assert_eq!((c.gateway.cut_tool_call.as_str(), c.gateway.ckpt_reply_start), ("tool_use", false));
+        assert!(parse_str("[gateway]\ncut_tool_call = \"cut\"\n").unwrap_err().contains("cut_tool_call"));
+        let (c2, ap2) = parse_str_profile("[gateway]\ncut_tool_call = \"tool_use\"\nckpt_reply_start = false\n", Some("coding")).unwrap();
+        assert_eq!((c2.gateway.cut_tool_call.as_str(), c2.gateway.ckpt_reply_start), ("tool_use", false));
+        assert!(ap2.unwrap().overridden.contains(&"gateway.ckpt_reply_start".to_string()));
+        // the profile over the built-in defaults: every coding value, flag form
+        let (c, ap) = parse_str_profile("", Some("coding")).unwrap();
+        let ap = ap.unwrap();
+        assert_eq!(c.profile.name, "coding");
+        assert_eq!(c.ram, Ram { cap_gb: 18.0, swap_gb: 7.0, margin_gb: 0.0, nice: 10 });
+        let g = &c.gateway;
+        assert_eq!((g.max_ctx, g.kv.as_str(), g.mtp, g.spec_depth, g.mtp_ctx_draft, g.verify_fused), (32768, "q8", true, SpecDepth::Auto, 7, true));
+        assert_eq!((g.rewind_gb, g.gemv.as_str(), g.startup_cap_gb, g.think), (0.62, "mma", 17.5, false));
+        assert_eq!((g.cut_tool_call.as_str(), g.ckpt_reply_start), ("length", true));
+        assert_eq!((c.snapshots.max_disk_gb, c.snapshots.min_free_disk_gb), (8.0, 12.0));
+        // paths are never in a profile
+        assert_eq!((g.model.as_str(), g.draft_vocab.as_str(), g.draft_table.as_str()), ("models/qwen38_27b_mlx4", "", ""));
+        assert_eq!(c.watcher, Watcher::default());
+        assert!(ap.overridden.is_empty());
+        let set: std::collections::HashMap<_, _> = ap.set.iter().cloned().collect();
+        assert_eq!(set["ram.cap_gb"], "18.0");
+        assert_eq!(set["gateway.kv"], "q8");
+        assert_eq!(set["gateway.spec_depth"], "auto");
+        assert_eq!(set["gateway.startup_cap_gb"], "17.5");
+        assert_eq!(set["snapshots.min_free_disk_gb"], "12.0");
+        assert_eq!((set["gateway.cut_tool_call"].as_str(), set["gateway.ckpt_reply_start"].as_str()), ("length", "true"));
+        // N8: built-in off (former behaviour), coding on
+        let s = &c.snapshots;
+        assert_eq!((g.ckpt_system, s.evict_for_save, s.evict_for_save_min_tokens, s.stable_ensure), (true, true, 2048, true));
+        let d = Config::default();
+        assert_eq!((d.gateway.ckpt_system, d.snapshots.evict_for_save, d.snapshots.evict_for_save_min_tokens, d.snapshots.stable_ensure), (false, false, 2048, false));
+        assert_eq!((set["gateway.ckpt_system"].as_str(), set["snapshots.evict_for_save"].as_str(), set["snapshots.stable_ensure"].as_str()), ("true", "true", "true"));
+        assert_eq!(set["snapshots.evict_for_save_min_tokens"], "2048");
+        let (c3, ap3) = parse_str_profile("[gateway]\nckpt_system = false\n[snapshots]\nevict_for_save_min_tokens = 4096\n", Some("coding")).unwrap();
+        assert_eq!((c3.gateway.ckpt_system, c3.snapshots.evict_for_save, c3.snapshots.evict_for_save_min_tokens), (false, true, 4096));
+        assert_eq!(ap3.unwrap().overridden, vec!["gateway.ckpt_system".to_string(), "snapshots.evict_for_save_min_tokens".to_string()]);
+        assert!(parse_str("[snapshots]\nevict_for_save = 1\n").is_err());
+        assert_eq!(set.len(), 22, "{:?}", ap.set);
+        assert!(ap.line().starts_with("profile coding: ") && ap.line().contains("ram.cap_gb=18.0"), "{}", ap.line());
+        // the file's [profile] name; explicit file values win over the profile and are listed as overrides
+        let t = "[profile]\nname = \"coding\"\n[gateway]\nmax_ctx = 16384\nmodel = \"/m\"\n[snapshots]\nmax_disk_gb = 4\n";
+        let (c, ap) = parse_str_profile(t, None).unwrap();
+        let ap = ap.unwrap();
+        assert_eq!((c.gateway.max_ctx, c.gateway.model.as_str(), c.gateway.kv.as_str(), c.snapshots.max_disk_gb, c.snapshots.min_free_disk_gb), (16384, "/m", "q8", 4.0, 12.0));
+        assert_eq!(ap.overridden, vec!["gateway.max_ctx".to_string(), "snapshots.max_disk_gb".to_string()]);
+        assert!(!ap.set.iter().any(|(k, _)| k == "gateway.max_ctx"));
+        // a file value equal to the built-in default still wins over the profile
+        let (c, _) = parse_str_profile("[gateway]\nverify_fused = false\nkv = \"auto\"\n", Some("coding")).unwrap();
+        assert!(!c.gateway.verify_fused);
+        assert_eq!(c.gateway.kv, "auto");
+        // the flag replaces the file's name; "" turns the file's profile off
+        let (c, ap) = parse_str_profile("[profile]\nname = \"coding\"\n", Some("")).unwrap();
+        assert!(ap.is_none() && c.ram.cap_gb == 16.0 && c.profile.name == "coding");
+        // unknown names (file or flag) are refused with the known list; unknown keys still name their line
+        let e = parse_str_profile("[profile]\nname = \"gaming\"\n", None).unwrap_err();
+        assert!(e.contains("unknown profile \"gaming\"") && e.contains("coding"), "{}", e);
+        assert!(parse_str_profile("", Some("Coding")).unwrap_err().contains("unknown profile"));
+        assert!(parse_str("[profile]\nname = \"x\"\n").is_err());
+        assert!(parse_str("[profile]\nnmae = \"coding\"\n").unwrap_err().contains("nmae"));
+        let e = parse_str_profile("[profile]\nname = \"coding\"\n[gateway]\nkvv = 1\n", None).unwrap_err();
+        assert!(e.contains("kvv") && e.contains("line"), "{}", e);
+        // the profile's values are validated like the file's; a file value that breaks validation still fails
+        assert!(parse_str_profile("[snapshots]\nhot_gb = 17\n", Some("coding")).is_ok(), "hot_gb 17 <= coding cap 18");
+        assert!(parse_str_profile("[ram]\ncap_gb = 16\n[snapshots]\nhot_gb = 17\n", Some("coding")).is_err());
+        assert!(parse_str("[gateway]\nstartup_cap_gb = 0\n").unwrap_err().contains("startup_cap_gb"));
+        // every built-in profile parses and holds known keys only
+        for (n, _, _) in PROFILES { assert!(parse_str_profile("", Some(n)).is_ok(), "{}", n); }
+        // the repo file runs without a profile (its [ram] cap stays the fixed 16 GB)
+        let t = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../streamdense.toml")).unwrap();
+        let (c, ap) = parse_str_profile(&t, None).unwrap();
+        assert!(ap.is_none() && c.profile.name.is_empty());
+        assert_eq!(Gateway::default().startup_cap_gb, 17.0);
     }
 }

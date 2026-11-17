@@ -2,7 +2,8 @@
 //! 1. engine: a banned id is never emitted (plain decode and MTP verify), the output is bit-identical to plain greedy
 //!    up to the first place the ban binds, fully identical when it never binds, and the ban is gone once cleared.
 //! 2. gateway over HTTP (27B tokenizer, ids folded): a stop sequence ends the reply there, trimmed, stop_reason
-//!    "stop_sequence" (JSON and SSE); a plan request whose ban never binds returns the plain reply.
+//!    "stop_sequence" (JSON and SSE); a plan request whose ban never binds returns the plain reply; so does a
+//!    `tool_choice: none` request with tools (and it never carries a tool_use).
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,7 +79,7 @@ fn stop_sequences_and_plan_http_tiny() {
         let tk = Arc::new(Tokenizer::from_path(TOK_DIR).unwrap());
         let eng = QwenEngine::open(&t, QwenOptions { max_ctx: 2048, mtp: true, ..Default::default() }).unwrap();
         let vocab = eng.cfg.vocab as u32;
-        let cfg = GatewayConfig { port: 0, worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab) }, ..Default::default() };
+        let cfg = GatewayConfig { port: 0, worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab), ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve::<QwenEngine>(&eng, tk, cfg, None, |p| { tx.send(p).unwrap(); }).unwrap();
     });
     let port = rx.recv_timeout(Duration::from_secs(120)).unwrap();
@@ -90,6 +91,15 @@ fn stop_sequences_and_plan_http_tiny() {
     // plan format: the 27B `<tool_call>` id is outside the tiny vocab, so the ban never binds -> the plain reply
     let p = post(&body(json!({"streamdense": {"format": "plan"}}), false)).json();
     assert_eq!(text_of(&p), full, "plan reply != plain reply");
+    // tool_choice none: tools stay in the prompt, the reply equals the tools reply minus any tool call (the
+    // `<tool_call>` ban never binds here, same as plan)
+    let tools = json!([{"name": "Bash", "description": "Run a shell command.",
+        "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}]);
+    let wt = post(&body(json!({"tools": tools.clone()}), false)).json();
+    let nt = post(&body(json!({"tools": tools, "tool_choice": {"type": "none"}}), false)).json();
+    assert_eq!(text_of(&nt), text_of(&wt), "tool_choice none reply != tools reply");
+    assert!(nt["content"].as_array().unwrap().iter().all(|c| c["type"] != "tool_use"), "{}", nt);
+    assert_ne!(nt["stop_reason"], "tool_use");
 
     let chars: Vec<(usize, char)> = full.char_indices().collect();
     if chars.len() < 12 { eprintln!("SKIP stop part: reply too short"); return; }

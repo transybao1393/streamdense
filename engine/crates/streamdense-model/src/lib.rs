@@ -26,8 +26,10 @@ pub mod qwen_config;
 #[allow(clippy::mut_from_ref)]
 pub mod qwen_engine;
 pub mod qwen_layers;
+pub mod prefill_profile;
 pub mod readmask;
 pub mod resident;
+pub mod rewind;
 pub mod mtp;
 pub mod snapshot;
 pub mod spec;

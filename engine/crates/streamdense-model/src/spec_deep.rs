@@ -460,6 +460,8 @@ pub trait DraftSource {
     /// `begin_sequence` of a feed that starts at KV position `pos` (`seq` = the fed tokens + the first output token);
     /// sources that index the whole KV (ctx_draft.rs `CtxSource`) keep their history up to `pos`.
     fn begin_at(&mut self, pos: usize, seq: &[u32]) { let _ = pos; self.begin_sequence(seq) }
+    /// The last `propose` returned the context lookup's run (ctx_draft.rs `CtxSource`), not a table run. Stats only.
+    fn last_from_lookup(&self) -> bool { false }
 }
 impl DraftSource for DraftTable {
     fn propose(&mut self, t: &[u32], max: usize) -> Vec<(u32, f32)> { DraftTable::propose(self, t, max) }
@@ -746,6 +748,7 @@ impl QwenEngine {
                 Some(s) if cap > 0 => s.propose(&tail, cap).into_iter().map(|(t, c)| (t, c as f64)).collect(),
                 _ => vec![],
             };
+            let prop_lookup = !prop.is_empty() && src.as_ref().is_some_and(|s| s.last_from_lookup());
             // table conditional q per position
             let qt: Vec<f64> = prop.iter().enumerate().map(|(i, &(_, c))| {
                 let prev = if i == 0 { 1.0 } else { prop[i - 1].1.max(1e-6) };
@@ -897,6 +900,12 @@ impl QwenEngine {
                 match x.0 { Src::Mtp => { r.drafts_mtp += 1; r.acc_mtp += acc as usize; }
                             Src::Table => { r.drafts_table += 1; r.acc_table += acc as usize; }
                             Src::Pad => { r.drafts_pad += 1; r.acc_pad += acc as usize; } }
+                if x.0 == Src::Table && prop_lookup { r.drafts_lookup += 1; r.acc_lookup += acc as usize; }
+            }
+            {   // passes by draft source (stats only)
+                let (ns, nm) = rows.iter().fold((0, 0), |(s, m), x| (s + (x.0 == Src::Table) as usize, m + (x.0 == Src::Mtp) as usize));
+                match (ns > 0, nm > 0) { (true, false) => r.passes_src += 1, (true, true) => r.passes_mixed += 1,
+                                         (false, true) => r.passes_mtp += 1, (false, false) => r.passes_nodraft += 1 }
             }
             r.drafts.push(d1);
             r.draft_pos.push(p as u32);

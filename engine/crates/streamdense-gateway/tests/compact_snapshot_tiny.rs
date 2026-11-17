@@ -125,7 +125,7 @@ fn start(tiny: String, tok: String, snaps: Option<PathBuf>, log: String) -> u16 
         let vocab = eng.cfg.vocab as u32;
         let b = CompactBackend::new(&eng, rule, json!({"mode": "12gb"})).unwrap();
         let hook = snaps.map(|d| Box::new(hook_for(&b, &d, &tiny)) as Box<dyn SnapshotHook<CompactBackend>>);
-        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: false, fold: Some(vocab) }, ..Default::default() };
+        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: false, fold: Some(vocab), ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve(&b, tk, cfg, hook, |p| { tx.send(p).unwrap(); }).unwrap();
     });
     rx.recv_timeout(Duration::from_secs(120)).unwrap()

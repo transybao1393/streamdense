@@ -323,6 +323,7 @@ impl QwenEngine {
         if tokens.len() != pos { return Err(format!("snapshot: {} tokens != pos {}", tokens.len(), pos)); }
         let mtp = self.mtp_kv().is_some();
         let mtp_len = if mtp { (c.mtp_len as usize).min(pos) } else { 0 };
+        self.ckpt_note_save(tokens);
         Ok(SnapHeader { format: FORMAT, engine: ENGINE_VERSION.to_string(), fingerprint: fingerprint(&self.cfg, self.opt.kv),
                         kv: self.opt.kv, pos, mtp_len, mtp, body: body_bytes(&self.cfg, self.opt.kv, pos, mtp_len, mtp), tokens: tokens.to_vec(),
                         compact: None })
@@ -362,6 +363,7 @@ impl QwenEngine {
             c.mtp_len = if self.mtp_kv().is_some() { 0 } else { c.mtp_len };
         }
         self.set_pos(h.pos);
+        self.ckpt_after_restore(&h.tokens); // new KV lineage; checkpoints of the snapshot's own lineage stay valid
     }
 
     /// In-RAM snapshot of the current state. `tokens` = every id fed so far (len == pos()). Nothing may be in flight.

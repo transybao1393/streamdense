@@ -27,7 +27,8 @@ pub struct FeedStats {
     pub spec: Option<(usize, usize, usize, f64)>,
     /// 12 GB mode (compact.rs): the streamed prompt read of this feed.
     pub stream: Option<StreamFeed>,
-    /// 12 GB mode context drafts (engine ctx_draft.rs `CtxStats::json`): drafted / accepted / tokens per verify pass.
+    /// Context drafts: 12 GB mode (engine ctx_draft.rs `CtxStats::json`: drafted / accepted / tokens per verify pass),
+    /// or MTP + context drafts in the full mode (`mtp_ctx_draft` > 0; spec.rs `SpecResult::mtp_ctx_json`, "mode": "mtp_ctx").
     pub ctx_draft: Option<serde_json::Value>,
 }
 
@@ -129,6 +130,20 @@ pub trait Backend {
     /// Ban `ids` on the selected slot before the argmax of every following pass (empty = none). true = done on the
     /// engine (lossless: a banned id is never the argmax); false = not supported, the worker stops at the token instead.
     fn set_ban(&self, _ids: &[u32]) -> bool { false }
+    /// Allow ONLY `ids` at every head argmax from the next pass on (toolctl.rs tool-name constraint; cleared with
+    /// `set_ban(&[])`). false = not supported (the name is decoded unconstrained; server.rs drops a disallowed call).
+    fn set_allow(&self, _ids: &[u32]) -> bool { false }
+    /// Rewind checkpoints (engine rewind.rs): slots on this backend (0 = none: the worker never rewinds).
+    fn ckpt_slots(&self) -> usize { 0 }
+    /// Bytes of one checkpoint (request-log only).
+    fn ckpt_bytes(&self) -> u64 { 0 }
+    /// Save the current state (position `pos()`) into checkpoint `i` (nothing in flight).
+    fn ckpt_save(&self, _i: usize) -> Result<(), String> { Err("this backend has no rewind checkpoints".into()) }
+    /// Position of checkpoint `i` while it is valid for the current sequence (it has only grown since).
+    fn ckpt_pos(&self, _i: usize) -> Option<usize> { None }
+    /// Go back to checkpoint `i`: Ok(position); afterwards the state == the state when it was saved. An error leaves
+    /// the engine reset.
+    fn ckpt_restore(&self, _i: usize) -> Result<usize, String> { Err("this backend has no rewind checkpoints".into()) }
 }
 
 /// One sequence of the batched scheduler (`Backend::dec_begin`): its slot, and once done its stop reason + stats.
@@ -234,6 +249,8 @@ impl Backend for QwenEngine {
             let (s, m) = self.feed_stream_mtp(ids, n_new, stop, on_tok)?;
             let mut f = conv(&s);
             f.spec = Some((m.passes, m.accepted, m.rejects, m.acceptance));
+            // combined MTP + context drafts: per-request source stats (counters only)
+            if self.opt.mtp_ctx_draft > 0 { f.ctx_draft = Some(m.mtp_ctx_json()); }
             Ok(f)
         } else {
             Ok(conv(&self.feed_stream(ids, n_new, stop, on_tok)?))
@@ -245,6 +262,13 @@ impl Backend for QwenEngine {
     }
     fn select(&self, i: usize) { self.select_seq(i) }
     fn set_ban(&self, ids: &[u32]) -> bool { QwenEngine::set_ban(self, ids).is_ok() }
+    fn set_allow(&self, ids: &[u32]) -> bool { QwenEngine::set_allow(self, ids).is_ok() }
+    /// one sequence slot only (the batched worker keeps per-slot bookkeeping the checkpoints do not follow)
+    fn ckpt_slots(&self) -> usize { if self.n_seqs() > 1 { 0 } else { QwenEngine::ckpt_slots(self) } }
+    fn ckpt_bytes(&self) -> u64 { self.ckpt_size() as u64 }
+    fn ckpt_save(&self, i: usize) -> Result<(), String> { QwenEngine::ckpt_save(self, i) }
+    fn ckpt_pos(&self, i: usize) -> Option<usize> { QwenEngine::ckpt_pos(self, i) }
+    fn ckpt_restore(&self, i: usize) -> Result<usize, String> { QwenEngine::ckpt_restore(self, i) }
     fn dec_begin(&self, slot: usize, ids: &[u32], n_new: usize, stop: &[u32], on_tok: &mut dyn FnMut(u32) -> bool) -> Result<DecSeq, String> {
         let tap = self.activity_tap();
         let mut logged = |t: u32| { if let Some(a) = &tap { a.log_out(&[t]); } on_tok(t) };
@@ -282,7 +306,8 @@ impl DecSync for QwenEngine {
         let Some(w) = b.done else { return };
         let (st, r) = (&b.st, &b.r);
         d.stats = FeedStats { prefill_s: st.prefill_s, decode_s: st.decode_s, gen: st.gen, last: st.last, stop_reason: w.to_string(),
-                              spec: Some((r.passes, r.accepted, r.rejects, r.acceptance)), stream: None, ctx_draft: None };
+                              spec: Some((r.passes, r.accepted, r.rejects, r.acceptance)), stream: None,
+                              ctx_draft: (self.opt.mtp_ctx_draft > 0).then(|| r.mtp_ctx_json()) };
         d.done = Some(w.to_string());
         self.flush_draft_source();
     }
@@ -291,7 +316,8 @@ impl DecSync for QwenEngine {
 /// One snapshot operation of a request (logged in the request log under "snap").
 #[derive(Clone, Debug, Default)]
 pub struct SnapEvent {
-    /// restore | save_stable | save_roll | save_switch | hot_stable (a warm-up's stable prefix copied to RAM)
+    /// restore | save_stable | save_roll | save_switch | hot_stable (a warm-up's stable prefix copied to RAM) |
+    /// ckpt (a rewind checkpoint taken, engine RAM) | rewind (the live state rewound to a checkpoint; `Worker::try_rewind`)
     pub kind: &'static str,
     /// Tokens covered (engine position of the state).
     pub n: usize,
@@ -315,6 +341,8 @@ pub trait SnapshotHook<B: ?Sized> {
     fn restore(&mut self, _eng: &B, _tokens: &[u32]) -> Option<SnapEvent> { None }
     /// A snapshot of exactly these tokens is cached already.
     fn has(&self, _eng: &B, _tokens: &[u32]) -> bool { false }
+    /// Tokens of `tokens` the longest cached snapshot (any tier) would cover, without loading it (0 = none).
+    fn best_len(&self, _eng: &B, _tokens: &[u32]) -> usize { 0 }
     /// Save the current state; `tokens` = every fed id (len == eng.pos()). `stable`: the shared prefix (kept);
     /// otherwise the rolling last-turn snapshot (replaces the previous one). `tag`: the request's project + lane
     /// (`ChatReq::stable_tag`; a stable prefix supersedes the older one of the same tag).
@@ -345,6 +373,11 @@ impl<B: ?Sized> SnapshotHook<B> for NoSnapshots {}
 pub const ROLL_MIN_FEED: usize = 256;
 /// The stable prefix must be at least this long to be worth a file.
 pub const STABLE_MIN: usize = 64;
+/// Rewind checkpoints are taken only at positions >= this (shorter states are cheap to re-read).
+pub const CKPT_MIN: usize = 64;
+/// The system checkpoint (`Ck::sys`) is protected from the cost retention only with at least this many slots: then the
+/// last instruction (pin), the newest reply start and one floating checkpoint (last turn / prompt end) still fit.
+pub const SYS_PIN_MIN_SLOTS: usize = 4;
 
 /// End of the stable prefix: the tokens through the first `<|im_end|>` (the system turn: system prompt + tools).
 pub fn stable_prefix_len(prompt: &[u32]) -> Option<usize> {
@@ -385,6 +418,18 @@ pub struct WorkerConfig {
     pub mtp: bool,
     /// Tests only: feed ids modulo this (tiny model + the 27B tokenizer).
     pub fold: Option<u32>,
+    /// `[gateway] cut_tool_call = "length"`: a tool call cut by the token limit ends the reply as "max_tokens", the
+    /// partial call is not returned as a complete tool_use (server.rs `finish_reply`). false = the former behaviour.
+    pub cut_tool_call: bool,
+    /// `[gateway] ckpt_reply_start`: a message-matchable rewind checkpoint at the start of the reply (`prepare`).
+    pub ckpt_reply_start: bool,
+    /// `[gateway] ckpt_system`: a pinned, message-matchable rewind checkpoint at the end of the system turn (system
+    /// prompt + tools) of the live lineage (`prepare`, `ck_mark_sys`); a request landing exactly there saves the
+    /// missing stable prefix file.
+    pub ckpt_system: bool,
+}
+impl Default for WorkerConfig {
+    fn default() -> Self { WorkerConfig { think: false, mtp: true, fold: None, cut_tool_call: false, ckpt_reply_start: false, ckpt_system: false } }
 }
 
 pub struct Job {
@@ -418,7 +463,10 @@ pub struct Outcome {
     /// Raw reply text without the stop token (starts inside `<think>` when thinking was on).
     pub raw: String,
     pub n_prompt: usize,
+    /// prompt tokens (of the render, n_prompt) not fed: n_prompt - n_feed
     pub n_reused: usize,
+    /// ids kept in the engine before the feed (may exceed n_reused: the model's own reply tokens re-render differently)
+    pub n_engine_reused: usize,
     pub n_feed: usize,
     pub mode: String,
     pub think: bool,
@@ -449,7 +497,54 @@ pub struct Outcome {
     pub warm: bool,
     /// A queued warm-up dropped before it started (`prune_warm`): cancelled | stale | superseded (mode "dropped").
     pub drop_reason: Option<&'static str>,
+    /// Request-log diagnostics (server.rs; never affect the reply): where the prompt diverges from the live state and
+    /// the best checkpoint / snapshot (`div`), why this reuse path was chosen (`reuse_why`), the checkpoints held after
+    /// the job (`ckpts`), the tool-call control of the reply (`tool_ctl`), decode seconds.
+    pub div: Option<serde_json::Value>,
+    pub reuse_why: String,
+    pub ckpts: Option<serde_json::Value>,
+    pub tool_ctl: Option<serde_json::Value>,
+    pub decode_s: f64,
 }
+
+/// Length of the common prefix of two token lists.
+pub fn lcp(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
+
+/// Index in `msgs` of the message whose rendered turn holds token `pos` of the prompt `full` (request-log only):
+/// counts `<|im_start|>` (`ims`) in `full[..=pos]`; consecutive tool results share one turn (the template groups
+/// them); tools without a system message add a system turn first ("system"); past the last message = the generation
+/// prompt ("gen"). Null when `pos` is before the first turn.
+pub fn msg_at(full: &[u32], pos: usize, msgs: &[ChatMsg], has_tools: bool, ims: u32) -> serde_json::Value {
+    let end = (pos + 1).min(full.len());
+    let turns = full[..end].iter().filter(|&&t| t == ims).count();
+    if turns == 0 { return serde_json::Value::Null; }
+    let mut t = turns - 1;
+    let sys_msg = msgs.first().is_some_and(|m| m.role == "system" || m.role == "developer");
+    if has_tools && !sys_msg {
+        if t == 0 { return serde_json::json!("system"); }
+        t -= 1;
+    }
+    let mut turn = 0usize;
+    for i in 0..msgs.len() {
+        if i > 0 && !(msgs[i].role == "tool" && msgs[i - 1].role == "tool") { turn += 1; }
+        if turn == t { return serde_json::json!(i); }
+        if turn > t { return serde_json::json!(i - 1); }
+    }
+    serde_json::json!("gen")
+}
+
+/// Request-log summary of a reply's tool-call control (`toolctl.rs`): None when nothing constrained it.
+fn tool_ctl_json(req: &ChatReq, tc: &crate::toolctl::ToolCtl) -> Option<serde_json::Value> {
+    if req.allowed_tools.is_none() && req.tool_force.is_none() && !req.tool_choice_none { return None; }
+    let forced = req.tool_force.as_ref().map(|f| match f { crate::anthropic::ToolForce::Any => "any".to_string(), crate::anthropic::ToolForce::Tool(n) => format!("tool:{}", n) });
+    Some(serde_json::json!({"allowed_tools": req.allowed_tools.as_ref().map(|a| a.len()), "names": tc.names.as_ref().map(|n| n.len()),
+        "forced": forced, "none": req.tool_choice_none, "name_passes": tc.steps, "solo": tc.solo}))
+}
+
+/// What `try_rewind` saw (request log): the best checkpoint (position, prompt tokens covered, token prefix (else the
+/// same messages)) and the longest snapshot.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RwDiag { pub ck: Option<(usize, usize, bool)>, pub snap: Option<usize> }
 
 /// The running warm-up (conversation key + cancel flag + keep), shared by the worker and the HTTP threads. The worker
 /// sets it under the lock while it drains the queue and picks the next job; an HTTP thread calls `real_arrived` after
@@ -497,11 +592,40 @@ pub struct Worker<'a, B: Backend + ?Sized> {
     pub gate: Arc<WarmGate>,
     /// Queued warm-ups older than this are dropped (default `WARM_MAX_AGE`).
     pub warm_max_age: Duration,
+    /// Rewind checkpoints (`Backend::ckpt_*`): the ids [0..p) of the state in each engine checkpoint slot.
+    pub ck: Vec<Option<Ck>>,
+    /// age counter of `ck` entries
+    pub ck_t: u64,
 }
+
+/// One rewind checkpoint as the worker knows it (the engine holds the state; `Backend::ckpt_pos` says if it is valid).
+#[derive(Clone, Debug)]
+pub struct Ck {
+    /// the ids in the engine when it was taken (len == its position)
+    pub ids: Vec<u32>,
+    /// it starts a message: the request's messages before it (`Worker::ck_best`)
+    pub desc: Option<CkDesc>,
+    /// the start of the last instruction (user message) of its lineage: kept by the retention
+    pub pin: bool,
+    /// the newest reply-start checkpoint (`WorkerConfig::ckpt_reply_start`): the retention evicts it last of the
+    /// unpinned ones (a request that edits the reply after it rewinds there)
+    pub reply: bool,
+    /// the end of the system turn (system prompt + tools) of its lineage (`WorkerConfig::ckpt_system`): with >= 4
+    /// slots the retention never evicts it while its lineage is live (a dormant one goes first, as any unpinned one)
+    pub sys: bool,
+    /// last taken / confirmed (age)
+    pub t: u64,
+}
+
+/// The messages (+ tools, thinking flag) a message-start checkpoint stands for, and their render's ids (`toks`: the
+/// render of `msgs` without a generation prompt, a token prefix of the prompt it was taken on), so a later request
+/// with the same messages, tools and thinking flag before it is matched without rendering them again.
+#[derive(Clone, Debug)]
+pub struct CkDesc { pub msgs: Vec<ChatMsg>, pub tools: Vec<ToolDef>, pub think: bool, pub toks: Vec<u32> }
 
 impl<'a, B: Backend + ?Sized> Worker<'a, B> {
     pub fn new(eng: &'a B, tk: Arc<Tokenizer>, cfg: WorkerConfig) -> Self {
-        Worker { eng, tk, cfg, kv: KvState::default(), parked: vec![], hook: Box::new(NoSnapshots), on_job: None, gate: Arc::new(WarmGate::default()), warm_max_age: WARM_MAX_AGE }
+        Worker { eng, tk, cfg, kv: KvState::default(), parked: vec![], hook: Box::new(NoSnapshots), on_job: None, gate: Arc::new(WarmGate::default()), warm_max_age: WARM_MAX_AGE, ck: vec![], ck_t: 0 }
     }
 
     /// Serve jobs until every sender is gone. Between jobs the snapshot hook gets idle steps (`idle_wait` / `idle`).
@@ -586,6 +710,7 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
                 match self.prepare(&job) {
                     Err(o) => self.done(&job, o, tiers),
                     Ok(mut p) => {
+                        self.force_tools(&job, &mut p, false);
                         let fed = std::mem::take(&mut p.fed);
                         let (eng, tk) = (self.eng, self.tk.clone());
                         p.arm_ban(eng);
@@ -680,6 +805,7 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
     /// Send a job's Done (+ the per-job hook for real requests), then the snapshot hook's job_end (current slot).
     fn done(&mut self, job: &Job, mut out: Outcome, tiers: Option<serde_json::Value>) {
         out.tiers = tiers;
+        out.ckpts = self.ck_list();
         out.msg_id = job.id.clone();
         match self.on_job.as_mut() {
             Some(h) if !job.warm => { let o = out.clone(); let _ = job.events.send(Ev::Done(out)); h(self.eng, &job.req, &o); }
@@ -702,6 +828,7 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
         let tiers = self.hook.job_begin(job.t_recv);
         let mut out = self.generate(&job);
         out.tiers = tiers;
+        out.ckpts = self.ck_list();
         out.msg_id = job.id.clone();
         match self.on_job.as_mut() {
             // a warm-up has no reply: the per-job hook (watcher, answer library) does not see it
@@ -741,6 +868,9 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
         // followup assumes our reply is the next message and adds a generation prompt: never for a warm-up
         let downgrade = |p: Plan| if warm && p.mode == Mode::Followup { Plan { mode: Mode::Full, tokens: p.full.clone(), full: p.full } } else { p };
         let mut plan = downgrade(self.kv.plan(msgs, tools, think, full, &rend, &enc));
+        // request log: where the prompt leaves the live state (before anything below changes it)
+        let live = self.kv.is_valid().then(|| (lcp(&self.kv.seq, &plan.full), self.kv.seq.len()));
+        let mut parked_n = 0usize;
         let mut parked_hit = false;
         if plan.mode == Mode::Full && self.hook.enabled() {
             // multi-user: another conversation's live state is about to go -> file (switch save) + park its bookkeeping
@@ -748,8 +878,10 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
                 if let Some(ev) = self.hook.switch(self.eng, live, &plan.full) { o.snaps.push(ev); }
                 if self.hook.has(self.eng, live) { park(&mut self.parked, self.kv.clone()); }
             }
-            // a parked conversation this request continues: restore its file, then plan against its state
-            let hit = self.parked.iter().rposition(|p| p.seq.len() >= 2 && self.hook.has(self.eng, &p.seq[..p.seq.len() - 1])
+            // a parked conversation this request continues: restore its file, then plan against its state (unless a
+            // rewind checkpoint of the live state covers more of the prompt: `try_rewind` below)
+            let ck = self.ck_best(&plan.full, msgs, tools, think).map_or(0, |c| c.2);
+            let hit = self.parked.iter().rposition(|p| p.seq.len() >= 2 && p.seq.len() - 1 > ck && self.hook.has(self.eng, &p.seq[..p.seq.len() - 1])
                 && { let m = p.plan(msgs, tools, think, plan.full.clone(), &rend, &enc).mode; if warm { m == Mode::Prefix } else { m != Mode::Full } });
             if let Some(i) = hit {
                 let p = self.parked.remove(i);
@@ -763,6 +895,7 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
                         self.kv = p;
                         plan = downgrade(self.kv.plan(msgs, tools, think, plan.full, &rend, &enc));
                         parked_hit = plan.mode != Mode::Full;
+                        parked_n = n;
                     }
                 }
                 if !parked_hit { self.eng.reset(); self.kv.invalidate(); }
@@ -771,19 +904,37 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
         o.tokenize_s = t0.elapsed().as_secs_f64();
         let (mut mode, mut toks) = (plan.mode, plan.tokens);
         let mut feed: Vec<u32> = vec![];
+        let mut ctx_down = false;
         if mode != Mode::Full {
             feed.push(*self.kv.seq.last().unwrap()); // the pending token goes in first
             feed.extend_from_slice(&toks);
-            if self.eng.pos() + feed.len() + 1 > max_ctx { mode = Mode::Full; toks = plan.full.clone(); }
+            if self.eng.pos() + feed.len() + 1 > max_ctx { mode = Mode::Full; toks = plan.full.clone(); ctx_down = true; }
         }
         let n_prompt = plan.full.len();
         let mut reused = 0;
         // ids already in the engine (len == pos) before `feed`
         let mut base: Vec<u32> = vec![];
         let mut label = mode.as_str();
+        // request log: the checkpoints held before this job (position, pinned, valid for the live state)
+        let ck_before: Vec<String> = (0..self.ck.len()).filter_map(|i| self.ck[i].as_ref().map(|c| format!("{}{}{}{}{}", c.ids.len(), if c.sys { "#" } else { "" }, if c.pin { "*" } else { "" }, if c.reply { "^" } else { "" }, if self.ck_valid(i) { "" } else { "~" }))).collect();
+        let mut rwd = RwDiag::default();
+        let mut why = String::new();
         if mode == Mode::Full {
             feed = toks.clone();
-            if self.hook.enabled() && n_prompt >= 2 && n_prompt + 1 <= max_ctx {
+            // the live state shares a prefix with the prompt (an earlier message rewritten): rewind to the last
+            // checkpoint before the change when that re-reads less than any snapshot restore
+            let (rw, rev, d) = self.try_rewind(&plan.full, msgs, tools, think, max_ctx);
+            rwd = d;
+            if let Some(e) = rev.as_ref().and_then(|ev| ev.error.clone()) { why = format!("rewind failed ({}); ", e); }
+            if let Some(ev) = rev { o.snaps.push(ev); }
+            if let Some((ids, u)) = rw {
+                // ids == plan.full[..u] (a token prefix), or the ids of the same messages as the engine read them
+                reused = ids.len();
+                base = ids;
+                feed = plan.full[u..].to_vec();
+                label = "rewind";
+                if let Some((p, u, tp)) = rwd.ck { why = format!("rewind ckpt@{} ({}{})", p, if tp { "token-prefix" } else { "msg-equal" }, if u != p { format!(", covers {}", u) } else { String::new() }); }
+            } else if self.hook.enabled() && n_prompt >= 2 && n_prompt + 1 <= max_ctx {
                 self.eng.reset();
                 self.kv.invalidate(); // the engine state changes from here on
                 if let Some(ev) = self.hook.restore(self.eng, &plan.full[..n_prompt - 1]) {
@@ -792,24 +943,52 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
                         feed = plan.full[ev.n..].to_vec();
                         reused = ev.n;
                         label = "restore";
+                        why = format!("{}restore snap {} ({}, {})", why, ev.n, if ev.src.is_empty() { "own" } else { ev.src }, if ev.tier.is_empty() { "-" } else { ev.tier });
                     } else {
                         self.eng.reset();
+                        why = format!("{}snapshot restore failed ({}); ", why, ev.error.clone().unwrap_or_else(|| format!("covered {} of {}", ev.n, n_prompt)));
                     }
                     o.snaps.push(ev);
                 }
+            }
+            if label == "full" {
+                let d = live.map(|x| x.0);
+                let cks = format!("ckpts [{}]", ck_before.join(","));
+                let snap = if self.hook.enabled() { format!("snap best {}", rwd.snap.unwrap_or(0)) } else { "snapshots off".into() };
+                let r = if ctx_down { "ctx limit".to_string() }
+                    else if warm && plan.mode == Mode::Full && live.is_some_and(|(d, n)| d + 1 >= n) { "warm-up of the live state".to_string() }
+                    else if live.is_none() && ck_before.is_empty() { format!("no live state, no ckpt; {}", snap) }
+                    else if d.is_some_and(|d| d < STABLE_MIN) { format!("lineage reset (div {}); {}; {}", d.unwrap_or(0), cks, snap) }
+                    else { format!("no ckpt <= div {} ({}); {}", d.map_or("-".to_string(), |d| d.to_string()), cks, snap) };
+                why = format!("{}full: {}", why, r);
             }
         } else {
             reused = self.eng.pos();
             base = self.kv.seq[..self.kv.seq.len() - 1].to_vec(); // feed[0] is the pending last token
             if parked_hit { label = "restore"; }
+            why = format!("{}{}", if parked_hit { format!("restore parked snap {} (own) + ", parked_n) } else { String::new() },
+                          if mode == Mode::Prefix { "append" } else { "followup (own reply tokens kept)" });
+            // the live state before this request's feed: a rewind point for a later request that rewrites what follows
+            if reused + feed.len() < max_ctx { if let Some(ev) = self.ck_take(&base, false, false, None) { o.snaps.push(ev); } }
         }
-        o.n_prompt = n_prompt; o.n_reused = reused; o.n_feed = feed.len(); o.mode = label.into();
+        o.reuse_why = why;
+        {
+            let ims = tk.token_id("<|im_start|>");
+            let at = |p: usize| ims.map_or(serde_json::Value::Null, |ims| msg_at(&plan.full, p, msgs, !tools.is_empty(), ims));
+            let dpos = live.map(|x| x.0).unwrap_or(reused);
+            o.div = Some(serde_json::json!({"live": live.map(|x| x.0), "live_len": live.map(|x| x.1), "ckpt": rwd.ck.map(|c| c.1), "snap": rwd.snap,
+                "msg": at(dpos), "reused_msg": at(reused)}));
+        }
+        // n_reused: prompt (render) tokens not fed (<= n_prompt); n_engine_reused: ids kept in the engine (followup /
+        // message-matched rewind keep the model's own reply tokens, whose count may differ from the render's)
+        let reused_render = n_prompt.saturating_sub(feed.len());
+        o.n_prompt = n_prompt; o.n_reused = reused_render; o.n_engine_reused = reused; o.n_feed = feed.len(); o.mode = label.into();
         if n_prompt + 1 > max_ctx || reused + feed.len() + 1 > max_ctx {
             self.kv.invalidate();
             o.stop_reason = "ctx_full".into();
             return Err(o);
         }
-        let _ = job.events.send(Ev::Start { n_prompt, n_reused: reused, n_feed: feed.len(), mode: label, think });
+        let _ = job.events.send(Ev::Start { n_prompt, n_reused: reused_render, n_feed: feed.len(), mode: label, think });
         if mode == Mode::Full && reused == 0 { self.eng.reset(); }
         let pos0 = base.len();
         // every id in the engine after this prefill (prefix / full / restore: == plan.full; followup: differs)
@@ -827,7 +1006,9 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
             let align = |c: usize| if c > pos0 { pos0 + (c - pos0) / al * al } else { c };
             if mode == Mode::Full {
                 if let Some(s) = stable_prefix_len(&plan.full).map(align) {
-                    if s > pos0 && !self.hook.has(self.eng, &plan.full[..s]) { cuts.push((s, true, true)); }
+                    // with ckpt_system also when the engine landed exactly on it (rewind to the system checkpoint / a hot
+                    // copy restore) and the file is missing: saved there without feeding
+                    if (s > pos0 || (s == pos0 && self.cfg.ckpt_system)) && !self.hook.has(self.eng, &plan.full[..s]) { cuts.push((s, true, true)); }
                     // the static part of a planner turn (before the project facts): shared by every project
                     let words = tk.encode(PROJECT_FACTS_WORDS);
                     let ws = |t: u32| { let d = tk.decode(&[t]); if !d.is_empty() && d.chars().all(char::is_whitespace) { Some(d.matches('\n').count()) } else { None } };
@@ -842,6 +1023,63 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
         // a warm-up feeds the whole prompt but its last token (left pending, as after a reply), saving nothing more
         let end = all.len() - 1;
         if warm && end > pos0 && cuts.last().map_or(true, |c| c.0 < end) { cuts.push((end, false, false)); }
+        // Message-boundary rewind points (render-aware: the history before the message, rendered without a generation
+        // prompt, must be a token prefix of the prompt): the start of the last user message (the last instruction; tool
+        // results are role "tool"), pinned: a client that rewrites it next time (e.g. strips a trailing state block, as
+        // some clients do) rewinds here; and the start of the last turn (e.g. the last tool result; a group of consecutive
+        // tool messages is one turn): a client that edits it rewinds here. Each stores the messages before it
+        // (`CkDesc`), so a later request matches it by message equality even when the engine's ids differ from the
+        // render (followup keeps the model's own reply tokens). Any mode: the cut goes to the same message start in
+        // `all`: the same `<|im_start|>` count, and `all` from there == the prompt from there.
+        // With `ckpt_reply_start` (not for a warm-up): also the start of the reply (after every prompt message, before
+        // the generation prompt), storing all the prompt's messages: a later request that edits this reply (the
+        // engine then holds the model's own reply tokens after it) rewinds here; the retention keeps the newest one.
+        let mut msg_cuts: Vec<(usize, bool, bool, CkDesc)> = vec![];
+        if self.eng.ckpt_slots() > 0 {
+            let instr = msgs.iter().rposition(|m| m.role == "user");
+            let turn = (1..msgs.len()).rev().find(|&j| !(msgs[j].role == "tool" && msgs[j - 1].role == "tool"));
+            // (message index, pinned, reply start)
+            let mut targets: Vec<(usize, bool, bool)> = vec![];
+            if let Some(i) = instr.filter(|&i| i > 0) { targets.push((i, true, false)); }
+            if let Some(j) = turn.filter(|&j| j > 0 && Some(j) != instr) { targets.push((j, false, false)); }
+            if self.cfg.ckpt_reply_start && !warm && !msgs.is_empty() { targets.push((msgs.len(), false, true)); }
+            let ims = tk.token_id("<|im_start|>");
+            for (i, pin, reply) in targets {
+                let toks = rend(&msgs[..i], false).ok().map(|t| tk.encode(&t)).filter(|t| t.len() <= plan.full.len() && plan.full[..t.len()] == t[..]);
+                let uf = toks.as_ref().map(|t| t.len());
+                let u = uf.and_then(|uf| if all == plan.full { Some(uf) } else {
+                    let ims = ims?;
+                    let c = plan.full[..uf].iter().filter(|&&x| x == ims).count();
+                    all.iter().enumerate().filter(|(_, &x)| x == ims).nth(c).map(|(j, _)| j)
+                        .filter(|&j| all.len() - j == plan.full.len() - uf && all[j..] == plan.full[uf..])
+                });
+                if let Some(u) = u.filter(|&u| u >= CKPT_MIN && u >= pos0 && u + 1 < all.len()) {
+                    if !cuts.iter().any(|c| c.0 == u) {
+                        let at = cuts.iter().position(|c| c.0 > u).unwrap_or(cuts.len());
+                        cuts.insert(at, (u, false, false));
+                    }
+                    if !msg_cuts.iter().any(|c| c.0 == u) {
+                        msg_cuts.push((u, pin, reply, CkDesc { msgs: msgs[..i].to_vec(), tools: tools.to_vec(), think, toks: toks.unwrap_or_default() }));
+                    }
+                }
+            }
+        }
+        // With `ckpt_system`: the end of the system turn (system prompt + tools, through the first `<|im_end|>` = the
+        // stable prefix), when this request feeds or lands on it; stores the leading system messages + tools + thinking
+        // flag (`CkDesc`), pinned as the lineage's system checkpoint (`ck_mark_sys`): a compacted history / rewritten
+        // first message rewinds there.
+        let mut sys_cut: Option<(usize, CkDesc)> = None;
+        if self.cfg.ckpt_system && self.eng.ckpt_slots() > 0 && !msgs.is_empty() {
+            let head = tk.encode("<|im_start|>system");
+            let nsys = msgs.iter().take_while(|m| m.role == "system" || m.role == "developer").count();
+            if let Some(s) = stable_prefix_len(&plan.full).filter(|&s| s >= CKPT_MIN && s >= pos0 && s + 1 < all.len() && plan.full.starts_with(&head) && all[..s] == plan.full[..s]) {
+                if !cuts.iter().any(|c| c.0 == s) {
+                    let at = cuts.iter().position(|c| c.0 > s).unwrap_or(cuts.len());
+                    cuts.insert(at, (s, false, false));
+                }
+                sys_cut = Some((s, CkDesc { msgs: msgs[..nsys].to_vec(), tools: tools.to_vec(), think, toks: plan.full[..s].to_vec() }));
+            }
+        }
         let fold = self.cfg.fold;
         let fid = |v: &[u32]| -> Vec<u32> { let mut x = v.to_vec(); if let Some(m) = fold { for t in x.iter_mut() { *t %= m; } } x };
         let use_mtp = self.cfg.mtp && self.eng.mtp_available();
@@ -870,6 +1108,12 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
                 }
                 at = to;
             }
+            // every cut is a rewind point too (stable prefix, last user message start (kept by retention), end of the prompt)
+            if self.eng.pos() == cut {
+                let mc = msg_cuts.iter().find(|c| c.0 == cut);
+                if let Some(ev) = self.ck_take(&all[..cut], mc.is_some_and(|c| c.1), mc.is_some_and(|c| c.2), mc.map(|c| c.3.clone())) { o.snaps.push(ev); }
+                if let Some((_, d)) = sys_cut.as_ref().filter(|c| c.0 == cut) { self.ck_mark_sys(cut, d.clone()); }
+            }
             if save {
                 let tag = if static_cut == Some(cut) { Some(crate::snap_tier::StableTag::plan_static()) } else { job.req.stable_tag() };
                 if let Some(ev) = self.hook.save(self.eng, &all[..cut], stable, tag) {
@@ -892,21 +1136,216 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
         let room = max_ctx - (reused + feed.len());
         let nnew = req.max_tokens.min(room).max(1);
         let fed = fid(&all[at..]);
-        let mut ban = if req.plan { plan_ban_ids(&tk) } else { vec![] };
+        let mut ban = if req.plan || req.tool_choice_none { plan_ban_ids(&tk) } else { vec![] };
         for &t in &req.ban_ids { if !ban.contains(&t) { ban.push(t); } }
         Ok(Prepared { o, all, fed, nnew, use_mtp, seg_prefill, think, ttft: None, gen: Vec::with_capacity(nnew.min(8192)),
                       dec: StreamDecoder::new(), ban, ban_armed: false, stops: req.stop.clone(), text: String::new(), sent: 0,
-                      stop_hit: None, format_stop: false })
+                      stop_hit: None, format_stop: false, tc: Default::default() })
+    }
+
+    /// Request log: the checkpoints held now ({p: position, pin, reply (newest reply start), live: valid for the engine's
+    /// state}); None without slots.
+    fn ck_list(&self) -> Option<serde_json::Value> {
+        if self.eng.ckpt_slots() == 0 { return None; }
+        Some(serde_json::Value::Array((0..self.ck.len()).filter_map(|i| self.ck[i].as_ref().map(|c| serde_json::json!({"p": c.ids.len(), "pin": c.pin, "reply": c.reply, "sys": c.sys, "live": self.ck_valid(i)}))).collect()))
+    }
+
+    /// Checkpoint `i` is valid for the engine's current state (its lineage, at or before the position).
+    fn ck_valid(&self, i: usize) -> bool {
+        self.ck.get(i).and_then(|c| c.as_ref()).is_some_and(|c| self.eng.ckpt_pos(i) == Some(c.ids.len()))
+    }
+
+    /// Take a rewind checkpoint of the current state; `ids` = every id in the engine (len == pos). `pin`: the start of
+    /// the request's last user message (`desc` = the messages before it): kept until the next pinned one of the same
+    /// lineage; one pinned checkpoint of another lineage (a chat switched away from) is kept too, so a switch back
+    /// (a snapshot restore of that chat's own state revalidates it, engine rewind.rs) can still rewind there.
+    /// `reply`: the start of the request's reply (`ckpt_reply_start`): it becomes the newest reply start, which the
+    /// cost choice below never evicts (the one before it loses that).
+    /// Slot choice: a free slot, else a dormant one (another lineage, not pinned; oldest first), else among the valid
+    /// unpinned ones (not the newest reply start) the one whose removal leaves the smallest relative gap
+    /// (next - prev) / next (roughly geometric spacing), else the oldest dormant pinned one. None when the backend has
+    /// none, the state is short, or this position is held already.
+    pub(crate) fn ck_take(&mut self, ids: &[u32], pin: bool, reply: bool, desc: Option<CkDesc>) -> Option<SnapEvent> {
+        let k = self.eng.ckpt_slots();
+        if k == 0 || ids.len() < CKPT_MIN || ids.len() != self.eng.pos() { return None; }
+        self.ck.resize(k, None);
+        self.ck_t += 1;
+        let t = self.ck_t;
+        let q = ids.len();
+        let valid: Vec<bool> = (0..k).map(|i| self.ck_valid(i)).collect();
+        let held = (0..k).find(|&i| valid[i] && self.ck[i].as_ref().is_some_and(|c| c.ids.len() == q));
+        let i = match held {
+            Some(i) => i,
+            None => {
+                let free = (0..k).find(|&i| self.ck[i].is_none());
+                let dormant = (0..k).filter(|&i| !valid[i] && self.ck[i].as_ref().is_some_and(|c| !c.pin)).min_by_key(|&i| self.ck[i].as_ref().map_or((false, 0), |c| (c.sys, c.t)));
+                let by_cost = || {
+                    let mut by: Vec<(usize, usize, bool)> = (0..k).filter(|&i| valid[i]).map(|i| { let c = self.ck[i].as_ref().unwrap(); (c.ids.len(), i, c.pin || c.reply || (c.sys && k >= SYS_PIN_MIN_SLOTS)) }).collect();
+                    by.sort();
+                    let cost = |j: usize| {
+                        let prev = if j == 0 { 0 } else { by[j - 1].0 };
+                        let next = if j + 1 < by.len() { by[j + 1].0 } else { q };
+                        (next - prev) as f64 / next.max(1) as f64
+                    };
+                    (0..by.len()).filter(|&j| !by[j].2).min_by(|&a, &b| cost(a).total_cmp(&cost(b))).map(|j| by[j].1)
+                };
+                let oldest = (0..k).min_by_key(|&i| (valid[i], self.ck[i].as_ref().map_or(0, |c| c.t)));
+                free.or(dormant).or_else(by_cost).or(oldest).unwrap_or(0)
+            }
+        };
+        let ev = if held.is_some() { None } else {
+            let t0 = Instant::now();
+            let r = self.eng.ckpt_save(i);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let bytes = self.eng.ckpt_bytes();
+            match r {
+                Ok(()) => { self.ck[i] = Some(Ck { ids: ids.to_vec(), desc: None, pin: false, reply: false, sys: false, t }); Some(SnapEvent { kind: "ckpt", n: q, ms, bytes, tier: "ram", ..Default::default() }) }
+                Err(e) => { self.ck[i] = None; return Some(SnapEvent { kind: "ckpt", n: q, ms, bytes, tier: "ram", error: Some(e), ..Default::default() }) }
+            }
+        };
+        // one newest reply start
+        if reply { for j in 0..k { if j != i { if let Some(o) = self.ck[j].as_mut() { o.reply = false; } } } }
+        if let Some(c) = self.ck[i].as_mut() {
+            if desc.is_some() { c.desc = desc; }
+            c.t = t;
+            if reply { c.reply = true; }
+            if pin {
+                c.pin = true;
+                // one pin per lineage: the older pin of this lineage goes; of the other lineages only the newest stays
+                for j in 0..k { if j != i && valid[j] { if let Some(o) = self.ck[j].as_mut() { o.pin = false; } } }
+                let mut other: Vec<(u64, usize)> = (0..k).filter(|&j| j != i && !valid[j]).filter_map(|j| self.ck[j].as_ref().filter(|c| c.pin).map(|c| (c.t, j))).collect();
+                other.sort();
+                other.pop();
+                for (_, j) in other { if let Some(o) = self.ck[j].as_mut() { o.pin = false; } }
+            }
+        }
+        ev
+    }
+
+    /// The checkpoint at `q` (just taken / held, valid) becomes the lineage's system checkpoint (`Ck::sys`, `desc` =
+    /// the leading system messages + tools + thinking flag). As with pins: one per lineage (an older valid one loses
+    /// the flag), and of the other lineages only the newest keeps it; a dormant sys checkpoint is reused last of the
+    /// dormant unpinned ones (`ck_take`), so a short side request does not take the main chat's boundary first.
+    pub(crate) fn ck_mark_sys(&mut self, q: usize, desc: CkDesc) {
+        let k = self.ck.len();
+        let valid: Vec<bool> = (0..k).map(|i| self.ck_valid(i)).collect();
+        let Some(i) = (0..k).find(|&i| valid[i] && self.ck[i].as_ref().is_some_and(|c| c.ids.len() == q)) else { return };
+        for j in 0..k { if j != i && valid[j] { if let Some(c) = self.ck[j].as_mut() { c.sys = false; } } }
+        let mut other: Vec<(u64, usize)> = (0..k).filter(|&j| j != i && !valid[j]).filter_map(|j| self.ck[j].as_ref().filter(|c| c.sys).map(|c| (c.t, j))).collect();
+        other.sort();
+        other.pop();
+        for (_, j) in other { if let Some(c) = self.ck[j].as_mut() { c.sys = false; } }
+        if let Some(c) = self.ck[i].as_mut() { c.sys = true; c.desc = Some(desc); }
+    }
+
+    /// The valid checkpoint that covers the most of `full` (the prompt; minus its last token): (slot, its position,
+    /// tokens of `full` it stands for). Either its ids are a prefix of `full` (covers its length), or it starts a
+    /// message (`CkDesc`) and the request's messages, tools and thinking flag before that message are the same: then
+    /// it covers the render of those messages (`CkDesc::toks`, a token prefix of `full`), while the engine holds the
+    /// ids it was taken on (the model's own reply tokens, as `followup` keeps them). The message at that index may be
+    /// anything, e.g. an edited assistant reply after a reply-start checkpoint.
+    fn ck_best(&mut self, full: &[u32], msgs: &[ChatMsg], tools: &[ToolDef], think: bool) -> Option<(usize, usize, usize)> {
+        let k = self.eng.ckpt_slots();
+        if k == 0 || full.len() < 2 { return None; }
+        self.ck.resize(k, None);
+        let lim = full.len() - 1;
+        let mut best: Option<(usize, usize, usize)> = None;
+        for i in 0..k {
+            if !self.ck_valid(i) { continue; }
+            let c = self.ck[i].as_ref().unwrap();
+            let p = c.ids.len();
+            let cov = if p <= lim && c.ids[..] == full[..p] { Some(p) } else {
+                c.desc.as_ref().filter(|d| d.msgs.len() <= msgs.len() && msgs[..d.msgs.len()] == d.msgs[..] && d.tools == tools && d.think == think)
+                    .filter(|d| !d.toks.is_empty() && d.toks.len() <= lim && full[..d.toks.len()] == d.toks[..]).map(|d| d.toks.len())
+            };
+            if let Some(u) = cov { if best.is_none_or(|b| u > b.2) { best = Some((i, p, u)); } }
+        }
+        best
+    }
+
+    /// Rewind for a full plan: the valid checkpoint covering the most of the prompt (`ck_best`), used when it covers at
+    /// least as much as the best snapshot (`SnapshotHook::best_len`; ties: the checkpoint, no reset and no file read).
+    /// Returns (Some((ids in the engine now, tokens of `full` covered)) when the engine is there, the "rewind" event).
+    /// A failed restore leaves the engine reset and returns (None, event with the error): the caller goes on as full.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn try_rewind(&mut self, full: &[u32], msgs: &[ChatMsg], tools: &[ToolDef], think: bool, max_ctx: usize)
+                             -> (Option<(Vec<u32>, usize)>, Option<SnapEvent>, RwDiag) {
+        let mut d = RwDiag::default();
+        if full.len() + 1 > max_ctx || full.len() < 2 { return (None, None, d); }
+        let lim = full.len() - 1;
+        if self.hook.enabled() { d.snap = Some(self.hook.best_len(self.eng, &full[..lim])); }
+        let Some((i, p, u)) = self.ck_best(full, msgs, tools, think) else { return (None, None, d) };
+        d.ck = Some((p, u, self.ck[i].as_ref().is_some_and(|c| p <= lim && c.ids[..] == full[..p])));
+        if d.snap.is_some_and(|s| s > u) { return (None, None, d); }
+        let ids = self.ck[i].as_ref().map(|c| c.ids.clone()).unwrap_or_default();
+        let t0 = Instant::now();
+        let r = self.eng.ckpt_restore(i);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        let ev = |error: Option<String>| SnapEvent { kind: "rewind", n: p, ms, bytes: self.eng.ckpt_bytes(), tier: "ram", error, ..Default::default() };
+        self.kv.invalidate(); // the engine state changed: finish() commits the bookkeeping of this prompt
+        match r {
+            Ok(q) if q == p && self.eng.pos() == p && ids.len() == p => (Some((ids, u)), Some(ev(None)), d),
+            Ok(q) => { self.eng.reset(); self.ck.clear(); (None, Some(ev(Some(format!("rewound to {} (engine at {}), wanted {}", q, self.eng.pos(), p)))), d) }
+            Err(e) => { self.eng.reset(); self.ck.clear(); (None, Some(ev(Some(e))), d) }
+        }
     }
 
     /// One job start to end (the one-at-a-time worker): prepare, feed + decode, finish.
     fn generate(&mut self, job: &Job) -> Outcome {
         let mut p = match self.prepare(job) { Ok(p) => p, Err(o) => return o };
-        let fed = std::mem::take(&mut p.fed);
-        let (eng, tk) = (self.eng, self.tk.clone());
+        self.force_tools(job, &mut p, true);
+        let mut fed = std::mem::take(&mut p.fed);
+        let (eng, tk, fold) = (self.eng, self.tk.clone(), self.cfg.fold);
         p.arm_ban(eng);
-        let r = self.eng.feed(&fed, p.nnew, &STOP_IDS, p.use_mtp, &mut |t| p.on_tok(job, eng, &tk, t));
+        // toolctl.rs: free decode until the end or an open tool-call name; the name one constrained pass per token
+        let mut acc: Option<FeedStats> = None;
+        let mut err: Option<String> = None;
+        'dec: loop {
+            while let Some(allow) = p.tc.name_allow(&tk, fold) {
+                if p.gen.len() >= p.nnew { break; }
+                if !eng.set_allow(&allow) { p.tc.skip(); break; }
+                p.tc.stepping = true;
+                let r = eng.feed(&fed, 1, &STOP_IDS, p.use_mtp, &mut |t| p.on_tok(job, eng, &tk, t));
+                p.tc.stepping = false;
+                p.tc.steps += 1;
+                if p.ban.is_empty() || !eng.set_ban(&p.ban) { eng.set_ban(&[]); }
+                match r {
+                    Ok(st) => {
+                        let end = st.stop_reason != "length" || p.stop_hit.is_some() || p.format_stop || job.cancel.load(Ordering::SeqCst);
+                        merge_feed(&mut acc, st);
+                        fed = p.gen.last().map(|&t| vec![t]).unwrap_or_default();
+                        if end { break 'dec; }
+                    }
+                    Err(e) => { err = Some(e); break 'dec; }
+                }
+            }
+            if p.gen.len() >= p.nnew && acc.is_some() {
+                if let Some(a) = acc.as_mut() { if a.stop_reason == "cancelled" && !job.cancel.load(Ordering::SeqCst) { a.stop_reason = "length".into(); } }
+                break;
+            }
+            let r = eng.feed(&fed, p.nnew - p.gen.len().min(p.nnew - 1), &STOP_IDS, p.use_mtp, &mut |t| p.on_tok(job, eng, &tk, t));
+            match r { Ok(st) => merge_feed(&mut acc, st), Err(e) => { err = Some(e); break; } }
+            if !std::mem::take(&mut p.tc.hold) { break; }
+            fed = p.gen.last().map(|&t| vec![t]).unwrap_or_default();
+        }
+        let r = match err { Some(e) => Err(e), None => acc.ok_or_else(|| "decode: no feed ran".to_string()) };
         self.finish(job, p, r)
+    }
+
+    /// toolctl.rs for a prepared job: the forced tool-call opener (`tool_choice` any / tool) appended to the prompt as
+    /// ordinary prompt tokens (and streamed as the first text piece: the visible filter hides it as a call), and the
+    /// tool-name constraint (`solo`: the `generate` loop runs it; batched: unconstrained, server.rs filters).
+    fn force_tools(&mut self, job: &Job, p: &mut Prepared, solo: bool) {
+        p.tc = crate::toolctl::ToolCtl::new(&job.req, p.think, solo);
+        if p.tc.force_text.is_empty() { return; }
+        let ids = self.tk.encode(&p.tc.force_text);
+        let room = self.eng.max_ctx().saturating_sub(self.eng.pos() + p.fed.len() + ids.len());
+        if room < 2 { p.tc.force_text.clear(); p.tc.raw.clear(); return; } // no room: unforced (ctx_full follows anyway)
+        p.all.extend_from_slice(&ids);
+        p.fed.extend(ids.iter().map(|&t| match self.cfg.fold { Some(m) => t % m, None => t }));
+        p.nnew = p.nnew.min(room).max(1);
+        let text = p.tc.force_text.clone();
+        p.text_out(job, &text, false);
     }
 
     /// After the decode of a prepared job (the engine on its slot): bookkeeping, reply text, stats.
@@ -915,9 +1354,10 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
         if p.ban_armed { self.eng.set_ban(&[]); }
         let tail = p.dec.finish();
         p.text_out(job, &tail, true);
-        let Prepared { mut o, all, use_mtp, seg_prefill, think, ttft, gen, text, stop_hit, format_stop, .. } = p;
+        let Prepared { mut o, all, use_mtp, seg_prefill, think, ttft, gen, text, stop_hit, format_stop, tc, .. } = p;
         let tk = self.tk.clone();
         o.ttft_s = ttft;
+        o.tool_ctl = tool_ctl_json(&job.req, &tc);
         o.mtp = use_mtp;
         let (msgs, tools): (&[ChatMsg], &[ToolDef]) = (&job.req.msgs, &job.req.tools);
         match r {
@@ -938,12 +1378,13 @@ impl<'a, B: Backend + ?Sized> Worker<'a, B> {
                     o.stop_reason = "stop_sequence".into();
                     o.stop_sequence = Some(job.req.stop[i].clone());
                 } else {
-                    o.raw = tk.decode(body);
+                    o.raw = format!("{}{}", tc.force_text, tk.decode(body)); // forced opener (toolctl.rs) + the reply
                     if format_stop { o.stop_reason = "format".into(); }
                 }
                 o.prefill_s = st.prefill_s + seg_prefill;
                 add_stream(&mut o.stream, &st.stream);
                 if st.gen > 1 && st.decode_s > 0.0 { o.decode_tok_s = Some((st.gen - 1) as f64 / st.decode_s); }
+                o.decode_s = st.decode_s;
                 o.spec = st.spec;
                 o.ctx_draft = st.ctx_draft;
                 o
@@ -993,6 +1434,8 @@ pub(crate) struct Prepared {
     stop_hit: Option<(usize, usize)>,
     /// a banned id came out (a backend without `set_ban`): the reply ends there, stop_reason "format"
     format_stop: bool,
+    /// tool-call control (toolctl.rs): forced opener, tool-name constraint
+    tc: crate::toolctl::ToolCtl,
 }
 impl Prepared {
     /// Per generated token: first-token time + answer-library boundary, text piece to the client, cancel check.
@@ -1006,6 +1449,8 @@ impl Prepared {
         if !STOP_IDS.contains(&t) {
             let piece = self.dec.push(tk, t);
             if self.text_out(job, &piece, false) { return false; }
+            // an open tool-call name: stop here (this token pending), `generate` decodes the name constrained
+            if self.tc.push(&piece) { return false; }
         }
         !job.cancel.load(Ordering::SeqCst)
     }
@@ -1033,6 +1478,22 @@ impl Prepared {
         self.stop_hit = hit;
         hit.is_some()
     }
+}
+
+/// Sum of the feeds of one reply (`generate`: free decode + constrained tool-name passes): the later feeds' prompt
+/// time counts as decode; the stop reason / last token are the last feed's; `ctx_draft` the first feed's.
+fn merge_feed(acc: &mut Option<FeedStats>, st: FeedStats) {
+    let Some(a) = acc.as_mut() else { *acc = Some(st); return };
+    a.decode_s += st.prefill_s + st.decode_s;
+    a.gen += st.gen;
+    a.last = st.last;
+    a.stop_reason = st.stop_reason;
+    a.spec = match (a.spec, st.spec) {
+        (Some(x), Some(y)) => { let (n, k) = (x.0 + y.0, x.1 + y.1); Some((n, k, x.2 + y.2, if n > 0 { k as f64 / n as f64 } else { 0.0 })) }
+        (x, y) => x.or(y),
+    };
+    if a.stream.is_none() { a.stream = st.stream; }
+    if a.ctx_draft.is_none() { a.ctx_draft = st.ctx_draft; }
 }
 
 /// Bytes of the longest suffix of `text` that is a proper prefix of one of `stops` (held back while streaming).
@@ -1099,6 +1560,32 @@ mod tests {
         assert!(prune_warm(&mut q, WARM_MAX_AGE, Instant::now()).is_empty());
     }
 
+    /// lcp + the message index of a token position (system turn, grouped tool results, generation prompt).
+    #[test]
+    fn div_message_index() {
+        assert_eq!(lcp(&[1, 2, 3, 4], &[1, 2, 9]), 2);
+        assert_eq!(lcp(&[], &[1]), 0);
+        const S: u32 = 7; // <|im_start|>
+        let m = |r: &str| ChatMsg::new(r, "x");
+        // system, user, assistant, tool, tool (one turn), user; then the generation prompt
+        let msgs = vec![m("system"), m("user"), m("assistant"), m("tool"), m("tool"), m("user")];
+        let full = vec![S, 1, 1, S, 2, S, 3, S, 4, 4, S, 5, S, 6];
+        let at = |p| msg_at(&full, p, &msgs, true, S);
+        assert_eq!(at(1), json!(0));
+        assert_eq!(at(3), json!(1));
+        assert_eq!(at(6), json!(2));
+        assert_eq!(at(9), json!(3), "both tool results are one turn: its first message");
+        assert_eq!(at(10), json!(5));
+        assert_eq!(at(13), json!("gen"));
+        assert_eq!(msg_at(&[1, S], 0, &msgs, true, S), serde_json::Value::Null);
+        // tools without a system message: the template's own system turn comes first
+        let msgs2 = vec![m("user"), m("assistant")];
+        let full2 = vec![S, 0, S, 1, S, 2];
+        assert_eq!(msg_at(&full2, 1, &msgs2, true, S), json!("system"));
+        assert_eq!(msg_at(&full2, 3, &msgs2, true, S), json!(0));
+        assert_eq!(msg_at(&full2, 3, &msgs2, false, S), json!(1));
+    }
+
     #[test]
     fn drop_reaches_client() {
         struct Nop;
@@ -1112,7 +1599,7 @@ mod tests {
         }
         let Ok(tk) = Tokenizer::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../models/qwen38_27b_mlx4")) else { eprintln!("SKIP: 27B tokenizer missing"); return };
         let eng = Nop;
-        let mut w = Worker::new(&eng, Arc::new(tk), WorkerConfig { think: false, mtp: false, fold: None });
+        let mut w = Worker::new(&eng, Arc::new(tk), WorkerConfig { think: false, mtp: false, fold: None, ..Default::default() });
         let (tx, rx) = std::sync::mpsc::channel();
         let mut j = job("x", true, None, false, 40);
         let (etx, erx) = std::sync::mpsc::channel();
@@ -1124,5 +1611,59 @@ mod tests {
             Ev::Done(o) => { assert_eq!((o.stop_reason.as_str(), o.mode.as_str(), o.drop_reason), ("cancelled", "dropped", Some("stale"))); assert!(o.warm); }
             e => panic!("{:?}", e),
         }
+    }
+
+    /// N8 slot policy on a fake backend with 4 checkpoint slots (valid = same lineage, at or before the position).
+    #[test]
+    fn sys_checkpoint_slot_policy() {
+        use std::cell::{Cell, RefCell};
+        struct Ckb { pos: Cell<usize>, gen: Cell<u64>, slots: RefCell<Vec<Option<(usize, u64)>>> }
+        impl Backend for Ckb {
+            fn reset(&self) { self.pos.set(0); self.gen.set(self.gen.get() + 1); }
+            fn pos(&self) -> usize { self.pos.get() }
+            fn max_ctx(&self) -> usize { 4096 }
+            fn vocab(&self) -> usize { 1000 }
+            fn mtp_available(&self) -> bool { false }
+            fn feed(&self, _: &[u32], _: usize, _: &[u32], _: bool, _: &mut dyn FnMut(u32) -> bool) -> Result<FeedStats, String> { unreachable!() }
+            fn ckpt_slots(&self) -> usize { 4 }
+            fn ckpt_save(&self, i: usize) -> Result<(), String> { self.slots.borrow_mut()[i] = Some((self.pos.get(), self.gen.get())); Ok(()) }
+            fn ckpt_pos(&self, i: usize) -> Option<usize> { self.slots.borrow()[i].filter(|s| s.1 == self.gen.get() && s.0 <= self.pos.get()).map(|s| s.0) }
+        }
+        let Ok(tk) = Tokenizer::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../models/qwen38_27b_mlx4")) else { eprintln!("SKIP: 27B tokenizer missing"); return };
+        let eng = Ckb { pos: Cell::new(0), gen: Cell::new(0), slots: RefCell::new(vec![None; 4]) };
+        let mut w = Worker::new(&eng, Arc::new(tk), WorkerConfig { ckpt_system: true, ..Default::default() });
+        let ids: Vec<u32> = (0..4000).collect();
+        let at = |w: &mut Worker<Ckb>, p: usize, pin: bool, reply: bool| { eng.pos.set(p); w.ck_take(&ids[..p], pin, reply, None); };
+        let held = |w: &Worker<Ckb>| { let mut v: Vec<usize> = w.ck.iter().flatten().map(|c| c.ids.len()).collect(); v.sort(); v };
+        // the system boundary (100), the last instruction (500, pinned), the reply start (900)
+        at(&mut w, 100, false, false);
+        w.ck_mark_sys(100, CkDesc { msgs: vec![], tools: vec![], think: false, toks: ids[..100].to_vec() });
+        at(&mut w, 500, true, false);
+        at(&mut w, 900, false, true);
+        // many floating checkpoints later in the chat (last turn / prompt end / followup base): one slot rotates
+        for p in (1000..3000).step_by(137) {
+            at(&mut w, p, false, false);
+            let h = held(&w);
+            assert!(h.contains(&100) && h.contains(&500) && h.contains(&900) && h.contains(&p), "{} {:?}", p, h);
+        }
+        assert_eq!(w.ck.iter().flatten().filter(|c| c.sys).count(), 1);
+        assert!(w.ck.iter().flatten().any(|c| c.sys && c.ids.len() == 100));
+        let l = w.ck_list().unwrap();
+        assert!(l.as_array().unwrap().iter().any(|c| c["p"] == 100 && c["sys"] == true), "{}", l);
+        // a compacted history (same system turn, the rest new) rewinds to the system checkpoint
+        let mut full = ids[..100].to_vec();
+        full.extend(std::iter::repeat_n(7u32, 300));
+        let (_, p, u) = w.ck_best(&full, &[], &[], false).unwrap();
+        assert_eq!((p, u), (100, 100));
+        // a new lineage: the other lineage's dormant unpinned slots (its sys one included) are reused first; its pin stays
+        eng.reset();
+        at(&mut w, 150, false, false);
+        at(&mut w, 250, false, false);
+        assert!(held(&w).contains(&100), "the dormant sys checkpoint is reused last: {:?}", held(&w));
+        at(&mut w, 350, false, false);
+        assert!(!held(&w).contains(&100), "{:?}", held(&w));
+        let pins: Vec<usize> = w.ck.iter().flatten().filter(|c| c.pin).map(|c| c.ids.len()).collect();
+        assert_eq!(pins, vec![500], "{:?}", held(&w));
+        assert!(held(&w).contains(&150) && held(&w).contains(&350));
     }
 }

@@ -1,10 +1,11 @@
 //! streamdense gateway --model DIR --port 8898 --max-ctx 8192 [--mtp | --no-mtp] [--spec-depth N|auto] [--spec-cost ..] [--draft-table DIR] [--gemv mma|old] [--draft-vocab FILE] [--no-mtp-decode] [--think] [--log FILE]
-//!                     [--tokenizer DIR] [--cap 17] [--reserve GB] [--kv bf16|q8 ([gateway] kv)] [--seqs 1..4] [--abort-gb 16] [--swap-gb 7]
+//!                     [--profile NAME ([profile] name; "coding")] [--think | --no-think ([gateway] think)]
+//!                     [--tokenizer DIR] [--cap GB ([gateway] startup_cap_gb, 17)] [--reserve GB] [--kv bf16|q8 ([gateway] kv)] [--seqs 1..4] [--abort-gb 16] [--swap-gb 7]
 //!                     [--prefill-k N] [--prefill-t N] [--prefill-exact] [--threads N] [--host 127.0.0.1] [--name qwen38-27b]
 //!                     [--no-snapshots] [--snapshot-dir DIR] [--snapshot-max-files N] [--snapshot-max-gb GB] ([snapshots], default 32 / 8) [--no-activity]
 //!                     [--watcher-dir DIR (or $SD_WATCHER_DIR)] [--forheader off|12gb] [--no-fast] [--no-fused] [--ctx-draft | --no-ctx-draft | --ctx-draft-dry] [--plan (print the budget / 12 GB K and exit; loads nothing)]
 //!                     [--verify-fused | --no-verify-fused] [--history | --no-history] [--history-dir DIR] [--history-project DIR]
-//!                     [--drafter DIR | --no-drafter] [--dflash2 DIR | --no-dflash2] [--fold-ids (tests only)]
+//!                     [--drafter DIR | --no-drafter] [--dflash2 DIR | --no-dflash2] [--rewind-gb GB ([gateway] rewind_gb, 0 = off)] [--fold-ids (tests only)]
 //! streamdense gateway --print-env [--port N]   (shell exports for Claude Code; loads nothing)
 //! Anthropic Messages API on 127.0.0.1 served by the in-process engine (streamdense-gateway, docs/GATEWAY.md).
 //! Defaults for --model / --port / --max-ctx / --mtp / --spec-depth / --gemv / --draft-vocab / --draft-table ([gateway]) and --abort-gb (= cap_gb) / --swap-gb ([ram]) come from
@@ -23,7 +24,7 @@
 //! DFlash2 ([gateway] dflash2, default "" = off; --dflash2 DIR / --no-dflash2; experimental): refused with --drafter or the
 //! 12 GB mode, turns MTP and snapshots off, refused unless the whole budget fits --abort-gb and the weights match
 //! [dflash2] expected_sha256; a drafting failure ends the request with an error (no automatic fallback).
-use crate::{conditions, config_root, load_config, watcher, Args};
+use crate::{conditions, config_root, watcher, Args};
 use serde_json::json;
 use std::sync::Arc;
 use streamdense_model::activity::script_class;
@@ -75,9 +76,44 @@ fn space_efficient_malloc() {
     eprintln!("WARNING: re-exec with {}=1 failed ({}): freed heap stays in the footprint", SPACE_EFFICIENT, e);
 }
 
+/// UTC "YYYY-MM-DDTHH:MM:SSZ" of Unix seconds (civil-from-days; no time crate).
+fn utc_iso(t: u64) -> String {
+    let (days, rem) = ((t / 86400) as i64, t % 86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+/// The gateway's session marker line: build (git describe + build time of the binary), args, the RAM / KV / MTP /
+/// rewind / snapshot settings, and every env flag that changes behaviour (SD_*, STICKY_*, UNION_TOOLS, ...).
+fn session_line(opt: &QwenOptions, abort_gb: f64, snaps: Option<serde_json::Value>, rewind: serde_json::Value, fh_on: bool, profile: serde_json::Value) -> serde_json::Value {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let exe = std::env::current_exe().ok();
+    let exe_mtime = exe.as_ref().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    let build_ts: u64 = env!("SD_BUILD_TS").parse().unwrap_or(0);
+    let env: serde_json::Map<String, serde_json::Value> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("SD_") || k.starts_with("STICKY_") || k == "UNION_TOOLS" || k == SPACE_EFFICIENT || k.starts_with("STREAMDENSE"))
+        .map(|(k, v)| (k, json!(v))).collect();
+    json!({"session": "gateway_start", "ts": now, "time": utc_iso(now as u64), "pid": std::process::id(),
+        "exe": exe.map(|p| p.display().to_string()), "git": env!("SD_GIT_DESCRIBE"), "build_time": utc_iso(build_ts),
+        "exe_mtime": exe_mtime.map(utc_iso), "args": std::env::args().skip(1).collect::<Vec<_>>(),
+        "cap_gb": opt.cap as f64 / 1e9, "abort_gb": abort_gb, "max_ctx": opt.max_ctx, "kv": if opt.kv == KvFormat::Q8 { "q8" } else { "bf16" },
+        "mtp": opt.mtp, "spec_depth": opt.spec_depth, "spec_auto": opt.spec_auto, "mtp_ctx_draft": opt.mtp_ctx_draft, "seqs": opt.seqs,
+        "prefill_t": opt.prefill_t, "prefill_k": opt.prefill_k, "prefill_exact": opt.prefill_exact, "verify_fused": opt.verify_fused,
+        "mode_12gb": fh_on, "rewind": rewind, "snapshots": snaps, "profile": profile, "env": env})
+}
+
 pub fn main(a: &Args) {
     let host = a.sd("--host", "127.0.0.1");
-    let conf = load_config();
+    let conf = crate::load_config_profile(a);
     let port: u16 = a.s("--port").map(|p| p.parse().unwrap_or_else(|_| die(format!("--port {}", p)))).unwrap_or(conf.cfg.gateway.port);
     let name = a.sd("--name", streamdense_gateway::MODEL_NAME);
     if a.has("--print-env") {
@@ -89,8 +125,10 @@ pub fn main(a: &Args) {
     let root = crate::ROOT;
     let model = a.s("--model").unwrap_or_else(|| config_root(&conf).join(&conf.cfg.gateway.model).display().to_string());
     eprintln!("config: {}", conf.source_str());
+    eprintln!("{}", crate::profile_line(&conf));
     let mut opt = QwenOptions::default();
-    opt.cap = (a.f("--cap", 17.0) * 1e9) as u64;
+    // startup estimate limit: --cap > [gateway] startup_cap_gb (default 17.0); the live cap is --abort-gb / [ram] cap_gb
+    opt.cap = (a.f("--cap", conf.cfg.gateway.startup_cap_gb) * 1e9) as u64;
     if let Some(r) = a.s("--reserve") { opt.reserve = (r.parse::<f64>().unwrap() * 1e9) as u64; }
     opt.max_ctx = a.f("--max-ctx", conf.cfg.gateway.max_ctx as f64) as usize;
     opt.mtp = if a.has("--no-mtp") { false } else { a.has("--mtp") || conf.cfg.gateway.mtp };
@@ -222,6 +260,25 @@ pub fn main(a: &Args) {
         if got != want { die(format!("DFlash2 refused: {} sha256 mismatch: expected {} ([dflash2] expected_sha256), file has {}", f.display(), want, got)); }
         got
     });
+    // rewind checkpoints (engine rewind.rs): --rewind-gb > [gateway] rewind_gb; full mode only (the 12 GB mode keeps
+    // prompt sums they do not cover; DFlash / DFlash2: the engine turns them off). Never a reason to refuse a start:
+    // the count is lowered until the budget fits the startup cap and the live cap
+    opt.rewind_bytes = if fh_on || opt.dflash.is_some() || opt.dflash2.is_some() { 0 } else { (a.f("--rewind-gb", conf.cfg.gateway.rewind_gb).max(0.0) * 1e9) as u64 };
+    if opt.rewind_bytes > 0 {
+        let per = streamdense_model::qwen_config::QwenConfig::from_model_dir(&model).map(|c| streamdense_model::rewind::ckpt_bytes(&c) as u64).unwrap_or(0);
+        let limit = if opt.live_cap > 0 { opt.cap.min(opt.live_cap) } else { opt.cap };
+        while per > 0 && opt.rewind_bytes >= per {
+            match QwenEngine::budget(&model, &opt) {
+                Ok(b) if b.arena_bytes() + b.reserve > limit => {
+                    let k = opt.rewind_bytes / per;
+                    opt.rewind_bytes = (k - 1) * per;
+                    eprintln!("rewind checkpoints: {} -> {} (the budget would exceed the cap {:.3} GB)", k, k - 1, gb(limit));
+                }
+                _ => break,
+            }
+        }
+        if let Some(k) = opt.rewind_bytes.checked_div(per) { eprintln!("rewind checkpoints: {} x {:.3} GB", k, per as f64 / 1e9); }
+    }
     let bud = QwenEngine::budget(&model, &opt).unwrap_or_else(|e| die(e));
     eprintln!("budget ({}):\n{}", model, bud.report());
     // DFlash2: the whole budget must fit the set cap; the cap is never raised and there is no automatic fallback
@@ -265,7 +322,10 @@ pub fn main(a: &Args) {
     }
     alloc::set_limit_extra(256 << 20); // request bodies + prompts fit easily; the decode loop may not grow the heap past this
 
-    let wc = WorkerConfig { think: a.has("--think"), mtp: !a.has("--no-mtp-decode"), fold: if fold { Some(eng.cfg.vocab as u32) } else { None } };
+    // thinking: --think / --no-think > [gateway] think (default off)
+    let think = if a.has("--no-think") { false } else { a.has("--think") || conf.cfg.gateway.think };
+    let wc = WorkerConfig { think, mtp: !a.has("--no-mtp-decode"), fold: if fold { Some(eng.cfg.vocab as u32) } else { None },
+                           cut_tool_call: conf.cfg.gateway.cut_tool_call == "length", ckpt_reply_start: conf.cfg.gateway.ckpt_reply_start, ckpt_system: conf.cfg.gateway.ckpt_system };
     // 12 GB mode: the compact backend (status: K, planned / resident GB, stream settings)
     let fh_info = match &fh {
         Some(f) => json!({"mode": "12gb", "k": f.rule.k, "kres": f.rule.kres, "inter": eng.cfg.inter, "share": f.rule.k as f64 / eng.cfg.inter as f64,
@@ -284,7 +344,8 @@ pub fn main(a: &Args) {
             Some(p) => json!({"state": "on", "dir": p.display().to_string(), "sha256": df2_sha, "drafting": wc.mtp, "experimental": true, "note": DFLASH2_NOTE}),
             None => json!({"state": "off"}),
         },
-        "draft_vocab": opt.draft_vocab.as_ref().map(|p| p.display().to_string()), "think": wc.think, "open_s": open_s, "abort_gb": gb(abort), "snapshots": snapshots,
+        "draft_vocab": opt.draft_vocab.as_ref().map(|p| p.display().to_string()), "think": wc.think, "cut_tool_call": conf.cfg.gateway.cut_tool_call, "ckpt_reply_start": wc.ckpt_reply_start, "ckpt_system": wc.ckpt_system, "profile": conf.profile.as_ref().map(|p| p.name.clone()), "open_s": open_s, "abort_gb": gb(abort), "snapshots": snapshots,
+        "rewind": json!({"checkpoints": eng.ckpt_slots(), "gb_each": eng.ckpt_size() as f64 / 1e9}),
         "forheader": fh_info});
     let mut cb = fh.map(|f| {
         let mut c = streamdense_gateway::compact::CompactBackend::new(&eng, f.rule, fh_info.clone()).unwrap_or_else(|e| die(e));
@@ -298,7 +359,7 @@ pub fn main(a: &Args) {
                   c.rule.k, eng.cfg.inter, fh_info["share"].as_f64().unwrap_or(0.0), c.rule.kres, gb(footprint::self_footprint()), opt.ffn_stream_slots,
                   if opt.ffn_stream_host { " inside the idle lm_head" } else { "" }, c.piece, if opt.mtp { " | MTP on" } else { "" });
     }
-    let cfg = GatewayConfig { host: host.clone(), port, model_name: name.clone(), worker: wc, log: a.s("--log"), info: info.clone() };
+    let cfg = GatewayConfig { host: host.clone(), port, model_name: name.clone(), worker: wc, log: a.s("--log"), info: info.clone(), peak: Some(mon.peak.clone()) };
     // snapshot cache (both modes; 12 GB mode: format-2 files with the prompt sums, under their own keys)
     let hook: Option<streamdense_gateway::CacheHook> = if !snapshots { None } else {
         let mid = streamdense_gateway::CacheHook::model_id(&model);
@@ -315,9 +376,9 @@ pub fn main(a: &Args) {
         if cb.is_some() { tc.hot_bytes = 0; }
         let h = streamdense_gateway::CacheHook::with_tiers(cache, tc);
         let t = &h.tiers.cfg;
-        eprintln!("snapshot tiers: hot <= {:.2} GB (headroom {:.2} under cap {:.2}) | warm cap {} files / {:.2} GB, free disk >= {:.1} GB | idle work after {:.1} s: save {}, pre-read {} ({} files / {:.2} GB) | hot shared prefix {} | switch save {} (>= {} tokens)",
+        eprintln!("snapshot tiers: hot <= {:.2} GB (headroom {:.2} under cap {:.2}) | warm cap {} files / {:.2} GB, free disk >= {:.1} GB | idle work after {:.1} s: save {}, pre-read {} ({} files / {:.2} GB) | hot shared prefix {} | switch save {} (>= {} tokens) | eviction first {} (>= {} tokens) | stable prefix kept {}",
                   gb(t.hot_bytes), gb(t.hot_headroom), gb(t.ram_cap), t.max_files, gb(t.max_bytes), gb(t.min_free), t.idle.map_or(0.0, |d| d.as_secs_f64()),
-                  t.idle_save, t.preread, t.preread_files, gb(t.preread_bytes), t.hot_stable, t.switch_save, t.switch_save_min);
+                  t.idle_save, t.preread, t.preread_files, gb(t.preread_bytes), t.hot_stable, t.switch_save, t.switch_save_min, t.evict_for_save, t.evict_for_save_min, t.stable_ensure);
         let (n, b) = h.usage();
         eprintln!("snapshots: {} ({} files, {:.1} MB; cap {} files / {:.2} GB){}", h.cache.dir.display(), n, b as f64 / 1e6, h.max_files, gb(h.max_bytes),
                   if cb.is_some() { format!(" | 12 GB mode files ({}), + {:.1} MB prompt sums each", h.cache.mode, (eng.cfg.layers * 2 * eng.cfg.inter * 4) as f64 / 1e6) } else { String::new() });
@@ -452,6 +513,13 @@ pub fn main(a: &Args) {
         let _ = std::io::stdout().flush();
         eprintln!("gateway: listening on http://{}:{} (model name {}); Claude Code env: streamdense gateway --print-env --port {}", host, p, name, p);
     };
+    // session marker (one JSON line in the gateway log): build, config, env flags; every later line can be tied to it
+    eprintln!("{}", session_line(&opt, gb(abort), hook.as_ref().map(|h| {
+        let t = &h.tiers.cfg;
+        json!({"dir": h.cache.dir.display().to_string(), "max_files": t.max_files, "max_gb": gb(t.max_bytes), "hot_gb": gb(t.hot_bytes),
+               "hot_headroom_gb": gb(t.hot_headroom), "ram_cap_gb": gb(t.ram_cap), "switch_save": t.switch_save, "idle_save": t.idle_save, "preread": t.preread, "evict_for_save": t.evict_for_save, "evict_for_save_min_tokens": t.evict_for_save_min, "stable_ensure": t.stable_ensure})
+    }), json!({"checkpoints": eng.ckpt_slots(), "gb_each": eng.ckpt_size() as f64 / 1e9}), fh_on,
+        conf.profile.as_ref().map_or(serde_json::Value::Null, |p| p.json())));
     let r = match &cb {
         // 12 GB mode: the compact backend; the job hook sees the engine inside it
         Some(c) => {

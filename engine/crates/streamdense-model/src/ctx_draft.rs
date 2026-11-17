@@ -214,16 +214,19 @@ pub struct CtxSource {
     /// last lookup run (tokens) and its match-length bin
     last: Vec<u32>,
     last_bin: usize,
+    /// the last `propose` returned the lookup run (stats only: `DraftSource::last_from_lookup`)
+    picked_lookup: bool,
 }
 impl CtxSource {
     pub fn new(max: usize, inner: Option<Box<dyn DraftSource>>) -> CtxSource {
-        CtxSource { cx: CtxDrafter::new(), max: max.min(SPEC_DEPTH_MAX), inner, last: vec![], last_bin: 0 }
+        CtxSource { cx: CtxDrafter::new(), max: max.min(SPEC_DEPTH_MAX), inner, last: vec![], last_bin: 0, picked_lookup: false }
     }
 }
 impl DraftSource for CtxSource {
     fn propose(&mut self, tail: &[u32], max: usize) -> Vec<(u32, f32)> {
         let inner = self.inner.as_mut().map(|s| s.propose(tail, max)).unwrap_or_default();
         self.last.clear();
+        self.picked_lookup = false;
         let Some(&pending) = tail.last() else { return inner };
         let (m, toks) = self.cx.lookup(pending, max.min(self.max));
         let b = mbin(m);
@@ -232,8 +235,10 @@ impl DraftSource for CtxSource {
         self.last = toks;
         self.last_bin = b;
         let sum = |v: &[(u32, f32)]| v.iter().map(|x| x.1 as f64).sum::<f64>();
+        self.picked_lookup = !look.is_empty() && sum(&look) >= sum(&inner);
         if sum(&look) >= sum(&inner) { look } else { inner }
     }
+    fn last_from_lookup(&self) -> bool { self.picked_lookup }
     fn observe(&mut self, tail: &[u32], accepted: &[u32], top3: &[[u32; 3]]) {
         // conditional acceptance of the lookup run vs the verified greedy tokens a_i = top3[i][0], up to the first miss
         let b = self.last_bin;

@@ -141,7 +141,7 @@ fn start_multi(log: &str, c: Arc<Counters>) -> Option<u16> {
     std::thread::spawn(move || {
         let tk = Arc::new(Tokenizer::from_path(TOK_DIR).unwrap());
         let eng = Multi { pos: (0..SLOTS).map(|_| Cell::new(0)).collect(), cur: Cell::new(0), c };
-        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: true, fold: None }, ..Default::default() };
+        let cfg = GatewayConfig { port: 0, log: Some(log), worker: WorkerConfig { think: false, mtp: true, fold: None, ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve(&eng, tk, cfg, None, |p| { tx.send(p).unwrap(); }).unwrap();
     });
     Some(rx.recv_timeout(Duration::from_secs(60)).unwrap())
@@ -235,7 +235,7 @@ fn start_tiny(seqs: usize) -> Option<u16> {
         let eng = QwenEngine::open(&tiny, opt).unwrap();
         assert_eq!(eng.seqs(), seqs);
         let vocab = eng.cfg.vocab as u32;
-        let cfg = GatewayConfig { port: 0, worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab) }, ..Default::default() };
+        let cfg = GatewayConfig { port: 0, worker: WorkerConfig { think: false, mtp: true, fold: Some(vocab), ..Default::default() }, ..Default::default() };
         streamdense_gateway::serve(&eng, tk, cfg, None, |p| { tx.send(p).unwrap(); }).unwrap();
     });
     Some(rx.recv_timeout(Duration::from_secs(120)).unwrap())

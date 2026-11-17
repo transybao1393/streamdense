@@ -271,6 +271,15 @@ impl<'a> Enc<'a> {
     pub fn end(self) { self.e.endEncoding(); }
 }
 
+/// Encode one blit pass on `cb` copying `(src, dst, bytes)` ranges inside `buf` (no other encoder may be open on `cb`).
+pub fn blit_copy(cb: &CmdBuf, buf: &Buffer, spans: &[(usize, usize, usize)]) {
+    let e = cb.blitCommandEncoder().expect("blit encoder");
+    for &(s, d, n) in spans {
+        if n > 0 { unsafe { e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(buf, s, buf, d, n) }; }
+    }
+    e.endEncoding();
+}
+
 pub fn gpu_ms(cb: &CmdBuf) -> f64 { (cb.GPUEndTime() - cb.GPUStartTime()) * 1e3 }
 /// (GPUStartTime, GPUEndTime) in seconds, host time base (gaps between command buffers = GPU idle on this queue).
 pub fn gpu_span(cb: &CmdBuf) -> (f64, f64) { (cb.GPUStartTime(), cb.GPUEndTime()) }

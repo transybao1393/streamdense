@@ -3,6 +3,10 @@
 # Missing file -> the same built-in defaults. Unknown keys are an error. Check: engine/target/release/streamdense config
 # Start the gateway with these values: engine/target/release/streamdense up
 
+# [profile]          # a named set of defaults applied under this file's explicit values; flags win; or `streamdense up --profile NAME`
+# name = "coding"    # "coding" (local coding agents, docs/GATEWAY.md "Profiles"): [ram] cap_gb 18; [gateway] max_ctx 32768, kv q8, MTP auto
+                     # + mtp_ctx_draft 7, verify_fused, rewind_gb 0.62, startup_cap_gb 17.5, think off; [snapshots] 8 GB / 12 GB free disk
+
 [ram]
 cap_gb    = 16.0   # hard cap on the model process footprint: sd-watchdog kills it, and the engine aborts itself (--abort-gb)
 swap_gb   = 7      # stop if system swap grows by more than this since the process started (not absolute swap)
@@ -23,6 +27,9 @@ draft_table = "~/.streamdense/draft_table"   # learning draft table for spec_dep
 # verify_fused = false   # fused verify matmuls (bit-identical, faster verify of 3..8 rows); default OFF; or --verify-fused
 # drafter = ""          # DFlash block drafter dir (kit export_engine.py output); "" = off. Replaces MTP, snapshots off; or --drafter DIR
 # dflash2 = ""          # DFlash2 drafter dir (models/dflash2_27b_q4); "" = off (experimental). Replaces MTP, snapshots off; or --dflash2 DIR / --no-dflash2. Budget must fit [ram] cap_gb; refused with drafter or the 12 GB mode
+# rewind_gb = 0.62     # rewind checkpoints (DeltaNet state + conv copies, 0.154 GB each on the 27B; 0.62 = 4): a rewritten earlier message re-reads only from the last checkpoint before it; 0 = off; or --rewind-gb
+# startup_cap_gb = 17.0 # startup estimate limit of the budget (refuses to open above it; rewind checkpoints are lowered first); the live cap is [ram] cap_gb; or --cap
+# think = false        # thinking for requests that ask for it; or --think / --no-think
 
 [watcher]   # domain watcher: always on (no off switch); topic domains (not languages); learns every turn, decides over long windows; dry-run plans
 mode                    = "observe"   # "observe" = decide + log what would unload; "unload" reserved (observes until then)
@@ -76,6 +83,9 @@ hot_headroom_gb      = 1.0    # (32 GB machine: [ram] cap_gb ~ 28 and hot_gb ~ 2
 hot_stable           = true   # hot tier: also a RAM copy of the shared prefix (system prompt + tools) when it fits without dropping another copy
 switch_save          = true   # multi-user: save the live conversation before another conversation's request replaces it ...
 switch_save_min_tokens = 64   # ... when it is at least this many tokens past that conversation's newest file
+# evict_for_save = false        # N8 (on in the coding profile; set here only to override it): a switch / idle save of the live chat ...
+# evict_for_save_min_tokens = 2048   # ... of at least this many tokens evicts old files first instead of being skipped by min_free_disk_gb
+# stable_ensure  = false        # N8: each new system + tools prefix saved (eviction first); the live one never deleted by the disk policy
 
 # [history]   # history index (OFF by default): drafts for the 12 GB mode's context drafts from text you already have (lossless)
 # enabled   = false
